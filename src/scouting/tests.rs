@@ -999,6 +999,44 @@ fn repository_changes_between_evidence_and_publication_publish_nothing() -> Resu
 }
 
 #[test]
+fn documentation_change_between_evidence_and_publication_preserves_code_claims() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let conn = fixture(repo.path())?;
+    let anchors = candidate_anchors(&conn, repo.path())?;
+    let before = crate::publication::Identities::read(&conn)?;
+
+    let root = repo.path().to_path_buf();
+    let db_path = store::db_path(repo.path());
+    let mut gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&anchors)))]);
+    gateway.on_complete = Some(Box::new(move || {
+        std::fs::write(
+            root.join("README.md"),
+            "# Flow\n\nThe flow starts and then finishes.\n",
+        )
+        .expect("write documentation fixture");
+        let racing = store::open_path(&db_path).expect("open racing connection");
+        indexer::index_repo(&root, &racing).expect("racing docs-only re-index");
+    }));
+
+    let report = scout_workflows(repo.path(), &conn, &mut gateway, &scout_options())?;
+    assert_eq!(report.status, "completed");
+    assert!(report.artifact_id.is_some());
+    let after = crate::publication::Identities::read(&conn)?;
+    assert_eq!(after.code, before.code);
+    assert_ne!(after.documentation, before.documentation);
+    assert_ne!(after.publication, before.publication);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_snapshot FROM scout_runs WHERE id=?1",
+            [report.run_id],
+            |row| row.get::<_, String>(0),
+        )?,
+        crate::publication::durable_code_source(&before.code)
+    );
+    Ok(())
+}
+
+#[test]
 fn dry_run_report_marks_budget_and_call_slots() -> Result<()> {
     let repo = tempfile::tempdir()?;
     std::fs::write(

@@ -27,6 +27,7 @@ mod mcp;
 mod origin;
 mod package_exports;
 mod parse;
+mod publication;
 mod query;
 mod recon;
 mod runtime_identity;

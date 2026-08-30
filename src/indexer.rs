@@ -273,7 +273,7 @@ pub fn incremental_refresh_repo_with_options(
 /// Incremental watcher refresh for a generation known to contain only
 /// checker-ineligible source changes. When the complete checker-eligible
 /// canonical identity and module-resolution identity are unchanged, the
-/// active checker batch is rebound to the replacement shared snapshot without
+/// active checker batch is rebound to the replacement code digest without
 /// planning or launching the checker.
 pub fn incremental_refresh_repo_rebinding_checker(
     root: &Path,
@@ -285,7 +285,9 @@ pub fn incremental_refresh_repo_rebinding_checker(
         conn,
         options,
         IndexMode::Incremental,
-        CheckerRetention::RebindActiveIfCheckerInputsUnchanged,
+        CheckerRetention::ValidateActive {
+            retain_failed_for_watch: true,
+        },
         IndexOperation::new(&OsFileSystem),
     )
 }
@@ -302,7 +304,9 @@ pub fn refresh_repo_with_options(
         conn,
         options,
         IndexMode::FullRefresh,
-        CheckerRetention::Drop,
+        CheckerRetention::ValidateActive {
+            retain_failed_for_watch: false,
+        },
         IndexOperation::new(&OsFileSystem),
     )
 }
@@ -339,7 +343,9 @@ pub fn watch_full_refresh_repo_rebinding_checker(
         conn,
         options,
         IndexMode::FullRefresh,
-        CheckerRetention::RebindActiveIfCheckerInputsUnchanged,
+        CheckerRetention::ValidateActive {
+            retain_failed_for_watch: true,
+        },
         IndexOperation::new(&OsFileSystem),
     )
 }
@@ -352,9 +358,18 @@ enum IndexMode {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CheckerRetention {
+    #[cfg(test)]
     Drop,
     PreserveActiveForWatch,
-    RebindActiveIfCheckerInputsUnchanged,
+    ValidateActive {
+        retain_failed_for_watch: bool,
+    },
+}
+
+impl CheckerRetention {
+    fn validates_active(self) -> bool {
+        matches!(self, Self::ValidateActive { .. })
+    }
 }
 
 /// Environment capabilities shared by every filesystem-sensitive phase of a
@@ -602,13 +617,10 @@ fn index_repo_attempt<F: FileSystem>(
         .collect::<HashMap<_, _>>();
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let preparation = (|| -> Result<(_, _, _, _, _, _)> {
-        let previous_checker_identity = (checker_retention
-            == CheckerRetention::RebindActiveIfCheckerInputsUnchanged)
+        let previous = ProjectionIdentity::read(conn)?;
+        let previous_checker_identity = checker_retention
+            .validates_active()
             .then(|| checker_canonical_identity(conn))
-            .transpose()?;
-        let rebind_source = (checker_retention
-            == CheckerRetention::RebindActiveIfCheckerInputsUnchanged)
-            .then(|| ProjectionIdentity::read(conn))
             .transpose()?;
         let changed_formats = ensure_format_contracts(conn)?;
         let documentation_provenance_format_changed = ensure_documentation_provenance_format(conn)?;
@@ -624,6 +636,9 @@ fn index_repo_attempt<F: FileSystem>(
         let checker_contract_changed = formats::eligible_ids(Capability::Checker)
             .into_iter()
             .any(|format| changed_formats.contains(format));
+        let code_contract_changed = formats::ALL.iter().any(|format| {
+            format.corpus == formats::Corpus::Code && changed_formats.contains(format.id)
+        });
         let stored: HashMap<String, (i64, String, String, String, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT path, id, hash, role, corpus, format
@@ -834,16 +849,6 @@ fn index_repo_attempt<F: FileSystem>(
         }
         outcome.removed = previous_paths.difference(&published).count();
 
-        let previous = if outcome.extraction_reset {
-            ProjectionIdentity {
-                snapshot: None,
-                projection_version: None,
-                resolution_hash: None,
-            }
-        } else {
-            ProjectionIdentity::read(conn)?
-        };
-
         // Dependency discovery sees the just-extracted, uncommitted importer
         // rows. Reading and parsing the selected corpus inside the outer
         // transaction ensures a transient dependency failure restores the
@@ -857,7 +862,8 @@ fn index_repo_attempt<F: FileSystem>(
         conn.execute(
             "DELETE FROM meta
              WHERE key IN (
-               'snapshot', 'projection_version', 'resolution_hash',
+               'snapshot', 'code_digest', 'documentation_digest',
+               'projection_version', 'resolution_hash',
                'documentation_provenance_digest'
              )",
             [],
@@ -867,8 +873,8 @@ fn index_repo_attempt<F: FileSystem>(
             plans,
             prepared,
             previous_checker_identity,
-            rebind_source,
             checker_contract_changed,
+            code_contract_changed,
         ))
     })();
     let (
@@ -876,8 +882,8 @@ fn index_repo_attempt<F: FileSystem>(
         plans,
         prepared,
         previous_checker_identity,
-        rebind_source,
         checker_contract_changed,
+        code_contract_changed,
     ) = match preparation {
         Ok(preparation) => preparation,
         Err(error) => {
@@ -905,8 +911,10 @@ fn index_repo_attempt<F: FileSystem>(
             [root.to_string_lossy()],
         )?;
         let resolution = crate::structural::compute_resolution_hash(conn)?;
-        provenance_store::publish_documentation_provenance_digest(conn)?;
-        let snapshot = crate::structural::compute_snapshot_with_resolution(conn, &resolution)?;
+        publish_projection_identity(conn, &resolution)?;
+        let provenance_digest = provenance_store::compute_documentation_provenance_digest(conn)?;
+        let identities =
+            crate::publication::Identities::compute(conn, &resolution, &provenance_digest)?;
         if let Some(repository) = provenance_repository.as_ref() {
             validate_documentation_provenance_publication(
                 repository,
@@ -916,75 +924,88 @@ fn index_repo_attempt<F: FileSystem>(
                 &[],
             )?;
         }
-        // Manual indexing always resets the optional checker plane. Watch keeps
-        // the old active batch and newest superseded staging batch hidden for
-        // the following per-project carry step; projection still rejects a
-        // mismatched source snapshot.
-        let checker_batches_changed = match checker_retention {
+        // Manual indexing retains only a checker publication proven reusable;
+        // watch may additionally keep failed predecessors as hidden carry for
+        // the following enrichment step. Projection still accepts only the
+        // exact current code digest.
+        let checker_publication_changed = match checker_retention {
+            #[cfg(test)]
             CheckerRetention::Drop => store::clear_checker_batches(conn)?,
             CheckerRetention::PreserveActiveForWatch => {
-                store::preserve_checker_carry_source_for_watch(conn)?
+                let _ = store::preserve_checker_carry_source_for_watch(conn)?;
+                false
             }
-            CheckerRetention::RebindActiveIfCheckerInputsUnchanged => {
+            CheckerRetention::ValidateActive {
+                retain_failed_for_watch,
+            } => {
                 let current_checker_identity = checker_canonical_identity(conn)?;
-                let source = rebind_source.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("checker rebind source identity was not captured")
-                })?;
                 let can_rebind = !checker_contract_changed
                     && previous_checker_identity.as_deref()
                         == Some(current_checker_identity.as_str())
-                    && source.resolution_hash.as_deref() == Some(resolution.as_str())
-                    && match source.snapshot.as_deref() {
-                        Some(old_snapshot) => {
-                            crate::checker::active_batch_inputs_fresh(&root, conn, old_snapshot)?
+                    && previous.resolution_hash.as_deref() == Some(resolution.as_str())
+                    && match previous.code_digest.as_deref() {
+                        Some(old_code_digest) => {
+                            crate::checker::active_batch_inputs_fresh(&root, conn, old_code_digest)?
                         }
                         None => false,
                     };
                 let rebound = if can_rebind {
-                    match source.snapshot.as_deref() {
-                        Some(old_snapshot) => {
-                            store::rebind_active_checker_batch(conn, old_snapshot, &snapshot)?
-                        }
+                    match previous.code_digest.as_deref() {
+                        Some(old_code_digest) => store::rebind_active_checker_batch(
+                            conn,
+                            old_code_digest,
+                            &identities.code,
+                        )?,
                         None => false,
                     }
                 } else {
                     false
                 };
-                let deactivated = !can_rebind
-                    && source.snapshot.as_deref() == Some(snapshot.as_str())
-                    && store::deactivate_active_checker_batch_for_snapshot(conn, &snapshot)?;
                 outcome.checker_rebound = rebound;
-                let retention_changed = store::preserve_checker_carry_source_for_watch(conn)?;
-                retention_changed || rebound || deactivated
+                let already_bound =
+                    previous.code_digest.as_deref() == Some(identities.code.as_str());
+                let retained = can_rebind && (already_bound || rebound);
+                let active_changed = if retained {
+                    if retain_failed_for_watch {
+                        let _ = store::preserve_checker_carry_source_for_watch(conn)?;
+                    } else {
+                        let _ = store::discard_inactive_checker_batches(conn)?;
+                    }
+                    false
+                } else if retain_failed_for_watch {
+                    let deactivated = already_bound
+                        && store::deactivate_active_checker_batch_for_snapshot(
+                            conn,
+                            &identities.code,
+                        )?;
+                    let _ = store::preserve_checker_carry_source_for_watch(conn)?;
+                    deactivated
+                } else {
+                    store::clear_checker_batches(conn)?
+                };
+                active_changed || rebound
             }
         };
-        let current = ProjectionIdentity {
-            snapshot: Some(snapshot.clone()),
-            projection_version: Some(crate::structural::PROJECTION_VERSION.to_string()),
-            resolution_hash: Some(resolution.clone()),
-        };
-        let snapshot_changed = previous.snapshot.as_deref() != current.snapshot.as_deref();
         let projection_started = std::time::Instant::now();
-        if previous == current && !checker_batches_changed {
+        if !outcome.extraction_reset
+            && !code_contract_changed
+            && previous.code_digest.as_deref() == Some(identities.code.as_str())
+            && !checker_publication_changed
+        {
             // The projection is a pure function of the canonical tables: the
-            // snapshot covers every extracted row (file content identity) and the
-            // resolution hash covers module edges, whose inputs (tsconfigs,
-            // manifests, node_modules layout) live outside indexed content.
-            // Checker publication rebuilds the projection immediately and its
-            // batch is accepted only for this exact snapshot. Identical inputs
-            // under the same projection version can therefore republish the
-            // existing rows.
-            current.publish(conn)?;
+            // code digest covers every extracted code row, the projection
+            // contract, and module resolution. Checker publication rebuilds
+            // the projection immediately and its batch is accepted only for
+            // this exact code digest.
             outcome.projection_rebuilt = false;
             if options.timing {
                 eprintln!("timing structural-projection=skipped (unchanged)");
             }
         } else {
-            crate::structural::rebuild_projection_with_timing(conn, &snapshot, options.timing)?;
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES('resolution_hash', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [&resolution],
+            crate::structural::rebuild_projection_with_timing(
+                conn,
+                &identities.code,
+                options.timing,
             )?;
             if options.timing {
                 eprintln!(
@@ -993,12 +1014,21 @@ fn index_repo_attempt<F: FileSystem>(
                 );
             }
         }
+        identities.publish(conn)?;
         // Documentation readiness is exact-snapshot state. Rebuild it from the
         // durable shared cache after the new marker exists, but before the outer
         // publication commit. An incomplete cache remains a normal NotReady
         // state and never turns indexing into a provider operation.
-        if snapshot_changed {
-            crate::docs::retrieval::rematerialize_cached_generations(conn, &snapshot)?;
+        if outcome.extraction_reset
+            || crate::docs::retrieval::cached_generation_rematerialization_needed(
+                conn,
+                &identities.documentation,
+            )?
+        {
+            crate::docs::retrieval::rematerialize_cached_generations(
+                conn,
+                &identities.documentation,
+            )?;
         }
         let (rust_files_with_errors, rust_error_count): (i64, i64) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(parse_error_count), 0)
@@ -1148,12 +1178,11 @@ fn checker_canonical_identity(conn: &Connection) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// The three meta values that must all match for the previous projection to
-/// be provably identical to what a rebuild would produce.
-#[derive(PartialEq, Eq)]
+/// Prior code-plane inputs retained across canonical replacement. The code
+/// digest alone gates projection reuse; the separately stored resolution hash
+/// is needed only by the checker-safe rebind optimization.
 struct ProjectionIdentity {
-    snapshot: Option<String>,
-    projection_version: Option<String>,
+    code_digest: Option<String>,
     resolution_hash: Option<String>,
 }
 
@@ -1164,32 +1193,27 @@ impl ProjectionIdentity {
                 .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
                     row.get(0)
                 })
-                .ok())
+                .optional()?)
         };
         Ok(Self {
-            snapshot: read("snapshot")?,
-            projection_version: read("projection_version")?,
+            code_digest: read(crate::publication::CODE_DIGEST_META_KEY)?,
             resolution_hash: read("resolution_hash")?,
         })
     }
+}
 
-    fn publish(&self, conn: &Connection) -> Result<()> {
-        for (key, value) in [
-            ("snapshot", &self.snapshot),
-            ("projection_version", &self.projection_version),
-            ("resolution_hash", &self.resolution_hash),
-        ] {
-            let value = value
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("projection identity is missing {key}"))?;
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES(?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )?;
-        }
-        Ok(())
+fn publish_projection_identity(conn: &Connection, resolution_hash: &str) -> Result<()> {
+    for (key, value) in [
+        ("projection_version", crate::structural::PROJECTION_VERSION),
+        ("resolution_hash", resolution_hash),
+    ] {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
     }
+    Ok(())
 }
 
 fn ensure_format_contracts(conn: &Connection) -> Result<std::collections::HashSet<&'static str>> {
@@ -1267,7 +1291,8 @@ fn ensure_format_contracts(conn: &Connection) -> Result<std::collections::HashSe
         conn.execute("DELETE FROM resolved_edges", [])?;
         conn.execute("DELETE FROM graph_nodes", [])?;
         conn.execute(
-            "DELETE FROM meta WHERE key IN ('snapshot', 'projection_version')",
+            "DELETE FROM meta
+             WHERE key IN ('snapshot', 'code_digest', 'projection_version')",
             [],
         )?;
     }

@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 pub const DB_FILE: &str = ".jscout.db";
-pub const SCHEMA_VERSION: &str = "33";
+pub const SCHEMA_VERSION: &str = "34";
 const DURABLE_SCHEMA_FLOOR: u32 = 16;
 
 static SQLITE_VEC: Once = Once::new();
@@ -91,18 +91,16 @@ pub fn open_path_read_only(path: &Path) -> Result<Connection> {
             path.display()
         );
     }
-    let (has_snapshot, projection_version): (bool, Option<String>) = conn.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM meta WHERE key='snapshot'
-         ), (
-           SELECT value FROM meta WHERE key='projection_version'
-         )",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let Some(projection_version) = projection_version.filter(|_| has_snapshot) else {
+    let projection_version = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='projection_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(projection_version) = projection_version else {
         bail!(
-            "index database `{}` has no published structural snapshot; run `jscout index`",
+            "index database `{}` has no published structural projection; run `jscout index`",
             path.display()
         );
     };
@@ -114,14 +112,16 @@ pub fn open_path_read_only(path: &Path) -> Result<Connection> {
         );
     }
     validate_published_contracts(&conn)?;
+    crate::publication::Identities::read(&conn)?;
     Ok(conn)
 }
 
 /// Reject source-derived rows produced by an incompatible binary contract.
 /// Indexing is the only repair path; read and embedding surfaces must not
 /// reinterpret old rows under the current extractor or Markdown format.
-/// Documentation provenance is optional and is validated only by retrieval
-/// calls that opt in to freshness ranking.
+/// Documentation provenance readiness is optional and validated only by
+/// retrieval calls that opt in to freshness ranking; its digest is required
+/// as one component of every publication identity.
 pub(crate) fn validate_published_contracts(conn: &Connection) -> Result<()> {
     let (extraction_version, documentation_chunk_format): (Option<String>, Option<String>) = conn
         .query_row(
@@ -319,7 +319,8 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              DROP TABLE IF EXISTS package_instances;
              DELETE FROM meta
              WHERE key IN (
-               'root', 'snapshot', 'projection_version', 'resolution_hash',
+               'root', 'snapshot', 'code_digest', 'documentation_digest',
+               'projection_version', 'resolution_hash',
                'extraction_version', 'documentation_chunk_format_version',
                'documentation_provenance_format_version',
                'documentation_provenance_enabled',
@@ -327,7 +328,7 @@ fn rebuild_legacy_disposable_schema(conn: &Connection) -> Result<()> {
              ) OR key LIKE 'embedding_index_synced_v1:%'
                OR key LIKE 'format_contract_version:%'
                OR key LIKE 'semantic_embedding_index_synced_v1:%';
-             UPDATE meta SET value='33' WHERE key='schema_version';",
+             UPDATE meta SET value='34' WHERE key='schema_version';",
         )?;
         Ok(())
     })();
@@ -345,7 +346,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta(key, value) VALUES('schema_version', '33')
+INSERT INTO meta(key, value) VALUES('schema_version', '34')
   ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS package_instances(
@@ -1333,12 +1334,20 @@ pub(crate) fn reset_snapshot_state(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Manual fixed-snapshot indexing starts the optional checker plane from
-/// scratch. This is deliberately caller policy rather than a user-facing
-/// retention flag.
+/// Drop checker state after validation fails or in tests that intentionally
+/// model the pre-retention path. This is caller policy, not a user-facing flag.
 pub(crate) fn clear_checker_batches(conn: &Connection) -> Result<bool> {
-    let changed = conn.execute("DELETE FROM checker_enrichment_batches", [])? != 0;
-    Ok(changed)
+    let active = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checker_enrichment_batches WHERE active=1)",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.execute("DELETE FROM checker_enrichment_batches", [])?;
+    Ok(active)
+}
+
+pub(crate) fn discard_inactive_checker_batches(conn: &Connection) -> Result<bool> {
+    Ok(conn.execute("DELETE FROM checker_enrichment_batches WHERE active=0", [])? != 0)
 }
 
 /// Keep the active publication plus one superseded staging carry source.
@@ -1686,12 +1695,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn v16_durable_floor_preserves_cache_and_memory_while_rebuilding_snapshot_schema() -> Result<()>
-    {
-        let directory = tempfile::tempdir()?;
-        let database = directory.path().join("floor.db");
-        let conn = open_path(&database)?;
+    fn seed_legacy_rebuild_fixture(conn: &Connection, schema_version: &str) -> Result<()> {
         conn.execute_batch(
             r#"INSERT INTO files(path, hash, corpus, format, role)
                VALUES('old.ts', 'source', 'code', 'typescript', 'production');
@@ -1708,13 +1712,15 @@ mod tests {
                prompt_version, confidence, source_snapshot, created_at,
                input_fingerprint, artifact_fingerprint
              ) VALUES(1, 'annotation', 'memory', '{}', 'agent', 'v1',
-                      'likely', 'old', '2026-01-01T00:00:00Z', 'input', 'artifact');
+                      'likely', 'legacy-semantic-snapshot',
+                      '2026-01-01T00:00:00Z', 'input', 'artifact');
              INSERT INTO scout_runs(
                id, scout_kind, status, gateway_protocol, provider, model,
                billing_path, prompt_version, source_snapshot, input_fingerprint,
                request_hash, started_at, completed_at
              ) VALUES(1, 'repository', 'completed', 1, 'test', 'model', 'custom',
-                      'repository-recon/v1', 'old', 'recon-input', 'request',
+                      'repository-recon/v1', 'legacy-scout-snapshot',
+                      'recon-input', 'request',
                       '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z');
              INSERT INTO repository_classifications(
                id, run_id, subject_key, subject_kind, selector_json, depth,
@@ -1724,7 +1730,8 @@ mod tests {
              ) VALUES(1, 1, 'area:repository:src', 'area',
                       '{"kind":"repository_area","scope":"src","direct_only":false}',
                       0, 'runtime', 'likely', 'runtime source', '["E001"]',
-                      'evidence', 'classification', 'old', '2026-01-01T00:00:01Z');
+                      'evidence', 'classification', 'legacy-repository-snapshot',
+                      '2026-01-01T00:00:01Z');
              INSERT INTO repository_file_policy(
                file_id, classification_id, subject_key, scope_role,
                effective_role, source_hash, depth
@@ -1733,11 +1740,24 @@ mod tests {
              INSERT INTO checker_enrichment_batches(
                source_snapshot, checker_version, checker_source,
                checker_input_fingerprint, sidecar_protocol, created_at, active
-             ) VALUES('old', '5.9.3', 'test', 'checker', 1,
-                      '2026-01-01T00:00:00Z', 1);
-             UPDATE meta SET value='16' WHERE key='schema_version';"#,
+             ) VALUES('legacy-global', '5.9.3', 'test', 'checker', 1,
+                      '2026-01-01T00:00:00Z', 1);"#,
         )?;
-        crate::embed::materialize_cached_embeddings(&conn)?;
+        crate::embed::materialize_cached_embeddings(conn)?;
+        conn.execute(
+            "UPDATE meta SET value=?1 WHERE key='schema_version'",
+            [schema_version],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn v16_durable_floor_preserves_cache_and_memory_while_rebuilding_snapshot_schema() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("floor.db");
+        let conn = open_path(&database)?;
+        seed_legacy_rebuild_fixture(&conn, "16")?;
         drop(conn);
 
         let upgraded = open_path(&database)?;
@@ -1778,6 +1798,115 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(version, SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn v33_identity_split_rebuild_preserves_durable_rows_but_requires_reindex() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("v33.db");
+        let conn = open_path(&database)?;
+        seed_legacy_rebuild_fixture(&conn, "33")?;
+        conn.execute_batch(
+            r"INSERT INTO doc_vector_generations(
+               snapshot, profile_id, dimensions, chunk_format_version
+             ) VALUES('legacy-global', 1, 2, 'legacy-doc-format');
+             INSERT INTO meta(key, value) VALUES
+               ('root', '/legacy'),
+               ('snapshot', 'legacy-global'),
+               ('projection_version', 'legacy-projection'),
+               ('resolution_hash', 'legacy-resolution'),
+               ('extraction_version', 'legacy-extraction'),
+               ('documentation_chunk_format_version', 'legacy-doc-format'),
+               ('documentation_provenance_enabled', 'true'),
+               ('documentation_provenance_digest', 'legacy-provenance');",
+        )?;
+        drop(conn);
+
+        let before_read_only = std::fs::read(&database)?;
+        let error = open_path_read_only(&database)
+            .expect_err("schema v33 must fail closed until a writer rebuilds it");
+        assert!(error.to_string().contains("uses schema v33"));
+        assert_eq!(std::fs::read(&database)?, before_read_only);
+
+        let upgraded = open_path(&database)?;
+        let durable: (i64, i64, i64, i64, i64, String, String, String) = upgraded.query_row(
+            "SELECT
+               (SELECT count(*) FROM embedding_profiles),
+               (SELECT count(*) FROM embeddings),
+               (SELECT count(*) FROM semantic_artifacts),
+               (SELECT count(*) FROM scout_runs),
+               (SELECT count(*) FROM repository_classifications),
+               (SELECT source_snapshot FROM semantic_artifacts WHERE id=1),
+               (SELECT source_snapshot FROM scout_runs WHERE id=1),
+               (SELECT source_snapshot FROM repository_classifications WHERE id=1)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            durable,
+            (
+                1,
+                1,
+                1,
+                1,
+                1,
+                "legacy-semantic-snapshot".into(),
+                "legacy-scout-snapshot".into(),
+                "legacy-repository-snapshot".into(),
+            )
+        );
+        let disposable: (String, i64, i64, i64, i64) = upgraded.query_row(
+            "SELECT
+               (SELECT value FROM meta WHERE key='schema_version'),
+               (SELECT count(*) FROM files),
+               (SELECT count(*) FROM embedding_index_entries),
+               (SELECT count(*) FROM checker_enrichment_batches),
+               (SELECT count(*) FROM doc_vector_generations)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(disposable, (SCHEMA_VERSION.into(), 0, 0, 0, 0));
+        let publication_rows: i64 = upgraded.query_row(
+            "SELECT count(*) FROM meta WHERE key IN (
+               'root', 'snapshot', 'code_digest', 'documentation_digest',
+               'projection_version', 'resolution_hash', 'extraction_version',
+               'documentation_chunk_format_version',
+               'documentation_provenance_enabled',
+               'documentation_provenance_digest'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(publication_rows, 0);
+        drop(upgraded);
+
+        let error = open_path_read_only(&database)
+            .expect_err("rebuilt schema must remain unpublished until indexing succeeds");
+        assert!(
+            error
+                .to_string()
+                .contains("no published structural projection")
+        );
         Ok(())
     }
 
@@ -1917,9 +2046,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("published.db");
         let writer = open_path(&database)?;
-        writer.execute(
-            "INSERT INTO meta(key, value) VALUES('snapshot', 'snapshot')",
-            [],
+        let identities = crate::publication::Identities::publish_test(
+            &writer,
+            "code",
+            "documentation",
+            "provenance",
         )?;
         writer.execute(
             "INSERT INTO meta(key, value) VALUES('projection_version', ?1)",
@@ -1955,7 +2086,7 @@ mod tests {
             reader.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |row| {
                 row.get(0)
             })?;
-        assert_eq!(snapshot, "snapshot");
+        assert_eq!(snapshot, identities.publication);
         assert!(
             reader
                 .execute(

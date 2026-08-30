@@ -35,7 +35,7 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
                 println!(
-                    "shared snapshot: {} root={}",
+                    "documentation digest: {} root={}",
                     status.snapshot,
                     status.canonical_root.as_deref().unwrap_or("unknown")
                 );

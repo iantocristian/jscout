@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use super::corpus::Decision;
 
-/// A read-only summary of the documentation projection inside the current
-/// shared structural snapshot. Documentation has no database or snapshot of
-/// its own.
+/// A read-only summary of the documentation plane in the shared database.
+/// Vector generations bind the documentation digest rather than the global
+/// publication marker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
     pub snapshot: String,
@@ -58,7 +58,7 @@ pub struct SearchHit {
     #[serde(skip_serializing, default)]
     pub freshness_committer_time: Option<i64>,
     // Operational Git failures are emitted by indexing. They are not part of
-    // a hit's stable retrieval contract or the shared snapshot identity.
+    // a hit's stable retrieval contract or the documentation identity.
     #[serde(skip_serializing, default)]
     pub freshness_detail: Option<String>,
     pub score: f64,
@@ -67,7 +67,7 @@ pub struct SearchHit {
 
 pub fn current_snapshot(conn: &Connection) -> Result<String> {
     crate::store::validate_published_contracts(conn)?;
-    crate::structural::current_snapshot(conn)
+    crate::publication::current_documentation_digest(conn)
 }
 
 /// Read status from one pinned SQLite snapshot so a concurrent `jscout index`
@@ -378,10 +378,7 @@ mod tests {
     fn fixture() -> Result<(tempfile::TempDir, Connection)> {
         let root = tempfile::tempdir()?;
         let conn = crate::store::open(root.path())?;
-        conn.execute(
-            "INSERT INTO meta(key,value) VALUES('snapshot','shared-1')",
-            [],
-        )?;
+        crate::publication::Identities::publish_test(&conn, "code-1", "shared-1", "provenance-1")?;
         conn.execute(
             "INSERT INTO meta(key,value) VALUES('extraction_version',?1)",
             [crate::entity::EXTRACTION_VERSION],

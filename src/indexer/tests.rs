@@ -384,7 +384,9 @@ fn provenance_only_author_rewrite_rotates_its_digest_without_structural_churn() 
 
     let conn = store::open(repo.path())?;
     index_repo_with_docs_freshness(repo.path(), &conn)?;
-    let snapshot = structural::current_snapshot(&conn)?;
+    let code_snapshot = structural::current_snapshot(&conn)?;
+    let snapshot = docs::store::current_snapshot(&conn)?;
+    let publication_snapshot = crate::publication::current_publication_snapshot(&conn)?;
     let provenance_digest: String = conn.query_row(
         "SELECT value FROM meta WHERE key=?1",
         [docs::PROVENANCE_DIGEST_META_KEY],
@@ -467,7 +469,12 @@ fn provenance_only_author_rewrite_rotates_its_digest_without_structural_churn() 
         !refreshed.projection_rebuilt,
         "provenance-only history changes must not rebuild the structural projection"
     );
-    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    assert_eq!(structural::current_snapshot(&conn)?, code_snapshot);
+    assert_eq!(docs::store::current_snapshot(&conn)?, snapshot);
+    assert_ne!(
+        crate::publication::current_publication_snapshot(&conn)?,
+        publication_snapshot
+    );
     assert_ne!(
         conn.query_row(
             "SELECT value FROM meta WHERE key=?1",
@@ -1284,7 +1291,7 @@ fn failure_after_canonical_replacement_restores_the_last_good_publication() -> R
 }
 
 #[test]
-fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot() -> Result<()> {
+fn documentation_contract_change_rechunks_docs_without_rotating_code() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
         repo.path().join("main.ts"),
@@ -1293,6 +1300,7 @@ fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot()
     fs::write(repo.path().join("guide.md"), "# Guide\n\nCurrent body.\n")?;
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
+    let code_digest = structural::current_snapshot(&conn)?;
 
     let code_chunk_id: i64 = conn.query_row(
         "SELECT chunk.id
@@ -1316,11 +1324,7 @@ fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot()
             [format!("format_contract_version:{format}")],
         )?;
     }
-    let old_format_snapshot = structural::compute_snapshot(&conn)?;
-    conn.execute(
-        "UPDATE meta SET value=?1 WHERE key='snapshot'",
-        [&old_format_snapshot],
-    )?;
+    let old_format_documentation_digest = crate::publication::compute_documentation_digest(&conn)?;
 
     let outcome = index_repo(repo.path(), &conn)?;
 
@@ -1344,7 +1348,11 @@ fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot()
         |row| row.get(0),
     )?;
     assert_eq!(persisted_format, crate::docs::CHUNK_FORMAT_VERSION);
-    assert_ne!(structural::current_snapshot(&conn)?, old_format_snapshot);
+    assert_eq!(structural::current_snapshot(&conn)?, code_digest);
+    assert_ne!(
+        docs::store::current_snapshot(&conn)?,
+        old_format_documentation_digest
+    );
     Ok(())
 }
 
@@ -1492,6 +1500,7 @@ fn extraction_version_change_forces_unchanged_files_through_extraction() -> Resu
     let second = index_repo(repo.path(), &conn)?;
     assert_eq!((second.indexed, second.unchanged), (0, 1));
     let current_contract_snapshot = structural::current_snapshot(&conn)?;
+    let current_identities = crate::publication::Identities::read(&conn)?;
 
     conn.execute(
         "UPDATE meta SET value='legacy' WHERE key='extraction_version'",
@@ -1504,9 +1513,11 @@ fn extraction_version_change_forces_unchanged_files_through_extraction() -> Resu
     )?;
     let legacy_contract_snapshot = structural::compute_snapshot(&conn)?;
     assert_ne!(legacy_contract_snapshot, current_contract_snapshot);
-    conn.execute(
-        "UPDATE meta SET value=?1 WHERE key='snapshot'",
-        [&legacy_contract_snapshot],
+    crate::publication::Identities::publish_test(
+        &conn,
+        &legacy_contract_snapshot,
+        &current_identities.documentation,
+        &current_identities.provenance,
     )?;
     let third = index_repo(repo.path(), &conn)?;
     assert_eq!((third.indexed, third.unchanged), (1, 0));
@@ -2717,7 +2728,16 @@ fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()>
             |row| row.get::<_, i64>(0),
         )?,
         0,
-        "a checker batch must not survive a different structural snapshot"
+        "manual indexing must discard a checker batch that cannot be validated"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM resolved_edges WHERE provenance='checker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+        "a checker batch from another code digest must not enter the projection"
     );
     Ok(())
 }
@@ -3215,6 +3235,8 @@ fn normalize_g26_phase_zero_sections(sections: &mut [(String, String)]) {
                     key != "schema_version"
                         && key != "root"
                         && key != "snapshot"
+                        && key != "code_digest"
+                        && key != "documentation_digest"
                         && key != "documentation_provenance_enabled"
                         && key != "documentation_provenance_digest"
                         && key != "documentation_provenance_format_version"
@@ -3507,6 +3529,7 @@ fn rust_contract_invalidation_reextracts_only_rust() -> Result<()> {
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
     let original_snapshot = structural::current_snapshot(&conn)?;
+    let original_identities = crate::publication::Identities::read(&conn)?;
     let original_ids = conn
         .prepare(
             "SELECT file.path,file.id,MIN(chunk.id)
@@ -3527,9 +3550,11 @@ fn rust_contract_invalidation_reextracts_only_rust() -> Result<()> {
     )?;
     let stale_snapshot = structural::compute_snapshot(&conn)?;
     assert_ne!(stale_snapshot, original_snapshot);
-    conn.execute(
-        "UPDATE meta SET value=?1 WHERE key='snapshot'",
-        [&stale_snapshot],
+    crate::publication::Identities::publish_test(
+        &conn,
+        &stale_snapshot,
+        &original_identities.documentation,
+        &original_identities.provenance,
     )?;
 
     let outcome = index_repo(repo.path(), &conn)?;
@@ -3728,7 +3753,7 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
             |row| row.get::<_, i64>(0),
         )?,
         0,
-        "manual full indexing always resets checker enrichment"
+        "manual full indexing discards a checker batch that cannot be validated"
     );
     Ok(())
 }
@@ -3894,6 +3919,42 @@ fn checker_rebind_fixture() -> Result<(
         source_file,
         member_call,
     ))
+}
+
+#[test]
+fn manual_docs_only_refresh_preserves_a_valid_checker_publication() -> Result<()> {
+    let (repo, _external, conn, _batch, target, _, _) = checker_rebind_fixture()?;
+    let before = crate::publication::Identities::read(&conn)?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Service\n\nThe service loads its current state.\n",
+    )?;
+
+    refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+
+    let after = crate::publication::Identities::read(&conn)?;
+    assert_eq!(after.code, before.code);
+    assert_ne!(after.documentation, before.documentation);
+    assert_ne!(after.publication, before.publication);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_snapshot FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        after.code
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges
+             WHERE provenance='checker' AND dst_key=?1",
+            [&target],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "a docs-only manual publication must keep validated checker edges projected"
+    );
+    Ok(())
 }
 
 #[test]
@@ -4181,7 +4242,7 @@ fn rust_only_full_refresh_rebinds_checker_rows_after_rowids_move() -> Result<()>
 }
 
 #[test]
-fn identical_manual_full_refresh_clears_the_exact_checker_batch() -> Result<()> {
+fn identical_manual_full_refresh_discards_an_unproven_checker_batch() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
         repo.path().join("service.ts"),

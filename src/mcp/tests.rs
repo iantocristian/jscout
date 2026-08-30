@@ -439,6 +439,7 @@ fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()
     indexer::index_repo(repo.path(), &incremental)?;
     let (code_snapshot, code_surfaces, covered_tools) =
         capture_code_read_surfaces(repo.path(), &incremental)?;
+    let code_publication = crate::publication::current_publication_snapshot(&incremental)?;
 
     fs::write(
         repo.path().join("README.md"),
@@ -458,7 +459,9 @@ fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()
     indexer::index_repo(repo.path(), &incremental)?;
     let (incremental_snapshot, incremental_surfaces, _) =
         capture_code_read_surfaces(repo.path(), &incremental)?;
-    assert_ne!(code_snapshot, incremental_snapshot);
+    let documentation_publication = crate::publication::current_publication_snapshot(&incremental)?;
+    assert_eq!(code_snapshot, incremental_snapshot);
+    assert_ne!(code_publication, documentation_publication);
     assert_code_read_surfaces_equal(
         &code_surfaces,
         &incremental_surfaces,

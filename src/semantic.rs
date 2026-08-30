@@ -796,6 +796,7 @@ pub(crate) fn persist_validated_artifact(
 ) -> Result<i64> {
     validate_relation_contract(conn, input, relations)?;
     let body_json = serde_json::to_string(&input.body)?;
+    let source_snapshot = crate::publication::durable_code_source(snapshot);
     let mut support_rows: Vec<Vec<String>> = supports
         .iter()
         .map(|support| {
@@ -830,7 +831,7 @@ pub(crate) fn persist_validated_artifact(
             model: provenance.model,
             prompt_version: provenance.prompt_version,
             confidence: &input.confidence,
-            source_snapshot: snapshot,
+            source_snapshot: &source_snapshot,
         },
         &mut support_rows,
     );
@@ -850,7 +851,7 @@ pub(crate) fn persist_validated_artifact(
                 provenance.model,
                 provenance.prompt_version,
                 input.confidence,
-                snapshot,
+                source_snapshot,
                 provenance.scout_run_id,
                 provenance.input_fingerprint,
                 artifact_fingerprint,

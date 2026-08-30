@@ -366,16 +366,13 @@ pub struct PathSearch {
 }
 
 pub fn current_snapshot(conn: &Connection) -> Result<String> {
-    conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |r| {
-        r.get(0)
-    })
-    .context("no structural snapshot; run `jscout index <root>` first")
+    crate::publication::current_code_digest(conn)
 }
 
 #[cfg(test)]
 pub fn compute_snapshot(conn: &Connection) -> Result<String> {
     let resolution_hash = compute_resolution_hash(conn)?;
-    compute_snapshot_with_resolution(conn, &resolution_hash)
+    crate::publication::compute_code_digest(conn, &resolution_hash)
 }
 
 /// Deterministic digest of the module-resolution outcome. Resolution reads
@@ -430,138 +427,14 @@ pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub(crate) fn compute_snapshot_with_resolution(
-    conn: &Connection,
-    resolution_hash: &str,
-) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-structural-snapshot-v6\0");
-    hasher.update(PROJECTION_VERSION.as_bytes());
-    hasher.update(b"\0code-extraction-contract\0");
-    hasher.update(crate::entity::EXTRACTION_VERSION.as_bytes());
-    let extraction_version = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key='extraction_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .unwrap_or_default();
-    // Hash the producer contract and the marker that describes the published
-    // rows. A mismatch therefore cannot preserve an apparently current digest.
-    hasher.update(b"\0code-published-extraction-contract\0");
-    hasher.update(extraction_version.as_bytes());
-    hasher.update(b"\0documentation-parser-contract\0");
-    hasher.update(crate::docs::CHUNK_FORMAT_VERSION.as_bytes());
-    let documentation_chunk_format = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key='documentation_chunk_format_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .unwrap_or_default();
-    // The persisted value describes the contract that produced the currently
-    // stored docs rows. It normally equals the binary constant above; hashing
-    // both also makes an interrupted or pre-upgrade mismatch fail closed.
-    hasher.update(b"\0documentation-published-chunk-format\0");
-    hasher.update(documentation_chunk_format.as_bytes());
-    for format in crate::formats::ALL {
-        let present = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE format=?1)",
-            [format.id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !present {
-            continue;
-        }
-        let key = crate::formats::contract_meta_key(format);
-        let persisted = conn
-            .query_row("SELECT value FROM meta WHERE key=?1", [&key], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()?
-            .unwrap_or_default();
-        // Preserve the byte-exact phase-0 digest while the per-format marker
-        // is only a spelling of an existing legacy snapshot input. As soon as
-        // one format's producer diverges from that shared contract, its own
-        // producer/published pair extends the snapshot independently.
-        if format
-            .legacy_snapshot_contract()
-            .is_some_and(|legacy| format.extractor_version == legacy && persisted == legacy)
-        {
-            continue;
-        }
-        hasher.update(b"\0active-format-contract\0");
-        hasher.update(format.id.as_bytes());
-        hasher.update(b"\0producer\0");
-        hasher.update(format.extractor_version.as_bytes());
-        hasher.update(b"\0published\0");
-        hasher.update(persisted.as_bytes());
-    }
-    let rust_present = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE format=?1)",
-        [crate::formats::RUST],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if rust_present {
-        let edition_context = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key=?1",
-                [crate::rust_lang::EDITION_CONTEXT_META_KEY],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .unwrap_or_default();
-        hasher.update(b"\0rust-edition-context\0");
-        hasher.update(edition_context.as_bytes());
-    }
-    let mut stmt = conn.prepare(
-        "SELECT f.path, f.hash, f.role, f.origin, f.corpus, f.format,
-                COALESCE(f.package_path, ''),
-                COALESCE(p.origin, ''), COALESCE(p.name, ''),
-                COALESCE(p.version, ''), COALESCE(p.locator, ''),
-                COALESCE(p.manifest_hash, ''), COALESCE(p.status, '')
-         FROM files f
-         LEFT JOIN package_instances p ON p.id = f.package_instance_id
-         ORDER BY f.path",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok([
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
-            r.get::<_, String>(7)?,
-            r.get::<_, String>(8)?,
-            r.get::<_, String>(9)?,
-            r.get::<_, String>(10)?,
-            r.get::<_, String>(11)?,
-            r.get::<_, String>(12)?,
-        ])
-    })?;
-    for row in rows {
-        for value in row? {
-            hasher.update(b"\0");
-            hasher.update(value.as_bytes());
-        }
-    }
-    hasher.update(b"\0module-resolution\0");
-    hasher.update(resolution_hash.as_bytes());
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
 /// Rebuild the disposable structural graph from canonical extraction tables.
-pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
-    rebuild_projection_with_timing(conn, snapshot, false)
+pub fn rebuild_projection(conn: &Connection, code_digest: &str) -> Result<()> {
+    rebuild_projection_with_timing(conn, code_digest, false)
 }
 
 pub fn rebuild_projection_with_timing(
     conn: &Connection,
-    snapshot: &str,
+    code_digest: &str,
     timing: bool,
 ) -> Result<()> {
     // A savepoint makes projection replacement atomic both on its own and as
@@ -678,7 +551,7 @@ pub fn rebuild_projection_with_timing(
             );
         }
         let stage_started = Instant::now();
-        project_checker_enrichments(conn, &files, &symbols, snapshot, &mut insert_edge)?;
+        project_checker_enrichments(conn, &files, &symbols, code_digest, &mut insert_edge)?;
         if timing {
             eprintln!(
                 "timing project-checker-enrichments={:?}",
@@ -691,16 +564,6 @@ pub fn rebuild_projection_with_timing(
             eprintln!("timing project-events={:?}", stage_started.elapsed());
         }
 
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('snapshot', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [snapshot],
-        )?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('projection_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [PROJECTION_VERSION],
-        )?;
         Ok(())
     })();
     match result {

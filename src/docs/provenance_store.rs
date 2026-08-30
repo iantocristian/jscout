@@ -406,19 +406,6 @@ pub(crate) fn compute_documentation_provenance_digest(conn: &Connection) -> Resu
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Publish the provenance identity inside the caller's existing index
-/// transaction. Readers therefore observe either the previous complete pair
-/// of rows/digest or the replacement complete pair, never a mixture.
-pub(crate) fn publish_documentation_provenance_digest(conn: &Connection) -> Result<String> {
-    let digest = compute_documentation_provenance_digest(conn)?;
-    conn.execute(
-        "INSERT INTO meta(key, value) VALUES(?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![super::PROVENANCE_DIGEST_META_KEY, &digest],
-    )?;
-    Ok(digest)
-}
-
 enum CacheLookup {
     Hit(BlameMapping),
     Miss,

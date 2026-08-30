@@ -567,9 +567,9 @@ pub(super) enum Command {
 
 #[derive(Subcommand)]
 pub(super) enum DocsCommand {
-    /// Materialize missing Markdown/MDX vectors for the shared repository snapshot
+    /// Materialize missing Markdown/MDX vectors for the current documentation digest
     Embed {
-        /// Repository root whose shared snapshot is already indexed
+        /// Repository root whose documentation corpus is already indexed
         root: PathBuf,
         /// Use the main index database at this path instead of the configured path
         #[arg(long)]
@@ -583,7 +583,7 @@ pub(super) enum DocsCommand {
     },
     /// Search indexed Markdown/MDX with BM25 and optional vectors
     Search {
-        /// Repository root whose shared snapshot is already indexed
+        /// Repository root whose documentation corpus is already indexed
         root: PathBuf,
         /// Natural-language or identifier query
         query: String,

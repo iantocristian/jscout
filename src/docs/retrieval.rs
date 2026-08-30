@@ -365,7 +365,7 @@ struct SearchState {
 
 /// Embed missing documentation representations into the shared durable cache,
 /// then atomically materialize current docs occurrences and readiness after
-/// rechecking the textual shared snapshot.
+/// rechecking the documentation digest.
 pub fn embed_current(conn: &Connection, provider: &Provider, batch: usize) -> Result<EmbedReport> {
     ensure!(
         batch > 0,
@@ -641,8 +641,7 @@ fn resolve_vector_ranking(
     if !generation_is_ready(conn, snapshot, &profile)? {
         return Ok(VectorResolution::NotReady {
             profile: Some(profile),
-            detail: "the current shared snapshot has no complete documentation vector generation"
-                .into(),
+            detail: "the current documentation digest has no complete vector generation".into(),
         });
     }
     let ranking = vector_search(conn, provider, &profile_spec, &profile, query, limit)?;
@@ -951,7 +950,7 @@ fn materialize_current_generation(
     let result = (|| -> Result<usize> {
         ensure!(
             store::current_snapshot(conn)? == snapshot,
-            "shared snapshot advanced while documentation embeddings were being prepared; cached batches were kept, rerun `jscout docs embed`"
+            "documentation digest advanced while embeddings were being prepared; cached batches were kept, rerun `jscout docs embed`"
         );
         rebuild_profile_generation_from_cache(conn, snapshot, profile)?.context(
             "not every current documentation representation has a cached valid-dimension vector",
@@ -977,12 +976,24 @@ fn materialize_current_generation(
 /// occurrence has a cached vector of the profile's declared dimensions.
 /// Incomplete caches are an ordinary not-ready state: stale occurrences and
 /// generation markers are removed, while indexing continues successfully.
+pub(crate) fn cached_generation_rematerialization_needed(
+    conn: &Connection,
+    documentation_digest: &str,
+) -> Result<bool> {
+    for profile in documentation_profiles(conn)? {
+        if !generation_is_ready(conn, documentation_digest, &profile)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn rematerialize_cached_generations(conn: &Connection, snapshot: &str) -> Result<()> {
     conn.execute_batch("SAVEPOINT jscout_docs_cached_rematerialize")?;
     let result = (|| -> Result<()> {
         ensure!(
             store::current_snapshot(conn)? == snapshot,
-            "documentation cached rematerialization requires the newly published shared snapshot"
+            "documentation cached rematerialization requires the newly published documentation digest"
         );
         clear_all_materialized_generations(conn)?;
         for profile in documentation_profiles(conn)? {
@@ -2116,6 +2127,48 @@ mod tests {
     }
 
     #[test]
+    fn index_rematerializes_complete_cache_without_a_prior_generation() -> Result<()> {
+        let (root, conn) = indexed_document()?;
+        let snapshot = store::current_snapshot(&conn)?;
+        let provider = test_provider("http://127.0.0.1:1/v1/embeddings".into())?;
+        let spec = provider.profile_for(CHUNK_FORMAT_VERSION)?;
+        let profile = ensure_profile(&conn, &spec, 2)?;
+        let embedding_identity: String = conn.query_row(
+            "SELECT embedding_identity FROM doc_chunk_meta
+             WHERE embedding_identity IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES(?1,?2,?3)",
+            params![embedding_identity, profile.id, vec_to_blob(&[1.0, 0.0])],
+        )?;
+        assert!(!generation_is_ready(&conn, &snapshot, &profile)?);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM doc_embedding_index_entries WHERE profile_id=?1",
+                [profile.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+
+        crate::indexer::index_repo(root.path(), &conn)?;
+
+        assert_eq!(store::current_snapshot(&conn)?, snapshot);
+        assert!(generation_is_ready(&conn, &snapshot, &profile)?);
+        let materialized: (i64, i64) = conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM doc_embedding_index_entries WHERE profile_id=?1),
+               (SELECT COUNT(*) FROM vec_doc_embeddings_2 WHERE profile_id=?1)",
+            [profile.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(materialized, (1, 1));
+        Ok(())
+    }
+
+    #[test]
     fn deleting_an_unembedded_document_republishes_cached_readiness() -> Result<()> {
         let root = tempfile::tempdir()?;
         std::fs::write(
@@ -2476,7 +2529,7 @@ mod tests {
     fn final_materialization_rechecks_the_shared_snapshot() -> Result<()> {
         let root = tempfile::tempdir()?;
         let conn = crate::store::open(root.path())?;
-        conn.execute("INSERT INTO meta(key,value) VALUES('snapshot','s1')", [])?;
+        crate::publication::Identities::publish_test(&conn, "code", "s1", "provenance")?;
         conn.execute(
             "INSERT INTO meta(key,value) VALUES('extraction_version',?1)",
             [crate::entity::EXTRACTION_VERSION],
@@ -2531,9 +2584,9 @@ mod tests {
             params![profile.id, vec_to_blob(&[1.0, 0.0])],
         )?;
         assert_eq!(materialize_current_generation(&conn, "s1", &profile)?, 1);
-        conn.execute("UPDATE meta SET value='s2' WHERE key='snapshot'", [])?;
+        crate::publication::Identities::publish_test(&conn, "code", "s2", "provenance")?;
         let error = materialize_current_generation(&conn, "s1", &profile).unwrap_err();
-        assert!(error.to_string().contains("shared snapshot advanced"));
+        assert!(error.to_string().contains("documentation digest advanced"));
         let still_ready: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM doc_vector_generations WHERE snapshot='s1')",
             [],
@@ -2557,6 +2610,7 @@ mod tests {
         let conn = crate::store::open(root.path())?;
         crate::indexer::index_repo(root.path(), &conn)?;
         let snapshot = store::current_snapshot(&conn)?;
+        let code_snapshot = crate::structural::current_snapshot(&conn)?;
 
         // One document request plus two query requests. Index refreshes below
         // have no provider handle and must rematerialize exclusively from the
@@ -2649,16 +2703,36 @@ mod tests {
             "export const orbit = 'changed code corpus';\n",
         )?;
         crate::indexer::index_repo(root.path(), &conn)?;
-        let code_changed_snapshot = store::current_snapshot(&conn)?;
-        assert_ne!(code_changed_snapshot, snapshot);
+        let code_changed_snapshot = crate::structural::current_snapshot(&conn)?;
+        assert_ne!(code_changed_snapshot, code_snapshot);
+        assert_eq!(store::current_snapshot(&conn)?, snapshot);
         assert!(generation_is_ready(
             &conn,
-            &code_changed_snapshot,
+            &snapshot,
             &ResolvedProfile {
                 id: profile_id,
                 dimensions: 2,
             }
         )?);
+        assert_eq!(
+            conn.query_row(
+                "SELECT id FROM doc_embedding_index_entries WHERE profile_id=?1",
+                [profile_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            unchanged_occurrence_id,
+            "a code-only publication must not rebuild documentation occurrences"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT snapshot,profile_id,dimensions,chunk_format_version
+                 FROM doc_vector_generations WHERE profile_id=?1",
+                [profile_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?,
+            generation,
+            "a code-only publication must leave documentation readiness untouched"
+        );
 
         let refresh = crate::indexer::refresh_repo_with_options(
             root.path(),
@@ -2670,7 +2744,7 @@ mod tests {
             "this regression must exercise the destructive full-refresh path"
         );
         let rebuilt_snapshot = store::current_snapshot(&conn)?;
-        assert_eq!(rebuilt_snapshot, code_changed_snapshot);
+        assert_eq!(rebuilt_snapshot, snapshot);
         assert!(generation_is_ready(
             &conn,
             &rebuilt_snapshot,
@@ -2758,8 +2832,34 @@ mod tests {
         )?;
         assert_eq!(docs_in_code_vectors, 0);
 
+        std::fs::rename(root.path().join("README.md"), root.path().join("GUIDE.md"))?;
+        crate::indexer::index_repo(root.path(), &conn)?;
+        let renamed_docs_snapshot = store::current_snapshot(&conn)?;
+        assert_ne!(renamed_docs_snapshot, rebuilt_snapshot);
+        assert!(generation_is_ready(
+            &conn,
+            &renamed_docs_snapshot,
+            &ResolvedProfile {
+                id: profile_id,
+                dimensions: 2,
+            }
+        )?);
+        let renamed_materialization: (i64, i64, String) = conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM doc_embedding_index_entries WHERE profile_id=?1),
+               (SELECT COUNT(*) FROM vec_doc_embeddings_2 WHERE profile_id=?1),
+               (SELECT f.path
+                  FROM doc_embedding_index_entries entry
+                  JOIN chunks chunk ON chunk.id=entry.chunk_id
+                  JOIN files f ON f.id=chunk.file_id
+                 WHERE entry.profile_id=?1)",
+            [profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(renamed_materialization, (1, 1, "GUIDE.md".into()));
+
         std::fs::write(
-            root.path().join("README.md"),
+            root.path().join("GUIDE.md"),
             "# Unified vectors\n\nA new uncached documentation identity.\n",
         )?;
         crate::indexer::index_repo(root.path(), &conn)?;

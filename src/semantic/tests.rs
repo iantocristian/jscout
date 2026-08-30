@@ -823,6 +823,84 @@ fn workflow_candidates_keep_seed_symbols_under_singular_doc_directories() -> Res
 }
 
 #[test]
+fn docs_only_publication_preserves_semantic_code_guards() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("a.ts"),
+        "export function alpha() { return 1; }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    let publication = crate::publication::current_publication_snapshot(&conn)?;
+    let alpha = "sym:a.ts#::alpha@1";
+
+    fs::write(
+        repo.path().join("README.md"),
+        "# Alpha\n\nAlpha is the workflow entry.\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    assert_ne!(
+        crate::publication::current_publication_snapshot(&conn)?,
+        publication
+    );
+
+    let candidates = workflow_candidates(
+        repo.path(),
+        &conn,
+        &[alpha.into()],
+        &WorkflowCandidateOptions {
+            expected_snapshot: Some(snapshot.clone()),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(candidates.snapshot, snapshot);
+    assert!(
+        candidates
+            .candidates
+            .iter()
+            .any(|candidate| candidate.anchor == alpha)
+    );
+
+    let artifact = annotate(
+        repo.path(),
+        &conn,
+        &AnnotateInput {
+            artifact_type: "annotation".into(),
+            name: Some("alpha behavior".into()),
+            body: json!({ "claim": "alpha is the workflow entry" }),
+            supports: vec![support("/claim", alpha, "a.ts")],
+            confidence: "likely".into(),
+            snapshot: snapshot.clone(),
+            supersedes: None,
+        },
+    )?;
+    assert_eq!(
+        artifact.source_snapshot,
+        crate::publication::durable_code_source(&snapshot)
+    );
+
+    fs::write(
+        repo.path().join("a.ts"),
+        "export function alpha() { return 2; }\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let stale = workflow_candidates(
+        repo.path(),
+        &conn,
+        &[alpha.into()],
+        &WorkflowCandidateOptions {
+            expected_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    )
+    .expect_err("a code edit must invalidate the old semantic guard");
+    assert!(stale.to_string().contains("snapshot is stale"));
+    Ok(())
+}
+
+#[test]
 fn annotate_rejects_untrusted_confidence_bad_spans_and_stale_snapshots() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(

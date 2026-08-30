@@ -45,6 +45,7 @@ fn markdown_admission_does_not_change_serialized_code_search_ranking() -> Result
     };
     let before = search(&conn, None, "shared ranking calibration", &options)?;
     assert!(!before.hits.is_empty());
+    let before_publication = crate::publication::current_publication_snapshot(&conn)?;
     let before_json = serde_json::to_string(&before)?.replace(&before.snapshot, "<snapshot>");
 
     fs::write(
@@ -56,9 +57,11 @@ fn markdown_admission_does_not_change_serialized_code_search_ranking() -> Result
     )?;
     indexer::index_repo(repo.path(), &conn)?;
     let after = search(&conn, None, "shared ranking calibration", &options)?;
+    let after_publication = crate::publication::current_publication_snapshot(&conn)?;
     let after_json = serde_json::to_string(&after)?.replace(&after.snapshot, "<snapshot>");
 
-    assert_ne!(before.snapshot, after.snapshot);
+    assert_eq!(before.snapshot, after.snapshot);
+    assert_ne!(before_publication, after_publication);
     assert_eq!(before_json, after_json);
     Ok(())
 }
@@ -922,6 +925,37 @@ fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor()
         .as_ref()
         .and_then(|metadata| metadata.next_cursor.clone())
         .expect("continuation cursor");
+    let publication_before_docs = crate::publication::Identities::read(&conn)?.publication;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Paging\n\nDocumentation changes must not invalidate code cursors.\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let after_docs = crate::publication::Identities::read(&conn)?;
+    assert_eq!(after_docs.code, original_snapshot);
+    assert_ne!(after_docs.publication, publication_before_docs);
+    let resumed_after_docs = search(
+        &conn,
+        None,
+        "pagingNeedle",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: Some(first_cursor.clone()),
+            },
+            limit: 10,
+            rerank: false,
+            response_byte_limit: 1_000_000,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        resumed_after_docs
+            .hits
+            .iter()
+            .map(|hit| hit.file.as_str())
+            .collect::<Vec<_>>(),
+        ["c.ts"]
+    );
     let wrong_query = search(
         &conn,
         None,

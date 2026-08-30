@@ -248,6 +248,7 @@ pub fn persist_classification(
         bail!("repository classification confidence must be likely or possible");
     }
     let selector_json = serde_json::to_string(classification.selector)?;
+    let source_snapshot = crate::publication::durable_code_source(classification.source_snapshot);
     conn.execute(
         "INSERT INTO repository_classifications(
            run_id, subject_key, subject_kind, selector_json, parent_subject_key,
@@ -270,7 +271,7 @@ pub fn persist_classification(
             classification.cited_evidence_json,
             classification.evidence_fingerprint,
             classification.classification_fingerprint,
-            classification.source_snapshot,
+            source_snapshot,
         ],
     )?;
     Ok(conn.last_insert_rowid())
