@@ -32,11 +32,12 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
             )?;
             let status = store::status(&conn)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
+                println!("{}", serde_json::to_string(&status)?);
             } else {
                 println!(
-                    "documentation digest: {} root={}",
+                    "documentation digest: {} publication_snapshot={} root={}",
                     status.snapshot,
+                    status.publication_snapshot,
                     status.canonical_root.as_deref().unwrap_or("unknown")
                 );
                 println!(
@@ -101,11 +102,12 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
                 batch.unwrap_or(runtime.effective.embedding.batch),
             )?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!("{}", serde_json::to_string(&report)?);
             } else {
                 println!(
-                    "documentation vectors: snapshot={} embedded={} cached={} occurrences={} dimensions={} ready={}",
+                    "documentation vectors: snapshot={} publication_snapshot={} embedded={} cached={} occurrences={} dimensions={} ready={}",
                     report.snapshot,
+                    report.publication_snapshot,
                     report.embedded,
                     report.cached_reused,
                     report.occurrences_materialized,
@@ -177,7 +179,7 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
                         defaults.response_bytes
                     }),
                     output: if debug_json {
-                        retrieval::SearchOutput::Pretty
+                        retrieval::SearchOutput::Debug
                     } else if json {
                         retrieval::SearchOutput::Compact
                     } else {
@@ -192,9 +194,9 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
                 },
             )?;
             if debug_json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                println!("{}", serde_json::to_string(&result)?);
             } else if json {
-                print!("{}", retrieval::compact_search_string(&result)?);
+                println!("{}", retrieval::compact_search_string(&result)?);
             } else {
                 print!("{}", retrieval::human_search_string(&result));
             }

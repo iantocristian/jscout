@@ -20,7 +20,32 @@ pub(crate) struct Identities {
     pub publication: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Plane {
+    Code,
+    Documentation,
+}
+
+/// The one identity block carried by a public response. `snapshot` is the
+/// response plane's invalidation identity; `publication_snapshot` only
+/// correlates responses that observed the same atomic publication.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResponseIdentity {
+    pub snapshot: String,
+    pub publication_snapshot: String,
+}
+
 impl Identities {
+    pub(crate) fn response(self, plane: Plane) -> ResponseIdentity {
+        ResponseIdentity {
+            snapshot: match plane {
+                Plane::Code => self.code,
+                Plane::Documentation => self.documentation,
+            },
+            publication_snapshot: self.publication,
+        }
+    }
+
     pub(crate) fn compute(
         conn: &Connection,
         resolution_hash: &str,

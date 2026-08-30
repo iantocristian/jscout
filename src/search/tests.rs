@@ -45,8 +45,9 @@ fn markdown_admission_does_not_change_serialized_code_search_ranking() -> Result
     };
     let before = search(&conn, None, "shared ranking calibration", &options)?;
     assert!(!before.hits.is_empty());
-    let before_publication = crate::publication::current_publication_snapshot(&conn)?;
-    let before_json = serde_json::to_string(&before)?.replace(&before.snapshot, "<snapshot>");
+    let before_json = serde_json::to_string(&before)?
+        .replace(&before.snapshot, "<snapshot>")
+        .replace(&before.publication_snapshot, "<publication>");
 
     fs::write(
         repo.path().join("README.md"),
@@ -57,11 +58,12 @@ fn markdown_admission_does_not_change_serialized_code_search_ranking() -> Result
     )?;
     indexer::index_repo(repo.path(), &conn)?;
     let after = search(&conn, None, "shared ranking calibration", &options)?;
-    let after_publication = crate::publication::current_publication_snapshot(&conn)?;
-    let after_json = serde_json::to_string(&after)?.replace(&after.snapshot, "<snapshot>");
+    let after_json = serde_json::to_string(&after)?
+        .replace(&after.snapshot, "<snapshot>")
+        .replace(&after.publication_snapshot, "<publication>");
 
     assert_eq!(before.snapshot, after.snapshot);
-    assert_ne!(before_publication, after_publication);
+    assert_ne!(before.publication_snapshot, after.publication_snapshot);
     assert_eq!(before_json, after_json);
     Ok(())
 }
@@ -225,7 +227,6 @@ fn rust_lexical_hits_do_not_advertise_or_seed_structural_graph_calls() -> Result
             include_memory: false,
             expand: true,
             compact: true,
-            include_neighborhood_followups: true,
             ..SearchOptions::default()
         },
     )?;
@@ -236,7 +237,6 @@ fn rust_lexical_hits_do_not_advertise_or_seed_structural_graph_calls() -> Result
         .expect("Rust lexical hit");
     assert!(hit.anchors.is_empty());
     assert!(hit.file_anchor.is_none());
-    assert!(!hit.include_neighborhood_followup);
     let expansion = result.expansion.as_ref().expect("requested expansion");
     assert!(expansion.seeds.is_empty());
     assert!(expansion.nodes.is_empty());
@@ -248,11 +248,7 @@ fn rust_lexical_hits_do_not_advertise_or_seed_structural_graph_calls() -> Result
         .and_then(|hits| hits.iter().find(|hit| hit["at"] == "native.rs:1"))
         .expect("compact Rust hit");
     assert!(rendered_hit.get("anchor").is_none());
-    let calls = rendered_hit["followups"]["calls"]
-        .as_array()
-        .expect("file follow-up calls");
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["tool"], "file_outline");
+    assert!(rendered_hit.get("followups").is_none());
     Ok(())
 }
 
@@ -297,9 +293,11 @@ fn ranked_format_scope_filters_lexical_and_exact_candidates_before_limits() -> R
             MatchReason::ExactDefinition | MatchReason::ExactOccurrence
         )
     }));
-    assert!(rust.hits.iter().all(|hit| {
-        hit.anchors.is_empty() && hit.file_anchor.is_none() && !hit.include_neighborhood_followup
-    }));
+    assert!(
+        rust.hits
+            .iter()
+            .all(|hit| hit.anchors.is_empty() && hit.file_anchor.is_none())
+    );
 
     let typescript = scoped(vec!["typescript".into()])?;
     assert!(!typescript.hits.is_empty());
@@ -844,7 +842,6 @@ fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor()
                 limit: 2,
                 rerank: false,
                 compact: true,
-                include_neighborhood_followups: false,
                 response_byte_limit: 1_000_000,
                 file_origins: vec!["workspace".into(), "repository".into(), "workspace".into()],
                 ..Default::default()
@@ -861,7 +858,6 @@ fn exhaustive_search_pages_the_complete_lexical_chunk_set_and_binds_its_cursor()
         assert_eq!(metadata.scope.file_roles, SearchScopeFileRoles::All);
         assert_eq!(metadata.scope.origins, ["repository", "workspace"]);
         assert_eq!(metadata.scope.formats, SearchScopeFormats::All);
-        assert_eq!(metadata.scope.snapshot, result.snapshot);
         if let Some(expected) = total_chunks {
             assert_eq!(metadata.total_chunks, expected);
         } else {
@@ -1176,12 +1172,13 @@ fn exhaustive_budget_search_query(
 }
 
 #[test]
-fn exhaustive_search_emits_complete_handoff_only_on_the_first_page() -> Result<()> {
+fn exhaustive_search_emits_anchor_locators_without_followup_scaffolding() -> Result<()> {
     let (_repo, conn) = exhaustive_budget_fixture()?;
 
     let first_page = exhaustive_budget_search(&conn, None, 1, true, 1_000_000)?;
     let first_value = crate::compact::search_value(&first_page);
-    assert!(first_value["hits"][0]["followups"]["arguments"].is_object());
+    assert!(first_value["hits"][0].get("anchor").is_some());
+    assert!(first_value["hits"][0].get("followups").is_none());
     let first_cursor = first_page
         .exhaustive
         .as_ref()
@@ -1190,12 +1187,8 @@ fn exhaustive_search_emits_complete_handoff_only_on_the_first_page() -> Result<(
     let second_page = exhaustive_budget_search(&conn, Some(first_cursor), 1, true, 1_000_000)?;
     let second_value = crate::compact::search_value(&second_page);
     assert_eq!(second_page.hits[0].file, "b.ts");
-    assert!(second_value["hits"][0]["followups"]["tools"].is_array());
-    assert!(
-        second_value["hits"][0]["followups"]
-            .get("arguments")
-            .is_none()
-    );
+    assert!(second_value["hits"][0].get("anchor").is_some());
+    assert!(second_value["hits"][0].get("followups").is_none());
     Ok(())
 }
 
@@ -1231,7 +1224,6 @@ fn exhaustive_budget_locator_floor_advances_from_the_last_rendered_hit() -> Resu
         .next_cursor
         .clone()
         .expect("locator continuation cursor");
-    assert!(locator_page.response_budget.exhaustive_locator_only);
     assert_eq!(
         locator_page.response_budget.rendered_bytes,
         floor.minimum_bytes
@@ -1258,7 +1250,7 @@ fn exhaustive_budget_locator_floor_advances_from_the_last_rendered_hit() -> Resu
             .as_array()
             .expect("continuation hits")
             .iter()
-            .all(|hit| hit["followups"].get("arguments").is_none())
+            .all(|hit| hit.get("followups").is_none())
     );
 
     let one_below = exhaustive_budget_search(&conn, None, 3, true, floor.minimum_bytes - 1)
@@ -1286,7 +1278,6 @@ fn exhaustive_budget_floor_handles_terminal_and_diagnostic_envelopes() -> Result
         .minimum_bytes;
     let terminal_page = exhaustive_budget_search(&conn, None, 4, true, terminal_floor)?;
     assert_eq!(terminal_page.response_budget.rendered_bytes, terminal_floor);
-    assert!(terminal_page.response_budget.exhaustive_locator_only);
     let terminal_one_below = exhaustive_budget_search(&conn, None, 4, true, terminal_floor - 1)
         .expect_err("one byte below the terminal-page floor must fail");
     assert_eq!(
@@ -1297,9 +1288,8 @@ fn exhaustive_budget_floor_handles_terminal_and_diagnostic_envelopes() -> Result
         terminal_floor
     );
 
-    // Diagnostic JSON serializes `byte_limit` itself. Its reported floor must
-    // already include the extra digits introduced when the caller retries at
-    // that value.
+    // Diagnostic JSON does not echo the caller's byte limit, but its reported
+    // floor must still fit the exact response returned at that limit.
     let debug_error = exhaustive_budget_search(&conn, None, 3, false, 1)
         .expect_err("one byte cannot fit diagnostic exhaustive JSON");
     let debug_floor = debug_error
@@ -1307,8 +1297,13 @@ fn exhaustive_budget_floor_handles_terminal_and_diagnostic_envelopes() -> Result
         .expect("typed diagnostic budget error")
         .minimum_bytes;
     let debug_page = exhaustive_budget_search(&conn, None, 3, false, debug_floor)?;
+    assert!(
+        serde_json::to_value(&debug_page)?["response_budget"]
+            .get("byte_limit")
+            .is_none()
+    );
     assert_eq!(
-        serde_json::to_string_pretty(&debug_page)?.len(),
+        serde_json::to_string(&debug_page)?.len(),
         debug_page.response_budget.rendered_bytes
     );
     assert_eq!(debug_page.response_budget.rendered_bytes, debug_floor);
@@ -1732,7 +1727,7 @@ fn exhaustive_search_reports_unique_match_lines_without_rich_decorations() -> Re
         assert!(object.contains_key("anchor") || object.contains_key("anchors"));
         assert!(object.keys().all(|key| matches!(
             key.as_str(),
-            "at" | "kind" | "match_lines" | "anchor" | "anchors" | "followups"
+            "at" | "kind" | "match_lines" | "anchor" | "anchors"
         )));
     }
 
@@ -1890,28 +1885,18 @@ fn search_projects_chunks_to_snapshot_scoped_anchors() -> Result<()> {
     assert_eq!(definition.anchors, vec!["sym:a.ts#::greet@1"]);
     assert_eq!(definition.used_by, vec!["greet: 1 sites"]);
     assert!(approximate_name_usage_occurrences(&conn, &result.hits)? > 0);
-    assert_eq!(
-        result
-            .hits
-            .iter()
-            .filter(|hit| hit.include_followups)
-            .count(),
-        1
-    );
     let compact = crate::compact::search_value(&result);
     let compact_hits = compact["hits"].as_array().expect("compact hits");
-    assert_eq!(
+    assert!(
         compact_hits
             .iter()
-            .filter(|hit| hit["followups"].get("arguments").is_some())
-            .count(),
-        1
+            .all(|hit| hit.get("anchor").is_some() || hit.get("anchors").is_some())
     );
-    assert!(compact_hits.iter().all(|hit| {
-        hit.get("anchors").is_some()
-            || hit["followups"]["tools"].is_array()
-            || hit["followups"]["calls"].is_array()
-    }));
+    assert!(
+        compact_hits
+            .iter()
+            .all(|hit| hit.get("followups").is_none())
+    );
     assert!(result.expansion.is_none());
     Ok(())
 }
@@ -1949,7 +1934,6 @@ fn expansion_uses_one_global_node_edge_and_byte_budget() -> Result<()> {
             reranker: None,
             timing: false,
             compact: true,
-            include_neighborhood_followups: true,
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             expansion: ExpansionOptions {
                 projection: ExpansionProjection::Paths,
@@ -1997,7 +1981,6 @@ fn expansion_uses_one_global_node_edge_and_byte_budget() -> Result<()> {
             reranker: None,
             timing: false,
             compact: false,
-            include_neighborhood_followups: true,
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
             expansion: ExpansionOptions {
                 byte_limit: 1,
@@ -2278,8 +2261,6 @@ fn attached_memory_requires_direct_graph_or_artifact_relation_evidence() -> Resu
         file_anchor: Some("file:entry.ts".into()),
         uses: Vec::new(),
         used_by: Vec::new(),
-        include_followups: true,
-        include_neighborhood_followup: true,
     };
     let candidates = vec![
         artifact(3, 1.0, vec![support(&unrelated, "unrelated.ts")]),
@@ -2332,7 +2313,7 @@ fn response_budget_caps_the_complete_rendered_search_envelope() -> Result<()> {
             ..Default::default()
         },
     )?;
-    let rendered = serde_json::to_string_pretty(&result)?;
+    let rendered = serde_json::to_string(&result)?;
     assert!(rendered.len() <= 2_000);
     assert_eq!(rendered.len(), result.response_budget.rendered_bytes);
     assert!(result.response_budget.unbudgeted_bytes > rendered.len());
@@ -2368,7 +2349,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
     };
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
+        publication_snapshot: "p".repeat(64),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -2390,7 +2371,6 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
             selected_path_edges: Vec::new(),
             node_limit: 3,
             edge_limit: 2,
-            byte_limit: 10_000,
             file_roles: vec!["production".into(), "unknown".into()],
             file_origins: origin::defaults(),
             payload_bytes: 0,
@@ -2416,7 +2396,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
 fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
+        publication_snapshot: "p".repeat(64),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
@@ -2439,8 +2419,6 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
             file_anchor: Some("file:src/large.ts".into()),
             uses: vec!["helper (call)".into()],
             used_by: vec!["caller: 1 site".into()],
-            include_followups: true,
-            include_neighborhood_followup: true,
         }],
         semantic_artifacts: vec![SemanticArtifact {
             id: 1,
@@ -2490,68 +2468,6 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
 }
 
 #[test]
-fn compact_budget_sheds_followups_before_primary_hit_identity() -> Result<()> {
-    let mut result = SearchResult {
-        snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
-        exhaustive: None,
-        retrieval: RetrievalStatus::vector_disabled(),
-        hits: vec![Hit {
-            chunk_id: 1,
-            file: "src/target.ts".into(),
-            file_role: "production".into(),
-            repository_role: None,
-            file_origin: "repository".into(),
-            kind: "function".into(),
-            name: Some("target".into()),
-            start_line: 10,
-            end_line: 12,
-            score: 1.0,
-            match_reason: MatchReason::Hybrid,
-            matched_identifiers: Vec::new(),
-            match_lines: None,
-            snippet: "export function target() { return 1; }".into(),
-            snippet_truncated: false,
-            anchors: vec!["sym:src/target.ts#::target@1".into()],
-            file_anchor: Some("file:src/target.ts".into()),
-            uses: Vec::new(),
-            used_by: Vec::new(),
-            include_followups: true,
-            include_neighborhood_followup: true,
-        }],
-        semantic_artifacts: Vec::new(),
-        semantic_retrieval: None,
-        semantic_attachment: None,
-        semantic_candidates: 0,
-        semantic_selected: 0,
-        expansion: None,
-        response_budget: ResponseBudget {
-            byte_limit: 425,
-            ..Default::default()
-        },
-    };
-
-    apply_response_budget(&mut result, true)?;
-    assert_eq!(result.hits.len(), 1);
-    assert!(!result.hits[0].include_followups);
-    assert_eq!(result.response_budget.omitted_followups, 1);
-    let compact = crate::compact::search_value(&result);
-    assert!(compact["hits"][0]["followups"]["tools"].is_array());
-    assert!(compact["hits"][0]["followups"].get("arguments").is_none());
-    assert!(result.response_budget.rendered_bytes <= 425);
-    let sections = crate::compact::search_section_bytes(&result)?;
-    assert_eq!(
-        sections.hits_bytes
-            + sections.graph_bytes
-            + sections.memory_bytes
-            + sections.envelope_bytes,
-        sections.total_bytes
-    );
-    assert_eq!(sections.total_bytes, serde_json::to_vec(&compact)?.len());
-    Ok(())
-}
-
-#[test]
 fn search_caps_rendered_semantic_supports_even_under_a_large_byte_budget() -> Result<()> {
     let supports = (0..20)
         .map(|index| SemanticSupport {
@@ -2593,7 +2509,7 @@ fn search_caps_rendered_semantic_supports_even_under_a_large_byte_budget() -> Re
     second_artifact.name = Some("second workflow".into());
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
+        publication_snapshot: "p".repeat(64),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),

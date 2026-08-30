@@ -38,7 +38,7 @@ pub struct EnrichOptions<'a> {
     /// Internal watcher policy: seed a new snapshot batch from the previous
     /// active batch when project and fact identities still validate.
     pub carry_forward: bool,
-    /// Discard exact-snapshot reuse, staging resume, and watch carry. Exposed
+    /// Discard exact-code-digest reuse, staging resume, and watch carry. Exposed
     /// as manual `enrich --full` and used by the watch drift-flush timer.
     pub force_full: bool,
     /// Current watcher event paths used only to order delta work.
@@ -2054,7 +2054,7 @@ fn deactivate_stale_active_batch(
 }
 
 /// Read-only authorization used by Rust-only watch refreshes before rebinding
-/// an active checker publication to a replacement shared snapshot. Every
+/// an active checker publication to a replacement code digest. Every
 /// publishable project must still match the exact repository/absolute inputs
 /// recorded by the checker; missing or unreadable inputs fail closed.
 pub(crate) fn active_batch_inputs_fresh(
@@ -3658,7 +3658,7 @@ fn activate_staging_batch(
             package_gate.validate_fresh()?;
         }
         if crate::structural::current_snapshot(conn)? != snapshot {
-            bail!("structural snapshot changed while enrichment was running; staged work retained");
+            bail!("code snapshot changed while enrichment was running; staged work retained");
         }
         let pending: i64 = conn.query_row(
             "SELECT count(*) FROM checker_project_runs
@@ -3894,7 +3894,7 @@ fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> 
         fs::read(path).with_context(|| format!("could not read indexed source {display}"))?;
     let actual = blake3::hash(&bytes).to_hex().to_string();
     if actual != expected {
-        bail!("indexed source changed since the structural snapshot: {display}");
+        bail!("indexed source changed since the code snapshot: {display}");
     }
     Ok(())
 }
@@ -4086,7 +4086,7 @@ fn publish(root: &Path, conn: &Connection, plan: &PublishPlan<'_>) -> Result<i64
     let result = (|| -> Result<i64> {
         let current = crate::structural::current_snapshot(conn)?;
         if current != plan.snapshot {
-            bail!("structural snapshot changed while enrichment was running; published nothing");
+            bail!("code snapshot changed while enrichment was running; published nothing");
         }
         for fact in plan.facts {
             recheck_occurrence(root, conn, &fact.occurrence)?;

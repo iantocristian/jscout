@@ -322,7 +322,6 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     ),
                     timing: runtime.effective.diagnostics.timing,
                     compact: json,
-                    include_neighborhood_followups: true,
                     response_byte_limit: effective_search_response_byte_limit(
                         response_bytes,
                         configured.response_bytes,
@@ -429,7 +428,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             )?;
             let publication =
                 semantic::annotate_request_with_provider(&root, &conn, provider.as_ref(), input)?;
-            println!("{}", serde_json::to_string_pretty(&publication)?);
+            println!("{}", serde_json::to_string(&publication)?);
             Ok(())
         }
         Command::Memory {
@@ -512,7 +511,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     debug,
                 },
             )?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!("{}", serde_json::to_string(&result)?);
             Ok(())
         }
         Command::Overview {
@@ -548,7 +547,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     response_byte_limit: response_bytes,
                 },
             )?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!("{}", serde_json::to_string(&result)?);
             Ok(())
         }
         Command::WorkflowCandidates {
@@ -573,7 +572,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     candidate_limit,
                 },
             )?;
-            println!("{}", serde_json::to_string_pretty(&candidates)?);
+            println!("{}", serde_json::to_string(&candidates)?);
             Ok(())
         }
         Command::Watch {
@@ -746,7 +745,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     dirty_files: Vec::new(),
                 },
             )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            println!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
         Command::Checker { command } => match command {

@@ -4,8 +4,8 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::{
-    AnnotateInput, SupportInput, WorkflowCandidateOptions, annotate, search, support_relationship,
-    workflow_candidates,
+    AnnotateInput, AnnotateRequest, SupportInput, WorkflowCandidateOptions, annotate,
+    annotate_request_with_provider, search, support_relationship, workflow_candidates,
 };
 use crate::{indexer, store, structural};
 
@@ -856,6 +856,10 @@ fn docs_only_publication_preserves_semantic_code_guards() -> Result<()> {
         },
     )?;
     assert_eq!(candidates.snapshot, snapshot);
+    assert_eq!(
+        candidates.publication_snapshot,
+        crate::publication::Identities::read(&conn)?.publication
+    );
     assert!(
         candidates
             .candidates
@@ -897,6 +901,47 @@ fn docs_only_publication_preserves_semantic_code_guards() -> Result<()> {
     )
     .expect_err("a code edit must invalidate the old semantic guard");
     assert!(stale.to_string().contains("snapshot is stale"));
+    Ok(())
+}
+
+#[test]
+fn annotation_publication_echoes_the_identity_validated_by_its_write() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("a.ts"),
+        "export function alpha() { return 1; }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let identities = crate::publication::Identities::read(&conn)?;
+    let anchor = "sym:a.ts#::alpha@1";
+
+    let publication = annotate_request_with_provider(
+        repo.path(),
+        &conn,
+        None,
+        AnnotateRequest::Annotation {
+            name: Some("alpha behavior".into()),
+            body: json!({ "claim": "alpha is stable" }),
+            supports: vec![support("/claim", anchor, "a.ts")],
+            confidence: "likely".into(),
+            snapshot: identities.code.clone(),
+            supersedes: None,
+        },
+    )?;
+
+    assert_eq!(publication.snapshot, identities.code);
+    assert_eq!(publication.publication_snapshot, identities.publication);
+    assert_eq!(
+        publication.artifact.source_snapshot,
+        crate::publication::durable_code_source(&publication.snapshot)
+    );
+    let rendered = serde_json::to_value(&publication)?;
+    assert_eq!(rendered["snapshot"], publication.snapshot);
+    assert_eq!(
+        rendered["publication_snapshot"],
+        publication.publication_snapshot
+    );
     Ok(())
 }
 

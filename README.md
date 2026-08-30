@@ -35,7 +35,7 @@ From a source checkout:
 cargo build --release            # binary at target/release/jscout
 jscout config init /path/to/repo # create repository-local runtime policy
 jscout config validate /path/to/repo
-jscout index /path/to/repo       # rebuild the current structural snapshot
+jscout index /path/to/repo       # rebuild the current index publication
 jscout search /path/to/repo "checkout inventory"
 ```
 
@@ -163,9 +163,10 @@ jscout agent-guide --update R  # replace it with the current shipped skill
 ### Markdown and MDX documentation retrieval
 
 Repository Markdown and MDX are admitted by the normal `jscout index` pass
-into the shared snapshot and database. They rank in an isolated BM25/vector
-corpus, so documentation never changes code-search term statistics or vector
-candidates. MDX deliberately uses the same inert Markdown block parser: raw
+into the same atomic database publication as code, with a separate
+documentation digest. They rank in an isolated BM25/vector corpus, so
+documentation never changes code-search term statistics or vector candidates.
+MDX deliberately uses the same inert Markdown block parser: raw
 JSX, props, expressions, and inner text remain searchable documentation and
 never enter code graphs. Two narrow exclusions keep retrieval units useful: a
 contiguous leading import/export-only preamble emits no chunk, and exact JSX
@@ -218,16 +219,16 @@ projection has been published, an effectively freshness-enabled search fails
 closed and asks for `jscout index`; freshness-disabled search, status, embed,
 and code surfaces remain available.
 
-Vector search joins BM25 only when the current shared snapshot has a complete
-documentation vector generation for the configured embedding profile. Ordinary
+Vector search joins BM25 only when the current documentation digest has a
+complete vector generation for the configured embedding profile. Ordinary
 search falls back to BM25 when vectors are absent; `--vector` requires vector
 participation and fails instead. Index rebuilds rematerialize complete cached
 documentation generations without provider calls; only new documentation
 identities require `jscout docs embed`. Ordinary `jscout embed` and watched
-code embedding never request documentation vectors. Hits retain title,
-description, tags, heading context, exact source spans, and the indexed file
-hash. The MCP `documentation_search` tool exposes the same isolated ranking
-corpus.
+code embedding never request documentation vectors. Retrieval returns title,
+description, tags, heading context, path, and line range; file hashes and byte
+offsets remain internal. The MCP `documentation_search` tool exposes the same
+isolated ranking corpus.
 Membership defaults to exact lowercase `**/*.md` and `**/*.mdx` and is
 configured with `[docs]`. `docs.search.freshness` controls both indexed Git
 provenance and the bounded temporal reorder. `--no-freshness` disables only the
@@ -236,21 +237,22 @@ the indexed projection.
 
 Documentation provenance publishes an internal
 `meta.documentation_provenance_digest` in the same database transaction as the
-shared snapshot. A history-only attribution change updates that digest without
-rotating `meta.snapshot`, so code-bound checker, semantic, and cursor state does
-not become stale solely because Git authorship metadata changed. Documentation
-source edits still rotate `meta.snapshot`, and public responses continue to
-report that shared snapshot; a full code/docs identity split is separate work.
-Snapshot equality covers indexed source content, not optional provenance fields
-or freshness-adjusted ranking.
-The first reindex after installing the digest-split version may rotate an older
-structural digest once because the structural hash contract itself changed.
+code and documentation digests. A history-only attribution change rotates the
+global `publication_snapshot` fold while leaving both content digests stable,
+so code-bound checker, semantic, and cursor state does not become stale solely
+because Git authorship metadata changed. A documentation source edit rotates
+the documentation digest and publication fold but leaves the code digest
+unchanged. Code and semantic responses expose the code digest as `snapshot`;
+documentation responses expose the documentation digest; every indexed
+response also carries `publication_snapshot` for cross-response correlation.
+The first reindex after installing the split rebuilds disposable pre-split
+state once through the schema gate.
 
 Git provenance control-file events also still request a full watch generation.
 The digest prevents cross-plane invalidation, but it does not yet provide a
 provenance-only watcher fast path. Full refreshes rematerialize any complete
 documentation-vector generation from the durable cache even when the rebuilt
-shared snapshot digest is unchanged.
+documentation digest is unchanged.
 
 Build a distributable archive containing the Rust binary and both installed
 sidecars:
@@ -549,32 +551,33 @@ rebuilding the Program, and then exits so its heap is reclaimed before the next
 project starts.
 
 Results are committed to SQLite staging after every successful batch. The run
-key includes the structural snapshot, deterministic plan, TypeScript identity,
+key includes the code digest, deterministic plan, TypeScript identity,
 and checker protocol. A killed Rust process leaves those rows non-public;
 rerunning the same command resumes the missing occurrence/project pairs. A
 controlled project failure activates only completed projects, marks the failed
 owner in coverage, and forces affected targeted edges to `possible`; that same
 batch remains the resume target. After every project completes, Rust rechecks
-the structural snapshot, distinct checker inputs, and mapped target
+the code digest, distinct checker inputs, and mapped target
 fingerprints, publishes the complete canonical batch, and drops the superseded
-batch. A structural race remains staged and publishes nothing.
+batch. A code-publication race remains staged and publishes nothing.
 Each request has a hard deadline (`--timeout`, default 300 seconds); timeout
 kills only the current project worker. Progress names the project and reports
 staged occurrences plus Node RSS and heap usage. Worker crashes return the
 actual Node error/stack in the command error as well as stderr.
 
-### Checker snapshot lifecycle
+### Checker code-digest lifecycle
 
-Every checker batch is bound to exactly one structural snapshot. Projection
-accepts it only when `source_snapshot` matches. Manual `jscout index` clears all
-checker batches, even when the rebuilt structural snapshot is identical; run
-`jscout enrich` afterward when occurrence-specific checker edges are needed.
+Every checker batch is bound to exactly one code digest. Projection accepts it
+only when `source_snapshot` matches. Manual `jscout index` preserves or rebinds
+an active publication only when the code digest, checker contracts, canonical
+checker inputs, module resolution, and on-disk inputs all still validate;
+otherwise it clears the checker plane.
 
-`tsconfig` files are checker invalidation boundaries, not structural snapshot
-inputs. Editing or deleting one can therefore leave the reported structural
-snapshot hash unchanged. In watch mode the boundary event still starts a
+`tsconfig` files are checker invalidation boundaries, not code-digest inputs.
+Editing or deleting one can therefore leave the reported code digest unchanged.
+In watch mode the boundary event still starts a
 generation, and the checker planner's configuration-chain and membership
-fingerprints determine which projects must run again; snapshot equality alone
+fingerprints determine which projects must run again; code-digest equality alone
 does not imply that checker configuration was unchanged.
 
 `jscout watch --enrich` performs the cycle: reindex first, then run the same
@@ -641,11 +644,12 @@ use full refresh. Non-boundary directory and uncertain missing-path events use
 the same complete-inventory incremental path, because their paths are not the
 correctness inventory. Full scope is sticky within a coalesced generation.
 
-Both refresh modes rerun dependency ownership, module resolution, snapshot
+Both refresh modes rerun dependency ownership, module resolution, plane-digest
 calculation, vector occurrence rematerialization, and structural projection as
-needed. Manual indexing clears checker facts. Watch may reuse an exact-snapshot
-batch or keep the active publication plus the newest reusable superseded
-staging source hidden as inputs to the following validated carry pass. A
+needed. Either mode retains a checker publication only after exact code-digest
+and input validation. Watch may additionally keep the active publication plus
+the newest reusable superseded staging source hidden as inputs to the following
+validated carry pass. A
 deterministic extraction rejection or non-retryable read failure is reported
 and excluded; an old row for that path is not served as current. The refresh
 still succeeds over the indexable corpus.
@@ -900,13 +904,12 @@ The complete diagnostics remain available with `debug=true` and in telemetry;
 rank, lexical-score, and vector-cosine values are diagnostic signals, not
 calibrated probabilities.
 
-Compact code hits advertise compatible follow-up tools. Only the highest-ranked
-eligible hit includes complete copy-safe arguments by default. Symbol anchors and
-their snapshot can be passed unchanged to `definition`, `who_uses`, or
-`neighborhood`; file-only hits expose only `file_outline` and `neighborhood`.
-Exact `definition`/`who_uses` anchor mode is mutually exclusive with their
-human-authored fuzzy `symbol` mode and preserves same-named methods instead of
-round-tripping through a lossy `path:name` shorthand.
+Compact code hits carry copy-safe symbol anchors without per-hit follow-up
+objects. Pair one anchor with the response's top-level `snapshot` when calling
+`definition`, `who_uses`, or `neighborhood`; pass a file hit's path to
+`file_outline`. Exact `definition`/`who_uses` anchor mode is mutually exclusive
+with their human-authored fuzzy `symbol` mode and preserves same-named methods
+instead of round-tripping through a lossy `path:name` shorthand.
 
 When an interactive `annotate` call starts with a healthy semantic vector
 index, jscout embeds the new document and incrementally synchronizes that
@@ -984,7 +987,7 @@ concurrency; Node/gateway and
 checker paths; MCP profile/source view/result transport; telemetry; index dependencies; and
 watch defaults. Query text, exact targets, dry-run intent, temporary widened
 budgets, and model-call caps remain per invocation. Changing retrieval posture
-does not alter the structural snapshot or embedding profile, so disabling and
+does not alter either content digest or the embedding profile, so disabling and
 later re-enabling reranking never causes a re-embed.
 
 MCP remains one process for one root and one database. `jscout mcp
@@ -1112,13 +1115,13 @@ never silently guesses an implementation. The same query is exposed as the
 
 ## Search anchors and expansion
 
-Search returns a repository snapshot, retrieval-stage status, and ranked hits.
+Search returns a code snapshot, retrieval-stage status, and ranked hits.
 `retrieval.vector` is `active`, `disabled`, or `degraded`; degraded means the
 requested vector stage failed and the returned ranking is lexical-only. This
 status is present in compact CLI/MCP and full diagnostic JSON, so an agent does
 not have to infer vector availability from stderr. Every hit includes a
 `file_role`. Structurally eligible JavaScript/TypeScript hits also include a
-`file_anchor` and one or more snapshot-scoped `anchors` projected from the
+`file_anchor` and one or more code-snapshot-scoped `anchors` projected from the
 chunk's overlapping declarations, falling back to the file anchor. Rust lexical
 hits omit structural anchors and graph follow-ups. Roles are deterministic:
 `production`, `test`, `fixture`, `generated`, `documentation`, or `unknown`.
@@ -1182,16 +1185,14 @@ omitted, so inspecting diagnostics cannot silently remove graph nodes or edges.
 Pass `--response-bytes` explicitly to test diagnostic truncation. Compact CLI
 and MCP responses retain their configured complete-response budgets.
 
-Compact hits also expose copy-safe follow-ups. An unscoped symbol hit returns
-one shared `arguments` object accepted unchanged by `definition`, `who_uses`,
-and `neighborhood`. A format-scoped symbol hit instead returns per-tool calls:
-`definition` and `who_uses` preserve and enforce the original `formats`
-allowlist, while `neighborhood` receives no unsupported filter. Ambiguous
-multi-anchor chunks expose their anchors but no follow-up object. A file-only
-hit returns per-tool call objects for
-`file_outline` and `neighborhood`. The snapshot is part of exact-anchor
-arguments so stale anchors re-resolve by path/scope/name or fail closed instead
-of silently binding to a same-named declaration.
+For exact drill-down, construct arguments from a hit's `anchor` and the
+response's top-level `snapshot`. Preserve any explicit `origins` and `formats`
+from the originating search request for `definition` and `who_uses`;
+`neighborhood` does not accept a format filter. Ambiguous chunks expose
+`anchors` for the caller to choose from, and file-only hits retain their `at`
+locator. Supplying the snapshot makes stale anchors re-resolve by
+path/scope/name or fail closed instead of silently binding to a same-named
+declaration.
 
 An explicit `--response-bytes` caps whichever complete JSON representation was requested:
 hits, expansion, budget metadata, and serialization overhead. The result
@@ -1216,11 +1217,10 @@ or `stale` label. The complete response-byte limit includes semantic artifacts.
 structural rows across snapshots. It preserves content-hash embedding cache
 rows, semantic memory, and immutable repository-reconnaissance history, then
 rematerializes current vector occurrences and exact fresh reconnaissance policy
-from those durable planes. Checker enrichment is snapshot-bound: manual index
-clears it, while watch may reuse an exact batch or validate and rebind
-unchanged project facts into a newly published current-snapshot batch. Run
-`jscout enrich` again after manual indexing when those occurrence-specific
-edges are required.
+from those durable planes. Checker enrichment is code-digest-bound: manual
+index and watch may reuse an exact batch or validate and rebind unchanged facts
+into the newly published code digest; invalid checker state is cleared. Run
+`jscout enrich` when no validated occurrence-specific checker edges remain.
 `jscout watch` coordinates full convergence and bounded incremental source
 refreshes with optional embedding/checker operations, debounce, retries, and
 periodic complete-inventory incremental reconciliation. `watch --embed` updates the default corpus;
@@ -1528,9 +1528,10 @@ carry `repository`, `workspace`, or `dependency` origin plus optional package
 instance/path identity. Package instances record canonical root, name, version,
 locator, manifest hash, and completeness status.
 
-Repository Markdown uses the shared `files`/`chunks` snapshot and durable
-content-addressed embedding cache. `docs_fts` and dimension-specific docs vector
-tables keep its ranking statistics and candidates isolated from code search.
+Repository Markdown uses the shared `files`/`chunks` tables and durable
+content-addressed embedding cache, while its documentation digest is independent
+of the code digest. `docs_fts` and dimension-specific docs vector tables keep
+its ranking statistics and candidates isolated from code search.
 
 Agent-authored and generated `workflow`, `card`, `summary`, `concept`, and
 `annotation` records live in separate `semantic_artifacts`/

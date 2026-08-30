@@ -51,7 +51,7 @@ pub(super) fn render_cli_neighborhood(
     debug_json: bool,
 ) -> Result<String> {
     Ok(if debug_json && response_bytes.is_none() {
-        serde_json::to_string_pretty(&neighborhood)?
+        serde_json::to_string(&neighborhood)?
     } else if debug_json {
         mcp::render_bounded_object_arrays(
             serde_json::to_value(neighborhood)?,
@@ -128,10 +128,11 @@ pub(super) fn cmd_search(
         return Ok(());
     }
     if debug_json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
     println!("snapshot: {}", result.snapshot);
+    println!("publication snapshot: {}", result.publication_snapshot);
     println!(
         "retrieval: lexical={} vector={} reranker={}",
         result.retrieval.lexical, result.retrieval.vector, result.retrieval.reranker
@@ -346,9 +347,11 @@ pub(super) fn cmd_calls(
     let conn = open_database_read_only(root, database)?;
     let result = calls::query(root, &conn, query)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
+    println!("snapshot: {}", result.snapshot);
+    println!("publication snapshot: {}", result.publication_snapshot);
     if result.matches.is_empty() {
         println!(
             "no matching call sites ({} candidate files scanned)",
@@ -401,7 +404,11 @@ pub(super) fn cmd_events(
     file_origins: &[String],
 ) -> Result<()> {
     let conn = open_database_read_only(root, Some(database))?;
-    let sites = query::events_in_origins(&conn, name, file_origins)?;
+    let (identity, sites) = with_code_response(&conn, || {
+        query::events_in_origins(&conn, name, file_origins)
+    })?;
+    println!("snapshot: {}", identity.snapshot);
+    println!("publication snapshot: {}", identity.publication_snapshot);
     if sites.is_empty() {
         println!("no event sites found");
         return Ok(());
@@ -433,18 +440,40 @@ pub(super) fn cmd_who_uses(
     file_origins: &[String],
 ) -> Result<()> {
     let conn = open_database_read_only(root, Some(database))?;
-    let graph = query::ModuleGraph::load(&conn)?;
-    let targets = query::find_symbols_in_origins(&conn, spec, file_origins)?;
-    if targets.is_empty() {
+    let (identity, results) = with_code_response(&conn, || {
+        let graph = query::ModuleGraph::load(&conn)?;
+        let targets = query::find_symbols_in_origins(&conn, spec, file_origins)?;
+        let mut results = Vec::with_capacity(targets.len());
+        for target in targets {
+            let usages = cli_who_uses_for_target(&conn, &graph, &target, file_origins)?;
+            results.push((target, usages));
+        }
+        Ok(results)
+    })?;
+    if results.is_empty() {
         eprintln!("no symbol found for '{spec}'");
         std::process::exit(1);
     }
-    for t in &targets {
-        let usages = cli_who_uses_for_target(&conn, &graph, t, file_origins)?;
-        if json {
-            println!("{}", serde_json::json!({ "target": t, "usages": usages }));
-            continue;
-        }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "snapshot": identity.snapshot,
+                "publication_snapshot": identity.publication_snapshot,
+                "targets": results
+                    .iter()
+                    .map(|(target, usages)| serde_json::json!({
+                        "target": target,
+                        "usages": usages,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+    println!("snapshot: {}", identity.snapshot);
+    println!("publication snapshot: {}", identity.publication_snapshot);
+    for (t, usages) in &results {
         println!(
             "\n{} {} — {}:{} ({}{})",
             t.kind,
@@ -459,7 +488,7 @@ pub(super) fn cmd_who_uses(
             },
         );
         let mut by_conf: std::collections::BTreeMap<&str, Vec<&query::Usage>> = Default::default();
-        for u in &usages {
+        for u in usages {
             by_conf.entry(u.confidence.as_str()).or_default().push(u);
         }
         for conf in ["certain", "likely", "possible"] {
@@ -482,6 +511,17 @@ pub(super) fn cmd_who_uses(
         }
     }
     Ok(())
+}
+
+fn with_code_response<T>(
+    conn: &rusqlite::Connection,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<(crate::publication::ResponseIdentity, T)> {
+    store::with_read_snapshot(conn, "jscout_cli_response", || {
+        let identity =
+            crate::publication::Identities::read(conn)?.response(crate::publication::Plane::Code);
+        Ok((identity, operation()?))
+    })
 }
 
 fn cli_who_uses_for_target(

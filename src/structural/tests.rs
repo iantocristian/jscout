@@ -41,7 +41,9 @@ fn projects_resolved_calls_and_returns_snapshot() -> Result<()> {
             ..Default::default()
         },
     )?;
-    assert_eq!(result.snapshot.len(), 64);
+    let identities = crate::publication::Identities::read(&conn)?;
+    assert_eq!(result.snapshot, identities.code);
+    assert_eq!(result.publication_snapshot, identities.publication);
     assert!(result.resolved_anchor.contains("a.ts#::greet@1"));
     assert!(result.edges.iter().any(|edge| {
         edge.kind == "call"
@@ -687,6 +689,9 @@ fn paths_returns_ranked_bounded_composed_routes() -> Result<()> {
             ..Default::default()
         },
     )?;
+    let identities = crate::publication::Identities::read(&conn)?;
+    assert_eq!(result.snapshot, identities.code);
+    assert_eq!(result.publication_snapshot, identities.publication);
     assert_eq!(result.paths.len(), 1);
     assert_eq!(result.paths[0].steps.len(), 2);
     assert!(result.paths[0].score > 0.0);
@@ -1969,10 +1974,10 @@ fn checker_facts_project_per_occurrence_without_replacing_member_hubs() -> Resul
 }
 
 /// Checker facts are one disposable plane, not independently freshened
-/// project fragments. A structural snapshot change suppresses the entire
-/// old batch until enrichment publishes a batch for the new snapshot.
+/// project fragments. A code-digest change suppresses the entire old batch
+/// until enrichment publishes a batch for the new code digest.
 #[test]
-fn checker_batch_is_removed_after_snapshot_changes() -> Result<()> {
+fn checker_batch_is_removed_after_code_digest_changes() -> Result<()> {
     let repo = tempfile::tempdir()?;
     write(
         repo.path(),

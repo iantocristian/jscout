@@ -4,7 +4,11 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::{embed, file_role, origin, query, semantic, store, structural};
+use crate::{
+    embed, file_role, origin,
+    publication::{Identities, Plane},
+    query, semantic, store, structural,
+};
 
 pub(crate) type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
@@ -96,8 +100,8 @@ pub struct SearchOptions {
     pub mode: SearchMode,
     pub limit: usize,
     pub expand: bool,
-    /// Maximum bytes in the pretty-printed JSON search envelope. This covers
-    /// hits, expansion, metadata, and serialization overhead.
+    /// Maximum bytes in the serialized JSON search envelope. This covers hits,
+    /// expansion, metadata, and serialization overhead.
     pub response_byte_limit: usize,
     /// Optional role allowlist for primary hits. Empty preserves normal recall.
     pub file_roles: Vec<String>,
@@ -123,10 +127,6 @@ pub struct SearchOptions {
     /// Budget and render the agent-facing compact transport rather than the
     /// diagnostic representation.
     pub compact: bool,
-    /// Emit neighborhood follow-ups when that structural tool is available.
-    /// Baseline MCP search disables these while retaining exact definition and
-    /// `who_uses` hand-offs.
-    pub include_neighborhood_followups: bool,
     pub expansion: ExpansionOptions,
 }
 
@@ -148,7 +148,6 @@ impl Default for SearchOptions {
             reranker: None,
             timing: false,
             compact: false,
-            include_neighborhood_followups: true,
             expansion: ExpansionOptions::default(),
         }
     }
@@ -205,7 +204,6 @@ pub struct SearchScope {
     pub file_roles: SearchScopeFileRoles,
     pub origins: Vec<String>,
     pub formats: SearchScopeFormats,
-    pub snapshot: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -264,8 +262,7 @@ impl std::error::Error for ResponseBudgetTooSmall {}
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub snapshot: String,
-    #[serde(skip)]
-    pub(crate) requested_formats: Vec<String>,
+    pub publication_snapshot: String,
     #[serde(flatten)]
     pub exhaustive: Option<ExhaustiveSearchMetadata>,
     pub retrieval: RetrievalStatus,
@@ -353,6 +350,7 @@ impl RetrievalStatus {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ResponseBudget {
+    #[serde(skip)]
     pub byte_limit: usize,
     pub rendered_bytes: usize,
     pub unbudgeted_bytes: usize,
@@ -362,14 +360,9 @@ pub struct ResponseBudget {
     pub omitted_semantic_supports: usize,
     pub omitted_nodes: usize,
     pub omitted_edges: usize,
-    pub omitted_followups: usize,
     pub truncated_snippets: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_sections: Option<SearchSectionBytes>,
-    /// Render a retained exhaustive hit as a bare locator when the response
-    /// budget cannot carry even its compact follow-up hint.
-    #[serde(skip)]
-    pub(crate) exhaustive_locator_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -403,7 +396,6 @@ pub struct SearchExpansion {
     pub(crate) selected_path_edges: Vec<Vec<EdgeIdentity>>,
     pub node_limit: usize,
     pub edge_limit: usize,
-    pub byte_limit: usize,
     pub file_roles: Vec<String>,
     pub file_origins: Vec<String>,
     pub payload_bytes: usize,
@@ -452,13 +444,6 @@ pub struct Hit {
     pub uses: Vec<String>,
     /// Symbols declared here that other files use, with usage counts.
     pub used_by: Vec<String>,
-    /// Whether this hit retains the one complete copy-safe argument object.
-    /// Every uniquely anchored compact hit still advertises compatible tools.
-    /// The response budget may shed these arguments before dropping the hit.
-    #[serde(skip)]
-    pub include_followups: bool,
-    #[serde(skip)]
-    pub include_neighborhood_followup: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1308,10 +1293,7 @@ fn format_allowlist_json(
     ))?)
 }
 
-fn exhaustive_scope(
-    options: &SearchOptions,
-    snapshot: &str,
-) -> (Vec<String>, Vec<String>, SearchScope) {
+fn exhaustive_scope(options: &SearchOptions) -> (Vec<String>, Vec<String>, SearchScope) {
     let selected_roles = normalized_allowlist(&options.file_roles, file_role::ALL);
     let all_roles = selected_roles.len() == file_role::ALL.len();
     let query_roles = if options.file_roles.is_empty() || all_roles {
@@ -1345,7 +1327,6 @@ fn exhaustive_scope(
             file_roles,
             origins,
             formats,
-            snapshot: snapshot.to_string(),
         },
     )
 }
@@ -1535,7 +1516,7 @@ fn exhaustive_hits(
     snapshot: &str,
     cursor: Option<&str>,
 ) -> Result<(Vec<Hit>, ExhaustivePageState)> {
-    let (file_roles, file_formats, scope) = exhaustive_scope(options, snapshot);
+    let (file_roles, file_formats, scope) = exhaustive_scope(options);
     let request_fingerprint =
         exhaustive_request_fingerprint(q, &file_roles, &scope.origins, &file_formats);
     let query = exhaustive_fts_query(q);
@@ -1666,7 +1647,6 @@ fn exhaustive_hits(
         let structurally_eligible =
             crate::formats::by_id(&row.format).is_some_and(|format| format.structural_eligible());
         let file_anchor = structurally_eligible.then(|| format!("file:{}", row.position.path));
-        let include_neighborhood_followup = file_anchor.is_some();
         let highlighted_content = highlighted
             .remove(&row.chunk_id)
             .ok_or_else(|| anyhow::anyhow!("missing exhaustive highlight for selected chunk"))?;
@@ -1693,15 +1673,8 @@ fn exhaustive_hits(
             file_anchor,
             uses: Vec::new(),
             used_by: Vec::new(),
-            include_followups: false,
-            include_neighborhood_followup,
         });
         selected_positions.push(row.position);
-    }
-    if cursor.is_none()
-        && let Some(hit) = hits.iter_mut().find(|hit| hit.anchors.len() <= 1)
-    {
-        hit.include_followups = true;
     }
     Ok((
         hits,
@@ -1858,21 +1831,16 @@ pub fn search(
         }
     };
     store::with_read_snapshot(conn, "jscout_search", || {
-        let snapshot = structural::current_snapshot(conn)?;
-        let (mut hits, retrieval, exhaustive_state) =
+        let identity = Identities::read(conn)?.response(Plane::Code);
+        let snapshot = &identity.snapshot;
+        let (hits, retrieval, exhaustive_state) =
             if matches!(&options.mode, SearchMode::Exhaustive { .. }) {
-                let (hits, state) =
-                    exhaustive_hits(conn, q, options, &snapshot, exhaustive_cursor)?;
+                let (hits, state) = exhaustive_hits(conn, q, options, snapshot, exhaustive_cursor)?;
                 (hits, RetrievalStatus::vector_disabled(), Some(state))
             } else {
                 let (hits, retrieval) = ranked_hits(conn, provider, q, options)?;
                 (hits, retrieval, None)
             };
-        if !options.include_neighborhood_followups {
-            for hit in &mut hits {
-                hit.include_neighborhood_followup = false;
-            }
-        }
         let (semantic_artifacts, semantic_retrieval, semantic_attachment, semantic_candidates) =
             if options.include_memory {
                 let candidate_limit = options.memory_limit.saturating_mul(8).clamp(1, 100);
@@ -1895,7 +1863,7 @@ pub fn search(
         let semantic_selected = semantic_artifacts.len();
         let expansion = options
             .expand
-            .then(|| expand_hits(conn, &snapshot, &hits, &options.expansion, options.compact))
+            .then(|| expand_hits(conn, snapshot, &hits, &options.expansion, options.compact))
             .transpose()?;
         let exhaustive = exhaustive_state
             .as_ref()
@@ -1918,8 +1886,8 @@ pub fn search(
                 page_had_more: state.has_more,
             });
         let mut result = SearchResult {
-            snapshot,
-            requested_formats: options.formats.clone(),
+            snapshot: identity.snapshot,
+            publication_snapshot: identity.publication_snapshot,
             exhaustive,
             retrieval,
             hits,
@@ -2377,9 +2345,6 @@ fn ranked_hits(
             }
         }
     }
-    if let Some(hit) = hits.iter_mut().find(|hit| hit.anchors.len() <= 1) {
-        hit.include_followups = true;
-    }
     Ok((hits, retrieval))
 }
 
@@ -2609,7 +2574,6 @@ fn load_hit(
         Vec::new()
     };
     let file_anchor = structurally_eligible.then(|| format!("file:{file}"));
-    let include_neighborhood_followup = file_anchor.is_some();
 
     // Outgoing: what this chunk calls/renders (top few, certain only).
     let uses: Vec<String> = if structurally_eligible {
@@ -2665,8 +2629,6 @@ fn load_hit(
         file_anchor,
         uses,
         used_by,
-        include_followups: false,
-        include_neighborhood_followup,
     }))
 }
 
@@ -2794,33 +2756,6 @@ fn apply_response_budget_once(result: &mut SearchResult, compact: bool) -> Resul
                 expansion.payload_bytes = expansion_payload_bytes(expansion, compact)?;
                 continue;
             }
-        }
-
-        if compact
-            && let Some(hit) = result
-                .hits
-                .iter_mut()
-                .rev()
-                .find(|hit| hit.include_followups && hit.anchors.len() <= 1)
-        {
-            hit.include_followups = false;
-            result.response_budget.omitted_followups += 1;
-            continue;
-        }
-
-        // Exhaustive pages must either retain at least one complete locator or
-        // fail. After shedding the complete first-page handoff, remove the
-        // remaining tools-only hints before dropping any locators so the
-        // rendered prefix stays as long as the byte limit permits. Anchor
-        // identity is never shortened because every retained locator must
-        // remain exact.
-        if compact
-            && !result.hits.is_empty()
-            && result.exhaustive.is_some()
-            && !result.response_budget.exhaustive_locator_only
-        {
-            result.response_budget.exhaustive_locator_only = true;
-            continue;
         }
 
         // Shed only from the tail: ranked search keeps its top hit, while an
@@ -3028,7 +2963,7 @@ fn rendered_bytes(result: &SearchResult, compact: bool) -> Result<usize> {
     if compact {
         crate::compact::search_rendered_bytes(result)
     } else {
-        Ok(serde_json::to_string_pretty(result)?.len())
+        Ok(serde_json::to_string(result)?.len())
     }
 }
 
@@ -3359,7 +3294,6 @@ fn expand_hits(
         selected_path_edges: selection.selected_path_edges,
         node_limit: options.node_limit,
         edge_limit: options.edge_limit,
-        byte_limit: options.byte_limit,
         file_roles: options.file_roles.clone(),
         file_origins: options.file_origins.clone(),
         payload_bytes,

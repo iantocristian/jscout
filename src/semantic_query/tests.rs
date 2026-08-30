@@ -196,6 +196,9 @@ fn semantic_query_filters_relates_and_drills_to_exact_source() -> Result<()> {
             ..Default::default()
         },
     )?;
+    let identities = crate::publication::Identities::read(&conn)?;
+    assert_eq!(result.snapshot, identities.code);
+    assert_eq!(result.publication_snapshot, identities.publication);
     assert_eq!(result.candidate_artifacts, 1);
     assert_eq!(result.mode, "discovery");
     assert_eq!(result.artifact_handles[0].id, card.id);
@@ -275,6 +278,9 @@ fn semantic_query_filters_relates_and_drills_to_exact_source() -> Result<()> {
     );
 
     let full = serde_json::to_value(&detail)?;
+    assert_eq!(full["snapshot"], identities.code);
+    assert_eq!(full["publication_snapshot"], identities.publication);
+    assert!(full["response_budget"].get("byte_limit").is_none());
     assert_eq!(
         full["semantic_artifacts"][0]["body"]["purpose"],
         "starts the settlement flow"
@@ -296,6 +302,10 @@ fn semantic_query_filters_relates_and_drills_to_exact_source() -> Result<()> {
     assert_eq!(no_source.semantic_artifacts[0].id, card.id);
     assert!(no_source.source_evidence.is_empty());
     assert!(result.response_budget.rendered_bytes <= 24_000);
+    assert_eq!(
+        result.response_budget.rendered_bytes,
+        serde_json::to_string(&result)?.len()
+    );
     assert_eq!(
         result.response_budget.unbudgeted_bytes,
         result.response_budget.rendered_bytes

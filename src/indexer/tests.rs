@@ -140,7 +140,7 @@ fn documentation_provenance_is_default_off_and_freshness_queries_fail_closed() -
 
     let lexical_options = docs::retrieval::SearchOptions {
         response_bytes: usize::MAX,
-        output: docs::retrieval::SearchOutput::Pretty,
+        output: docs::retrieval::SearchOutput::Debug,
         vector: false,
         rerank: false,
         ..docs::retrieval::SearchOptions::default()
@@ -825,8 +825,7 @@ fn mdx_uses_the_docs_corpus_without_entering_code_surfaces() -> Result<()> {
         assert_eq!(rows, expected, "docs FTS query {query}");
     }
 
-    let snapshot = structural::current_snapshot(&conn)?;
-    let docs_hits = docs::store::lexical_search(&conn, &snapshot, "mdxOnlyNeedle", 10)?;
+    let docs_hits = docs::store::lexical_search(&conn, "mdxOnlyNeedle", 10)?;
     assert_eq!(docs_hits.len(), 1);
     assert_eq!(docs_hits[0].path, "guide.mdx");
     assert!(

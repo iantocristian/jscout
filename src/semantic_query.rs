@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 use serde_json::Value;
 
+use crate::publication::{Identities, Plane};
 use crate::{embed, origin, recon, semantic, store, structural};
 
 pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
@@ -332,6 +333,7 @@ pub struct ConceptTag {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ResponseBudget {
+    #[serde(skip)]
     pub byte_limit: usize,
     pub rendered_bytes: usize,
     pub unbudgeted_bytes: usize,
@@ -352,6 +354,7 @@ pub struct ResponseBudget {
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub snapshot: String,
+    pub publication_snapshot: String,
     /// `discovery` returns compact handles; `artifact_detail` is the only mode
     /// that returns full semantic bodies and relation/source payloads.
     pub mode: &'static str,
@@ -396,6 +399,7 @@ impl Serialize for QueryResult {
         let diagnostic = self.render_diagnostics();
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("snapshot", &self.snapshot)?;
+        map.serialize_entry("publication_snapshot", &self.publication_snapshot)?;
         map.serialize_entry("mode", &self.mode)?;
         map.serialize_entry("status", &self.status)?;
         if self.mode == "artifact_detail" && !diagnostic {
@@ -528,8 +532,9 @@ pub fn query(
 ) -> Result<QueryResult> {
     validate_options(options)?;
     store::with_read_snapshot(conn, "jscout_semantic_query", || {
-        let snapshot = structural::current_snapshot(conn)?;
-        let support_scope = resolve_support_scope(conn, options)?;
+        let identity = Identities::read(conn)?.response(Plane::Code);
+        let snapshot = identity.snapshot;
+        let support_scope = resolve_support_scope(conn, options, &snapshot)?;
         let localized = support_scope.localized();
         let detail_mode = options.artifact_id.is_some();
         let mut candidates = candidates(conn, options)?;
@@ -699,6 +704,7 @@ pub fn query(
             || relation_paths_truncated;
         let mut result = QueryResult {
             snapshot,
+            publication_snapshot: identity.publication_snapshot,
             mode: if detail_mode {
                 "artifact_detail"
             } else {
@@ -803,12 +809,21 @@ fn validate_options(options: &QueryOptions) -> Result<()> {
     Ok(())
 }
 
-fn resolve_support_scope(conn: &Connection, options: &QueryOptions) -> Result<SupportScope> {
+fn resolve_support_scope(
+    conn: &Connection,
+    options: &QueryOptions,
+    snapshot: &str,
+) -> Result<SupportScope> {
     let anchor = options
         .anchor
         .as_deref()
         .map(|anchor| {
-            structural::resolve_current_anchor_in_origins(conn, anchor, &options.file_origins)
+            structural::resolve_anchor_in_origins_at_snapshot(
+                conn,
+                anchor,
+                snapshot,
+                &options.file_origins,
+            )
         })
         .transpose()?;
     let file = options
@@ -1798,13 +1813,13 @@ fn settle_unbudgeted_bytes(result: &mut QueryResult) -> Result<()> {
 
 fn settle_rendered_bytes(result: &mut QueryResult) -> Result<usize> {
     for _ in 0..8 {
-        let rendered = serde_json::to_string_pretty(result)?.len();
+        let rendered = serde_json::to_string(result)?.len();
         if result.response_budget.rendered_bytes == rendered {
             return Ok(rendered);
         }
         result.response_budget.rendered_bytes = rendered;
     }
-    Ok(serde_json::to_string_pretty(result)?.len())
+    Ok(serde_json::to_string(result)?.len())
 }
 
 fn truncate_utf8(text: &mut String, max_bytes: usize) {

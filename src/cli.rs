@@ -43,7 +43,7 @@ pub(super) enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Rebuild the structural snapshot (.jscout.db in the repo root)
+    /// Rebuild the canonical index publication (.jscout.db in the repo root)
     Index {
         /// Repository root
         root: PathBuf,
@@ -381,7 +381,7 @@ pub(super) enum Command {
         /// Current symbol anchors or uniquely resolvable symbol names; file anchors are rejected
         #[arg(required = true)]
         seeds: Vec<String>,
-        /// Optional expected structural snapshot
+        /// Optional expected code snapshot
         #[arg(long)]
         snapshot: Option<String>,
         /// Ranked traversal depth

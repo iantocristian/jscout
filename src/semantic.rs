@@ -6,7 +6,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{embed, structural};
+use crate::publication::{Identities, Plane, ResponseIdentity};
+use crate::{embed, store, structural};
 
 const MAX_BODY_BYTES: usize = 12_000;
 // Generated workflows may carry four evidence spans for each of 31
@@ -145,6 +146,8 @@ pub struct ArtifactRetrievalScore {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnnotationPublication {
+    pub snapshot: String,
+    pub publication_snapshot: String,
     #[serde(flatten)]
     pub artifact: SemanticArtifact,
     pub vector_memory: AnnotationVectorStatus,
@@ -237,6 +240,7 @@ pub struct WorkflowCandidate {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkflowCandidateSet {
     pub snapshot: String,
+    pub publication_snapshot: String,
     pub seeds: Vec<String>,
     pub direction: String,
     pub depth: usize,
@@ -266,6 +270,19 @@ pub fn workflow_candidates(
     seeds: &[String],
     options: &WorkflowCandidateOptions,
 ) -> Result<WorkflowCandidateSet> {
+    store::with_read_snapshot(conn, "jscout_workflow_candidates", || {
+        let identity = Identities::read(conn)?.response(Plane::Code);
+        workflow_candidates_in_snapshot(root, conn, seeds, options, &identity)
+    })
+}
+
+fn workflow_candidates_in_snapshot(
+    root: &Path,
+    conn: &Connection,
+    seeds: &[String],
+    options: &WorkflowCandidateOptions,
+    identity: &ResponseIdentity,
+) -> Result<WorkflowCandidateSet> {
     if seeds.is_empty() {
         bail!("workflow candidates require at least one seed anchor");
     }
@@ -275,7 +292,7 @@ pub fn workflow_candidates(
     if options.candidate_limit == 0 || options.candidate_limit > MAX_WORKFLOW_CANDIDATES {
         bail!("workflow candidate limit must be between 1 and {MAX_WORKFLOW_CANDIDATES}");
     }
-    let snapshot = structural::current_snapshot(conn)?;
+    let snapshot = identity.snapshot.as_str();
     if options
         .expected_snapshot
         .as_deref()
@@ -286,7 +303,12 @@ pub fn workflow_candidates(
     let mut resolved_seeds = seeds
         .iter()
         .map(|seed| {
-            structural::resolve_current_anchor_in_origins(conn, seed, &crate::origin::defaults())
+            structural::resolve_anchor_in_origins_at_snapshot(
+                conn,
+                seed,
+                snapshot,
+                &crate::origin::defaults(),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     resolved_seeds.sort();
@@ -338,14 +360,15 @@ pub fn workflow_candidates(
     let candidate_truncated = candidates.len() > options.candidate_limit;
     candidates.truncate(options.candidate_limit);
     let fingerprint = workflow_candidate_fingerprint(
-        &snapshot,
+        snapshot,
         &resolved_seeds,
         options.depth,
         options.candidate_limit,
         &candidates,
     );
     Ok(WorkflowCandidateSet {
-        snapshot,
+        snapshot: identity.snapshot.clone(),
+        publication_snapshot: identity.publication_snapshot.clone(),
         seeds: resolved_seeds,
         direction: "both".into(),
         depth: options.depth,
@@ -459,12 +482,8 @@ fn workflow_candidate_fingerprint(
     hasher.finalize().to_hex().to_string()
 }
 
-pub fn annotate_request(
-    root: &Path,
-    conn: &Connection,
-    request: AnnotateRequest,
-) -> Result<SemanticArtifact> {
-    let input = match request {
+fn annotate_input_from_request(request: AnnotateRequest) -> Result<AnnotateInput> {
+    Ok(match request {
         AnnotateRequest::Workflow {
             name,
             participants,
@@ -488,8 +507,7 @@ pub fn annotate_request(
             snapshot,
             supersedes,
         },
-    };
-    annotate(root, conn, &input)
+    })
 }
 
 /// Publish one interactive agent write and, only when this provider's
@@ -509,7 +527,8 @@ pub fn annotate_request_with_provider(
             error
         })
     });
-    let artifact = annotate_request(root, conn, request)?;
+    let input = annotate_input_from_request(request)?;
+    let (artifact, identity) = annotate_with_identity(root, conn, &input)?;
     let vector_memory = match (provider, ready_before_write) {
         (None, _) => AnnotationVectorStatus {
             status: "disabled",
@@ -543,6 +562,8 @@ pub fn annotate_request_with_provider(
         (Some(_), None) => unreachable!("provider presence determines preflight presence"),
     };
     Ok(AnnotationPublication {
+        snapshot: identity.snapshot,
+        publication_snapshot: identity.publication_snapshot,
         artifact,
         vector_memory,
     })
@@ -602,33 +623,50 @@ pub(crate) fn workflow_request(
     })
 }
 
+#[cfg(test)]
 pub fn annotate(root: &Path, conn: &Connection, input: &AnnotateInput) -> Result<SemanticArtifact> {
-    let (snapshot, supports) = validate_annotate_input(root, conn, input)?;
+    annotate_with_identity(root, conn, input).map(|(artifact, _)| artifact)
+}
+
+fn annotate_with_identity(
+    root: &Path,
+    conn: &Connection,
+    input: &AnnotateInput,
+) -> Result<(SemanticArtifact, ResponseIdentity)> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let inserted = persist_validated_artifact(
-        conn,
-        input,
-        &snapshot,
-        &supports,
-        &[],
-        &ArtifactProvenance {
-            model: "agent-reported",
-            prompt_version: "annotate/v2",
-            scout_run_id: None,
-            input_fingerprint: None,
-        },
-    );
-    let artifact_id = match inserted {
-        Ok(id) => {
-            conn.execute_batch("COMMIT")?;
-            id
+    let result = (|| {
+        let identity = Identities::read(conn)?.response(Plane::Code);
+        let supports = validate_annotate_input_at_snapshot(root, conn, input, &identity.snapshot)?;
+        let artifact_id = persist_validated_artifact(
+            conn,
+            input,
+            &identity.snapshot,
+            &supports,
+            &[],
+            &ArtifactProvenance {
+                model: "agent-reported",
+                prompt_version: "annotate/v2",
+                scout_run_id: None,
+                input_fingerprint: None,
+            },
+        )?;
+        let artifact =
+            load_artifact(conn, artifact_id)?.context("inserted semantic artifact is missing")?;
+        Ok((artifact, identity))
+    })();
+    match result {
+        Ok(output) => {
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error.into());
+            }
+            Ok(output)
         }
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");
-            return Err(error);
+            Err(error)
         }
-    };
-    load_artifact(conn, artifact_id)?.context("inserted semantic artifact is missing")
+    }
 }
 
 /// Generated-artifact provenance. Agent annotations carry no run identity;
@@ -648,8 +686,18 @@ pub(crate) fn validate_annotate_input(
     conn: &Connection,
     input: &AnnotateInput,
 ) -> Result<(String, Vec<ValidatedSupport>)> {
-    validate_input(input)?;
     let snapshot = structural::current_snapshot(conn)?;
+    let supports = validate_annotate_input_at_snapshot(root, conn, input, &snapshot)?;
+    Ok((snapshot, supports))
+}
+
+fn validate_annotate_input_at_snapshot(
+    root: &Path,
+    conn: &Connection,
+    input: &AnnotateInput,
+    snapshot: &str,
+) -> Result<Vec<ValidatedSupport>> {
+    validate_input(input)?;
     if input.snapshot != snapshot {
         bail!("annotation snapshot is stale; current snapshot is {snapshot}");
     }
@@ -696,7 +744,7 @@ pub(crate) fn validate_annotate_input(
                 support.claim_path
             );
         }
-        let anchor = structural::resolve_current_anchor(conn, &support.anchor)?;
+        let anchor = structural::resolve_anchor_at_snapshot(conn, &support.anchor, snapshot)?;
         if anchor != support.anchor {
             bail!("semantic supports require exact current anchors; use `{anchor}`");
         }
@@ -780,7 +828,7 @@ pub(crate) fn validate_annotate_input(
         });
     }
 
-    Ok((snapshot, supports))
+    Ok(supports)
 }
 
 /// Insert the artifact, its fingerprint, and its supports. No transaction

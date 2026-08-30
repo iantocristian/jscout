@@ -3158,7 +3158,7 @@ fn summary_reuse_survives_unrelated_changes() -> Result<()> {
     )?;
     let summary_id = first.reports[0].artifact_id.expect("published summary");
 
-    // A new file moves the structural snapshot but leaves this scope's
+    // A new file moves the code snapshot but leaves this scope's
     // children untouched: the summary fingerprint is snapshot-free, so the
     // completed run is reused instead of respent.
     std::fs::write(
@@ -3277,7 +3277,7 @@ fn summary_publication_refuses_a_child_added_mid_flight() -> Result<()> {
 
     // Planning sees only the start card. While the model call is in
     // flight, an agent adds a second current card to the same file. No
-    // source or structural snapshot changes, and the original child is
+    // source or code snapshot changes, and the original child is
     // untouched, so only a complete child-set recheck can catch it.
     let finish_anchor = crate::structural::resolve_current_anchor(&conn, "flow.ts:finish")?;
     let root = repo.path().to_path_buf();

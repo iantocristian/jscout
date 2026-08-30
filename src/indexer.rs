@@ -1015,7 +1015,7 @@ fn index_repo_attempt<F: FileSystem>(
             }
         }
         identities.publish(conn)?;
-        // Documentation readiness is exact-snapshot state. Rebuild it from the
+        // Documentation readiness is exact-digest state. Rebuild it from the
         // durable shared cache after the new marker exists, but before the outer
         // publication commit. An incomplete cache remains a normal NotReady
         // state and never turns indexing into a provider operation.

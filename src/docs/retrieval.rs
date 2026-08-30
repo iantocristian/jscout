@@ -14,6 +14,7 @@ use super::store::{self, SearchHit};
 use crate::embed::{
     ProfileSpec, Provider, ResolvedProfile, validate_response_profile, vec_to_blob,
 };
+use crate::publication::{Identities, Plane, ResponseIdentity};
 use crate::search::Reranker;
 
 const RRF_K: f64 = 60.0;
@@ -24,6 +25,7 @@ const MAX_CAPTURE_BYTES: u64 = 4_194_304;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct EmbedReport {
     pub snapshot: String,
+    pub publication_snapshot: String,
     pub profile_id: Option<i64>,
     pub profile_fingerprint: String,
     pub dimensions: Option<usize>,
@@ -39,6 +41,7 @@ pub struct EmbedReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchOptions {
     pub limit: usize,
+    #[serde(skip_serializing)]
     pub response_bytes: usize,
     pub output: SearchOutput,
     pub vector: bool,
@@ -70,7 +73,7 @@ impl Default for SearchOptions {
 #[serde(rename_all = "snake_case")]
 pub enum SearchOutput {
     Compact,
-    Pretty,
+    Debug,
     Human,
 }
 
@@ -158,6 +161,7 @@ impl SourceState {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SearchResponse {
     pub snapshot: String,
+    pub publication_snapshot: String,
     pub hits: Vec<RetrievalHit>,
     pub diagnostics: RetrievalDiagnostics,
     pub truncated: bool,
@@ -178,13 +182,10 @@ pub fn compact_search_string(result: &SearchResponse) -> Result<String> {
                 "tags": hit.document.tags,
                 "heading": hit.document.breadcrumb,
                 "lines": [hit.document.start_line, hit.document.end_line],
-                "source_bytes": [hit.document.source_start, hit.document.source_end],
                 "content": hit.content,
                 "freshness_basis": hit.document.freshness_basis,
                 "freshness_value": hit.freshness_value,
                 "freshness_secondary_value": hit.freshness_secondary_value,
-                "snapshot": hit.document.snapshot,
-                "file_hash": hit.document.file_hash,
                 "source_state": hit.source_state,
                 "source_detail": hit.source_detail,
             })
@@ -192,6 +193,7 @@ pub fn compact_search_string(result: &SearchResponse) -> Result<String> {
         .collect::<Vec<_>>();
     Ok(serde_json::to_string(&json!({
         "snapshot": result.snapshot,
+        "publication_snapshot": result.publication_snapshot,
         "hits": hits,
         "truncated": result.truncated,
         "retrieval": {
@@ -205,8 +207,9 @@ pub fn compact_search_string(result: &SearchResponse) -> Result<String> {
 
 pub fn human_search_string(result: &SearchResponse) -> String {
     let mut output = format!(
-        "documentation snapshot {}: {} hits (vector={:?}, reranker={:?}, freshness={:?}, max_rank_movement={}, truncated={}, budget_dropped={})\n",
+        "documentation snapshot {} publication_snapshot={}: {} hits (vector={:?}, reranker={:?}, freshness={:?}, max_rank_movement={}, truncated={}, budget_dropped={})\n",
         result.snapshot,
+        result.publication_snapshot,
         result.hits.len(),
         result.diagnostics.vector_status,
         result.diagnostics.reranker_status,
@@ -220,7 +223,7 @@ pub fn human_search_string(result: &SearchResponse) -> String {
             .expect("documentation string tags always serialize as JSON");
         let _ = writeln!(
             output,
-            "\n{}. {}:{}-{}  {}\ntitle={} description={} tags={}\nfreshness={} changed={} base_rank={} movement={}{}\nsnapshot={} file_hash={} source_state={}{}\n{}",
+            "\n{}. {}:{}-{}  {}\ntitle={} description={} tags={}\nfreshness={} changed={} base_rank={} movement={}{}\nsource_state={}{}\n{}",
             hit.rank,
             hit.document.path,
             hit.document.start_line,
@@ -236,8 +239,6 @@ pub fn human_search_string(result: &SearchResponse) -> String {
             hit.freshness_secondary_value
                 .as_deref()
                 .map_or_else(String::new, |value| format!(" previous={value}")),
-            hit.document.snapshot,
-            hit.document.file_hash,
             hit.source_state.as_str(),
             hit.source_detail
                 .as_deref()
@@ -371,7 +372,10 @@ pub fn embed_current(conn: &Connection, provider: &Provider, batch: usize) -> Re
         batch > 0,
         "documentation embedding batch size must be positive"
     );
-    let snapshot = store::current_snapshot(conn)?;
+    crate::store::validate_published_contracts(conn)?;
+    let snapshot = Identities::read(conn)?
+        .response(Plane::Documentation)
+        .snapshot;
     let profile_spec = provider.profile_for(CHUNK_FORMAT_VERSION)?;
     let profile_fingerprint = profile_spec.fingerprint.clone();
     let documents = embedding_documents(conn)?;
@@ -437,16 +441,24 @@ pub fn embed_current(conn: &Connection, provider: &Provider, batch: usize) -> Re
         embedded += rows.len();
     }
 
-    let (occurrences_materialized, generation_published) = match profile.as_ref() {
-        Some(profile) if !documents.is_empty() => (
-            materialize_current_generation(conn, &snapshot, profile)?,
-            true,
-        ),
-        _ => (0, false),
+    let (occurrences_materialized, generation_published, identity) = match profile.as_ref() {
+        Some(profile) if !documents.is_empty() => {
+            let (count, identity) = materialize_current_generation(conn, &snapshot, profile)?;
+            (count, true, identity)
+        }
+        _ => {
+            let identity = Identities::read(conn)?.response(Plane::Documentation);
+            ensure!(
+                identity.snapshot == snapshot,
+                "documentation digest advanced while embeddings were being prepared; rerun `jscout docs embed`"
+            );
+            (0, false, identity)
+        }
     };
 
     Ok(EmbedReport {
-        snapshot,
+        snapshot: identity.snapshot,
+        publication_snapshot: identity.publication_snapshot,
         profile_id: profile.as_ref().map(|value| value.id),
         profile_fingerprint,
         dimensions: profile.as_ref().map(|value| value.dimensions),
@@ -499,7 +511,9 @@ fn search_inner(
     query: &str,
     options: &SearchOptions,
 ) -> Result<SearchResponse> {
-    let snapshot = store::current_snapshot(conn)?;
+    crate::store::validate_published_contracts(conn)?;
+    let identity = Identities::read(conn)?.response(Plane::Documentation);
+    let snapshot = identity.snapshot.clone();
     if options.freshness {
         let (provenance_enabled, provenance_format): (Option<String>, Option<String>) = conn
             .query_row(
@@ -537,7 +551,7 @@ fn search_inner(
             0
         }))
         .max(options.limit);
-    let lexical_hits = store::lexical_search(conn, &snapshot, query, candidate_limit)?;
+    let lexical_hits = store::lexical_search(conn, query, candidate_limit)?;
     let lexical_ranking = lexical_hits
         .iter()
         .map(|hit| (hit.chunk_id, hit.score))
@@ -592,7 +606,7 @@ fn search_inner(
 
     for &(chunk_id, _) in &vector_ranking {
         if let std::collections::hash_map::Entry::Vacant(entry) = hits_by_id.entry(chunk_id) {
-            entry.insert(store::load_hit(conn, &snapshot, chunk_id, 0.0)?);
+            entry.insert(store::load_hit(conn, chunk_id, 0.0)?);
         }
     }
 
@@ -600,7 +614,7 @@ fn search_inner(
         root,
         query,
         options,
-        snapshot,
+        identity,
         SearchState {
             lexical_ranking,
             vector_ranking,
@@ -652,7 +666,7 @@ fn finish_search(
     root: &Path,
     query: &str,
     options: &SearchOptions,
-    snapshot: String,
+    identity: ResponseIdentity,
     state: SearchState,
 ) -> Result<SearchResponse> {
     let SearchState {
@@ -780,7 +794,8 @@ fn finish_search(
     };
     apply_response_budget(
         SearchResponse {
-            snapshot,
+            snapshot: identity.snapshot,
+            publication_snapshot: identity.publication_snapshot,
             hits,
             diagnostics,
             truncated: false,
@@ -798,7 +813,8 @@ fn embedding_documents(conn: &Connection) -> Result<Vec<EmbeddingDocument>> {
          FROM chunks c
          JOIN files f ON f.id=c.file_id
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
-         WHERE f.format IN (SELECT value FROM json_each(?1))
+         WHERE f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?1))
            AND c.kind!='markdown_document'
            AND m.embedding_identity IS NULL",
         [&eligible_formats],
@@ -823,7 +839,8 @@ fn embedding_documents(conn: &Connection) -> Result<Vec<EmbeddingDocument>> {
          JOIN docs_fts ON docs_fts.rowid=m.chunk_id
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
-         WHERE f.format IN (SELECT value FROM json_each(?1))
+         WHERE f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?1))
            AND m.embedding_identity IS NOT NULL
          GROUP BY m.embedding_identity
          ORDER BY m.embedding_identity",
@@ -945,16 +962,19 @@ fn materialize_current_generation(
     conn: &Connection,
     snapshot: &str,
     profile: &ResolvedProfile,
-) -> Result<usize> {
+) -> Result<(usize, ResponseIdentity)> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<usize> {
+    let result = (|| -> Result<(usize, ResponseIdentity)> {
+        crate::store::validate_published_contracts(conn)?;
+        let identity = Identities::read(conn)?.response(Plane::Documentation);
         ensure!(
-            store::current_snapshot(conn)? == snapshot,
+            identity.snapshot == snapshot,
             "documentation digest advanced while embeddings were being prepared; cached batches were kept, rerun `jscout docs embed`"
         );
-        rebuild_profile_generation_from_cache(conn, snapshot, profile)?.context(
+        let count = rebuild_profile_generation_from_cache(conn, snapshot, profile)?.context(
             "not every current documentation representation has a cached valid-dimension vector",
-        )
+        )?;
+        Ok((count, identity))
     })();
     match result {
         Ok(count) => {
@@ -968,7 +988,7 @@ fn materialize_current_generation(
     }
 }
 
-/// Rebuild current-snapshot documentation vector occurrences from the shared
+/// Rebuild current-documentation-digest vector occurrences from the shared
 /// durable embedding cache. This is deliberately provider-free and nests under
 /// the indexer's outer publication transaction.
 ///
@@ -1090,7 +1110,8 @@ fn rebuild_profile_generation_from_cache(
              JOIN files f ON f.id=c.file_id
              JOIN embeddings e
                ON e.chunk_hash=m.embedding_identity AND e.profile_id=?1
-             WHERE f.format IN (SELECT value FROM json_each(?2))
+             WHERE f.corpus='docs'
+               AND f.format IN (SELECT value FROM json_each(?2))
                AND m.embedding_identity IS NOT NULL
              ORDER BY m.chunk_id",
         )?;
@@ -1104,7 +1125,8 @@ fn rebuild_profile_generation_from_cache(
          FROM doc_chunk_meta m
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
-         WHERE f.format IN (SELECT value FROM json_each(?1))
+         WHERE f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?1))
            AND m.embedding_identity IS NOT NULL",
         [&eligible_formats],
         |row| row.get(0),
@@ -1232,7 +1254,8 @@ fn vector_search(
          FROM doc_chunk_meta m
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
-         WHERE f.format IN (SELECT value FROM json_each(?1))
+         WHERE f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?1))
            AND m.embedding_identity IS NOT NULL",
         [&eligible_formats],
         |row| row.get(0),
@@ -1283,6 +1306,7 @@ fn knn_vector_candidates(
          JOIN files f ON f.id=c.file_id
          JOIN docs_fts ON docs_fts.rowid=c.id
          WHERE v.embedding MATCH ?1 AND v.k=?2 AND v.profile_id=?3
+           AND f.corpus='docs'
            AND f.format IN (SELECT value FROM json_each(?4))
          ORDER BY v.distance"
     ))?;
@@ -1322,6 +1346,7 @@ fn full_distance_vector_search(
          JOIN files f ON f.id=c.file_id
          JOIN docs_fts ON docs_fts.rowid=c.id
          WHERE entry.profile_id=?2
+           AND f.corpus='docs'
            AND f.format IN (SELECT value FROM json_each(?3))",
     )?;
     let rows = statement.query_map(
@@ -1475,7 +1500,7 @@ fn apply_response_budget(
     let rendered_len = |response: &SearchResponse| -> Result<usize> {
         match output {
             SearchOutput::Compact => Ok(compact_search_string(response)?.len()),
-            SearchOutput::Pretty => Ok(serde_json::to_string_pretty(response)?.len() + 1),
+            SearchOutput::Debug => Ok(serde_json::to_string(response)?.len()),
             SearchOutput::Human => Ok(human_search_string(response).len()),
         }
     };
@@ -1527,7 +1552,6 @@ mod tests {
     fn hit(id: i64, path: &str) -> SearchHit {
         SearchHit {
             chunk_id: id,
-            snapshot: "shared".into(),
             path: path.into(),
             title: path.into(),
             description: None,
@@ -1594,6 +1618,7 @@ mod tests {
     fn response() -> SearchResponse {
         SearchResponse {
             snapshot: "shared-snapshot".into(),
+            publication_snapshot: "publication-snapshot".into(),
             hits: vec![
                 retrieval_hit(1, "a.md", &"first ".repeat(80)),
                 retrieval_hit(2, "b.md", &"second ".repeat(80)),
@@ -1606,7 +1631,7 @@ mod tests {
     fn rendered_response_len(response: &SearchResponse, output: SearchOutput) -> Result<usize> {
         match output {
             SearchOutput::Compact => Ok(compact_search_string(response)?.len()),
-            SearchOutput::Pretty => Ok(serde_json::to_string_pretty(response)?.len() + 1),
+            SearchOutput::Debug => Ok(serde_json::to_string(response)?.len()),
             SearchOutput::Human => Ok(human_search_string(response).len()),
         }
     }
@@ -1901,14 +1926,17 @@ mod tests {
             &SearchOptions {
                 limit: 1,
                 response_bytes: usize::MAX,
-                output: SearchOutput::Pretty,
+                output: SearchOutput::Debug,
                 vector: false,
                 rerank: false,
                 freshness: true,
                 max_rank_movement: 1,
                 ..SearchOptions::default()
             },
-            "snapshot".into(),
+            ResponseIdentity {
+                snapshot: "snapshot".into(),
+                publication_snapshot: "publication".into(),
+            },
             state(),
         )?;
         assert_eq!(enabled.hits[0].document.path, "current.md");
@@ -1926,14 +1954,17 @@ mod tests {
             &SearchOptions {
                 limit: 1,
                 response_bytes: usize::MAX,
-                output: SearchOutput::Pretty,
+                output: SearchOutput::Debug,
                 vector: false,
                 rerank: false,
                 freshness: false,
                 max_rank_movement: 1,
                 ..SearchOptions::default()
             },
-            "snapshot".into(),
+            ResponseIdentity {
+                snapshot: "snapshot".into(),
+                publication_snapshot: "publication".into(),
+            },
             state(),
         )?;
         assert_eq!(disabled.hits[0].document.path, "obsolete.md");
@@ -1957,7 +1988,7 @@ mod tests {
     fn response_budget_accounts_for_each_complete_output_and_reports_its_floor() -> Result<()> {
         for output in [
             SearchOutput::Compact,
-            SearchOutput::Pretty,
+            SearchOutput::Debug,
             SearchOutput::Human,
         ] {
             let original = response();
@@ -1973,6 +2004,7 @@ mod tests {
 
             let empty = SearchResponse {
                 snapshot: "shared-snapshot".into(),
+                publication_snapshot: "publication-snapshot".into(),
                 hits: Vec::new(),
                 diagnostics: diagnostics(),
                 truncated: false,
@@ -2005,6 +2037,8 @@ mod tests {
         hit.document.breadcrumb = "Deploy > Production".into();
 
         let compact: serde_json::Value = serde_json::from_str(&compact_search_string(&result)?)?;
+        assert_eq!(compact["snapshot"], "shared-snapshot");
+        assert_eq!(compact["publication_snapshot"], "publication-snapshot");
         assert_eq!(compact["hits"][0]["title"], "Release Guide");
         assert_eq!(
             compact["hits"][0]["description"],
@@ -2015,12 +2049,43 @@ mod tests {
             serde_json::json!(["alpha", "comma,tag", ""])
         );
         assert_eq!(compact["hits"][0]["heading"], "Deploy > Production");
+        for private in [
+            "snapshot",
+            "file_hash",
+            "source_start",
+            "source_end",
+            "source_bytes",
+        ] {
+            assert!(
+                compact["hits"][0].get(private).is_none(),
+                "compact hit serialized {private}"
+            );
+        }
+
+        let wire = serde_json::to_value(&result)?;
+        assert_eq!(wire["snapshot"], "shared-snapshot");
+        assert_eq!(wire["publication_snapshot"], "publication-snapshot");
+        assert!(wire.get("response_bytes").is_none());
+        for private in ["snapshot", "file_hash", "source_start", "source_end"] {
+            assert!(
+                wire["hits"][0].get(private).is_none(),
+                "debug hit serialized {private}"
+            );
+        }
+        assert!(
+            serde_json::to_value(SearchOptions::default())?
+                .get("response_bytes")
+                .is_none()
+        );
 
         let human = human_search_string(&result);
+        assert!(human.contains("shared-snapshot publication_snapshot=publication-snapshot"));
         assert!(human.contains("title=Release Guide"));
         assert!(human.contains("description=Current deployment instructions"));
         assert!(human.contains(r#"tags=["alpha","comma,tag",""]"#));
         assert!(human.contains("Deploy > Production"));
+        assert!(!human.contains("file_hash="));
+        assert!(!human.contains("source_bytes="));
         Ok(())
     }
 
@@ -2032,7 +2097,6 @@ mod tests {
         document.tags = vec!["alpha".into(), "comma,tag".into()];
         document.breadcrumb = "Deploy > Production".into();
         document.rendered_body = "Use the blue channel.".into();
-        document.snapshot = "must-not-reach-reranker".into();
         document.file_hash = "must-not-reach-reranker".into();
 
         assert_eq!(
@@ -2526,7 +2590,7 @@ mod tests {
     }
 
     #[test]
-    fn final_materialization_rechecks_the_shared_snapshot() -> Result<()> {
+    fn final_materialization_rechecks_docs_and_reports_the_current_publication() -> Result<()> {
         let root = tempfile::tempdir()?;
         let conn = crate::store::open(root.path())?;
         crate::publication::Identities::publish_test(&conn, "code", "s1", "provenance")?;
@@ -2583,7 +2647,28 @@ mod tests {
             "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES('doc-id',?1,?2)",
             params![profile.id, vec_to_blob(&[1.0, 0.0])],
         )?;
-        assert_eq!(materialize_current_generation(&conn, "s1", &profile)?, 1);
+        let (materialized, identity) = materialize_current_generation(&conn, "s1", &profile)?;
+        assert_eq!(materialized, 1);
+        assert_eq!(identity.snapshot, "s1");
+        assert_eq!(
+            identity.publication_snapshot,
+            crate::publication::current_publication_snapshot(&conn)?
+        );
+
+        crate::publication::Identities::publish_test(&conn, "code-2", "s1", "provenance")?;
+        let (materialized, code_only_identity) =
+            materialize_current_generation(&conn, "s1", &profile)?;
+        assert_eq!(materialized, 1);
+        assert_eq!(code_only_identity.snapshot, "s1");
+        assert_ne!(
+            code_only_identity.publication_snapshot,
+            identity.publication_snapshot
+        );
+        assert_eq!(
+            code_only_identity.publication_snapshot,
+            crate::publication::current_publication_snapshot(&conn)?
+        );
+
         crate::publication::Identities::publish_test(&conn, "code", "s2", "provenance")?;
         let error = materialize_current_generation(&conn, "s1", &profile).unwrap_err();
         assert!(error.to_string().contains("documentation digest advanced"));
@@ -2643,6 +2728,10 @@ mod tests {
 
         let initial = embed_current(&conn, &provider, 16)?;
         assert_eq!(initial.snapshot, snapshot);
+        assert_eq!(
+            initial.publication_snapshot,
+            crate::publication::current_publication_snapshot(&conn)?
+        );
         assert_eq!(initial.embedded, 1);
         assert_eq!(initial.cached_reused, 0);
         assert_eq!(initial.occurrences_materialized, 1);
@@ -2650,6 +2739,10 @@ mod tests {
         let profile_id = initial.profile_id.context("missing docs profile")?;
 
         let cached = embed_current(&conn, &provider, 16)?;
+        assert_eq!(
+            cached.publication_snapshot,
+            crate::publication::current_publication_snapshot(&conn)?
+        );
         assert_eq!(cached.profile_id, Some(profile_id));
         assert_eq!(cached.missing_before, 0);
         assert_eq!(cached.embedded, 0);
@@ -2808,6 +2901,10 @@ mod tests {
             },
         )?;
         assert_eq!(response.snapshot, rebuilt_snapshot);
+        assert_eq!(
+            response.publication_snapshot,
+            crate::publication::current_publication_snapshot(&conn)?
+        );
         assert_eq!(response.diagnostics.lexical_candidates, 0);
         assert_eq!(response.diagnostics.vector_status, VectorStatus::Active);
         assert_eq!(response.diagnostics.vector_candidates, 1);

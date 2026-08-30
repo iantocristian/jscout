@@ -1046,7 +1046,7 @@ pub fn dry_run_report(
         "reusable_items": reusable_items,
         "over_context_bytes_items": over_budget,
         "notes": [
-            "current_classification reports subject-local freshness independent of the structural snapshot",
+            "current_classification reports subject-local freshness independent of the code snapshot",
             "reusable and would_call use the resolved gateway/model-policy fingerprint; dry-run makes no provider generation calls",
             "whole-scope artifact surface counts are guidance, not a validation constraint; unknown/possible remains legal",
             "mixed subdivision shares both --max-subjects and --max-calls and is visible only after a result exists",

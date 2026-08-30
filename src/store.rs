@@ -395,8 +395,8 @@ CREATE TABLE IF NOT EXISTS chunks(
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
 
--- Documentation chunks share files/chunks and the structural snapshot, while
--- their retrieval-only fields remain in this disposable sidecar. Corpus
+-- Documentation chunks share files/chunks and one publication transaction,
+-- while their retrieval-only fields remain in this disposable sidecar. Corpus
 -- membership is an explicit property of `files`; this table cannot make a
 -- code file into documentation by accident or omission.
 CREATE TABLE IF NOT EXISTS doc_chunk_meta(
@@ -877,10 +877,10 @@ CREATE INDEX IF NOT EXISTS idx_resolved_edges_src
 CREATE INDEX IF NOT EXISTS idx_resolved_edges_dst
   ON resolved_edges(dst_key, confidence, kind);
 
--- Canonical TypeScript-checker facts are exact-snapshot public data. A watch
--- refresh may temporarily retain the prior active batch plus the most useful
--- superseded staging batch as hidden sources for validated, per-project carry
--- into the next snapshot; manual indexing clears the plane.
+-- Canonical TypeScript-checker facts are exact-code-digest public data. Index
+-- publication retains an active batch only after validating its canonical
+-- inputs; watch may also keep the most useful superseded staging batch hidden
+-- for validated, per-project carry into the next code publication.
 -- Source/target identities are deliberately not foreign keys because a
 -- projection rebuild must not cascade through canonical checker facts.
 CREATE TABLE IF NOT EXISTS checker_enrichment_batches(
@@ -957,7 +957,7 @@ CREATE INDEX IF NOT EXISTS idx_checker_enrichments_target
   ON checker_enrichments(target_anchor);
 -- One row per owning-project answer, including `unknown`. Facts record mapped
 -- targets; this table preserves coverage so partial checker success stays
--- visible in the exact-snapshot projection.
+-- visible in the exact-code-digest projection.
 CREATE TABLE IF NOT EXISTS checker_occurrence_projects(
   batch_id INTEGER NOT NULL REFERENCES checker_enrichment_batches(id) ON DELETE CASCADE,
   member_call_id INTEGER NOT NULL,
@@ -1317,13 +1317,14 @@ pub(crate) fn reset_extraction_state(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Delete the cheap source-derived rows for one repository snapshot while
+/// Delete the cheap source-derived rows for one index publication while
 /// preserving the content-addressed embedding cache, durable semantic memory,
-/// and temporarily hidden checker batches. After computing the rebuilt
-/// snapshot, the caller applies its checker-retention policy before projection;
-/// projection accepts only the exact current-snapshot batch. The caller owns
-/// the transaction and must not publish a new snapshot marker until extraction,
-/// resolution, projection, and cached-vector rematerialization have completed.
+/// and temporarily hidden checker batches. After computing the rebuilt code
+/// digest, the caller applies its checker-retention policy before projection;
+/// projection accepts only the exact current-code-digest batch. The caller owns
+/// the transaction and must not publish new plane digests and the publication
+/// marker until extraction, resolution, projection, and cached-vector
+/// rematerialization have completed.
 pub(crate) fn reset_snapshot_state(conn: &Connection) -> Result<()> {
     reset_extraction_state(conn)?;
     conn.execute_batch(
@@ -1628,7 +1629,7 @@ mod tests {
 
     use super::{
         DB_FILE, SCHEMA_VERSION, delete_file, file_source_path, open, open_path,
-        open_path_read_only, open_read_only, reset_extraction_state,
+        open_path_read_only, open_read_only, reset_extraction_state, with_read_snapshot,
     };
 
     fn index_columns(conn: &Connection, index: &str) -> Result<Vec<String>> {
@@ -1642,6 +1643,66 @@ mod tests {
         let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
         let rows = statement.query_map([relation], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    #[test]
+    fn read_snapshot_pins_rows_and_identities_across_a_concurrent_publication() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let database = state.path().join("index.db");
+        std::fs::write(repo.path().join("a.ts"), "export const value = 'before';\n")?;
+
+        let reader = open_path(&database)?;
+        crate::indexer::index_repo(repo.path(), &reader)?;
+        let before_identity = crate::publication::Identities::read(&reader)?;
+        let before_hash: String =
+            reader.query_row("SELECT hash FROM files WHERE path='a.ts'", [], |row| {
+                row.get(0)
+            })?;
+
+        let (start_write, write_started) = std::sync::mpsc::sync_channel(0);
+        let (write_finished, finish_write) = std::sync::mpsc::sync_channel(0);
+        let writer_root = repo.path().to_path_buf();
+        let writer_database = database.clone();
+        let writer = std::thread::spawn(move || {
+            write_started
+                .recv()
+                .expect("reader starts concurrent write");
+            let outcome = (|| -> Result<()> {
+                std::fs::write(writer_root.join("a.ts"), "export const value = 'after';\n")?;
+                let conn = open_path(&writer_database)?;
+                crate::indexer::index_repo(&writer_root, &conn)?;
+                Ok(())
+            })();
+            write_finished
+                .send(outcome)
+                .expect("reader receives concurrent write result");
+        });
+
+        let (seen_identity, seen_hash) =
+            with_read_snapshot(&reader, "publication_race_test", || {
+                let identity = crate::publication::Identities::read(&reader)?;
+                start_write.send(()).expect("writer is waiting");
+                finish_write.recv().expect("writer reports completion")?;
+                let hash =
+                    reader.query_row("SELECT hash FROM files WHERE path='a.ts'", [], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                Ok((identity, hash))
+            })?;
+        writer.join().expect("concurrent writer exits");
+
+        assert_eq!(seen_identity, before_identity);
+        assert_eq!(seen_hash, before_hash);
+        let after_identity = crate::publication::Identities::read(&reader)?;
+        let after_hash: String =
+            reader.query_row("SELECT hash FROM files WHERE path='a.ts'", [], |row| {
+                row.get(0)
+            })?;
+        assert_ne!(after_identity.code, before_identity.code);
+        assert_ne!(after_identity.publication, before_identity.publication);
+        assert_ne!(after_hash, before_hash);
+        Ok(())
     }
 
     #[test]

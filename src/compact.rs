@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
-use crate::{origin, query, scout, search, structural};
+use crate::{publication::ResponseIdentity, query, scout, search, structural};
 
 pub(crate) fn search_string(result: &search::SearchResult) -> Result<String> {
     Ok(serde_json::to_string(&search_value(result))?)
@@ -60,24 +60,18 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         .iter()
         .map(|hit| {
             if result.exhaustive.is_some() {
-                compact_exhaustive_hit(
-                    hit,
-                    &result.snapshot,
-                    result.response_budget.exhaustive_locator_only,
-                    &result.requested_formats,
-                )
+                compact_exhaustive_hit(hit)
             } else {
-                compact_hit(
-                    hit,
-                    &result.snapshot,
-                    default_match,
-                    &result.requested_formats,
-                )
+                compact_hit(hit, default_match)
             }
         })
         .collect::<Vec<_>>();
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(result.snapshot));
+    response.insert(
+        "publication_snapshot".into(),
+        json!(result.publication_snapshot),
+    );
     if let Some(exhaustive) = &result.exhaustive {
         response.insert("effective".into(), json!(exhaustive.effective));
         response.insert("scope".into(), json!(exhaustive.scope));
@@ -239,12 +233,7 @@ fn semantic_preview(body: &Value) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
-fn compact_hit(
-    hit: &search::Hit,
-    snapshot: &str,
-    default_match: search::MatchReason,
-    requested_formats: &[String],
-) -> Value {
+fn compact_hit(hit: &search::Hit, default_match: search::MatchReason) -> Value {
     let mut value = Map::new();
     value.insert(
         "at".into(),
@@ -281,17 +270,6 @@ fn compact_hit(
             }
         }
     }
-    if hit.anchors.len() <= 1 {
-        let anchor = hit
-            .anchors
-            .first()
-            .or(hit.file_anchor.as_ref())
-            .map_or("", String::as_str);
-        value.insert(
-            "followups".into(),
-            compact_followups(hit, anchor, snapshot, requested_formats),
-        );
-    }
     if !hit.uses.is_empty() {
         value.insert("uses".into(), json!(hit.uses));
     }
@@ -308,12 +286,7 @@ fn compact_hit(
     Value::Object(value)
 }
 
-fn compact_exhaustive_hit(
-    hit: &search::Hit,
-    snapshot: &str,
-    locator_only: bool,
-    requested_formats: &[String],
-) -> Value {
+fn compact_exhaustive_hit(hit: &search::Hit) -> Value {
     let mut value = Map::new();
     value.insert(
         "at".into(),
@@ -341,101 +314,7 @@ fn compact_exhaustive_hit(
             }
         }
     }
-    if !locator_only && hit.anchors.len() <= 1 {
-        let anchor = hit
-            .anchors
-            .first()
-            .or(hit.file_anchor.as_ref())
-            .map_or("", String::as_str);
-        value.insert(
-            "followups".into(),
-            compact_followups(hit, anchor, snapshot, requested_formats),
-        );
-    }
     Value::Object(value)
-}
-
-fn compact_followups(
-    hit: &search::Hit,
-    anchor: &str,
-    snapshot: &str,
-    requested_formats: &[String],
-) -> Value {
-    let origins = (hit.file_origin == "dependency").then(|| origin::ALL.to_vec());
-    if anchor.starts_with("sym:") {
-        let tools = if hit.include_neighborhood_followup {
-            vec!["definition", "who_uses", "neighborhood"]
-        } else {
-            vec!["definition", "who_uses"]
-        };
-        let mut followups = Map::new();
-        followups.insert("tools".into(), json!(tools));
-        if !hit.include_followups {
-            return Value::Object(followups);
-        }
-
-        let base_arguments = || {
-            let mut arguments = Map::new();
-            arguments.insert("anchor".into(), json!(anchor));
-            arguments.insert("snapshot".into(), json!(snapshot));
-            if let Some(origins) = &origins {
-                arguments.insert("origins".into(), json!(origins));
-            }
-            arguments
-        };
-        if requested_formats.is_empty() {
-            followups.insert("arguments".into(), Value::Object(base_arguments()));
-        } else {
-            let mut calls = ["definition", "who_uses"]
-                .into_iter()
-                .map(|tool| {
-                    let mut arguments = base_arguments();
-                    arguments.insert("formats".into(), json!(requested_formats));
-                    json!({ "tool": tool, "arguments": arguments })
-                })
-                .collect::<Vec<_>>();
-            if hit.include_neighborhood_followup {
-                calls.push(json!({
-                    "tool": "neighborhood",
-                    "arguments": base_arguments(),
-                }));
-            }
-            followups.remove("tools");
-            followups.insert("calls".into(), Value::Array(calls));
-        }
-        Value::Object(followups)
-    } else {
-        let tools = if hit.include_neighborhood_followup {
-            vec!["file_outline", "neighborhood"]
-        } else {
-            vec!["file_outline"]
-        };
-        if !hit.include_followups {
-            return json!({ "tools": tools });
-        }
-        let mut outline_arguments = Map::new();
-        outline_arguments.insert("path".into(), json!(hit.file));
-        if let Some(origins) = &origins {
-            outline_arguments.insert("origins".into(), json!(origins));
-        }
-        let mut calls = vec![json!({
-            "tool": "file_outline",
-            "arguments": outline_arguments,
-        })];
-        if hit.include_neighborhood_followup {
-            let mut neighborhood_arguments = Map::new();
-            neighborhood_arguments.insert("anchor".into(), json!(anchor));
-            neighborhood_arguments.insert("snapshot".into(), json!(snapshot));
-            if let Some(origins) = &origins {
-                neighborhood_arguments.insert("origins".into(), json!(origins));
-            }
-            calls.push(json!({
-                "tool": "neighborhood",
-                "arguments": neighborhood_arguments,
-            }));
-        }
-        json!({ "calls": calls })
-    }
 }
 
 fn search_budget_value(budget: &search::ResponseBudget) -> Value {
@@ -450,7 +329,6 @@ fn search_budget_value(budget: &search::ResponseBudget) -> Value {
             ("supports", budget.omitted_semantic_supports),
             ("nodes", budget.omitted_nodes),
             ("edges", budget.omitted_edges),
-            ("followup_arguments", budget.omitted_followups),
             ("snippets", budget.truncated_snippets),
         ] {
             if count > 0 {
@@ -466,6 +344,8 @@ fn search_budget_value(budget: &search::ResponseBudget) -> Value {
 
 pub(crate) fn who_uses_string(
     results: &[(&query::SymbolTarget, Vec<query::Usage>)],
+    identity: &ResponseIdentity,
+    resolution: Option<&query::SymbolAnchorResolution>,
     byte_limit: usize,
 ) -> Result<String> {
     if byte_limit < 256 {
@@ -491,30 +371,21 @@ pub(crate) fn who_uses_string(
 
     let matched_targets = results.len();
     let matched_usages = sites.len();
-    let (full, full_bytes) = settle_who_uses(
+    let envelope = WhoUsesEnvelope {
         results,
-        matched_targets,
-        &sites,
-        byte_limit,
+        identity,
+        resolution,
         matched_targets,
         matched_usages,
-        None,
-    )?;
+    };
+    let (full, full_bytes) = envelope.settle(matched_targets, &sites, None)?;
     if full_bytes <= byte_limit {
         return Ok(serde_json::to_string(&full)?);
     }
 
     let mut returned_targets = matched_targets;
     loop {
-        let (_, base_bytes) = settle_who_uses(
-            results,
-            returned_targets,
-            &[],
-            byte_limit,
-            matched_targets,
-            matched_usages,
-            Some(full_bytes),
-        )?;
+        let (_, base_bytes) = envelope.settle(returned_targets, &[], Some(full_bytes))?;
         if base_bytes <= byte_limit {
             break;
         }
@@ -534,15 +405,8 @@ pub(crate) fn who_uses_string(
     let mut high = eligible.len() + 1;
     while low < high {
         let middle = low + (high - low) / 2;
-        let (_, rendered) = settle_who_uses(
-            results,
-            returned_targets,
-            &eligible[..middle],
-            byte_limit,
-            matched_targets,
-            matched_usages,
-            Some(full_bytes),
-        )?;
+        let (_, rendered) =
+            envelope.settle(returned_targets, &eligible[..middle], Some(full_bytes))?;
         if rendered <= byte_limit {
             low = middle + 1;
         } else {
@@ -550,160 +414,140 @@ pub(crate) fn who_uses_string(
         }
     }
     let retained = low.saturating_sub(1);
-    let (value, rendered) = settle_who_uses(
-        results,
-        returned_targets,
-        &eligible[..retained],
-        byte_limit,
-        matched_targets,
-        matched_usages,
-        Some(full_bytes),
-    )?;
+    let (value, rendered) =
+        envelope.settle(returned_targets, &eligible[..retained], Some(full_bytes))?;
     if rendered > byte_limit {
         anyhow::bail!("failed to fit compact who_uses response into {byte_limit} bytes");
     }
     Ok(serde_json::to_string(&value)?)
 }
 
-fn settle_who_uses(
-    results: &[(&query::SymbolTarget, Vec<query::Usage>)],
-    returned_targets: usize,
-    sites: &[(usize, &query::Usage)],
-    byte_limit: usize,
+struct WhoUsesEnvelope<'a> {
+    results: &'a [(&'a query::SymbolTarget, Vec<query::Usage>)],
+    identity: &'a ResponseIdentity,
+    resolution: Option<&'a query::SymbolAnchorResolution>,
     matched_targets: usize,
     matched_usages: usize,
-    unbudgeted_bytes: Option<usize>,
-) -> Result<(Value, usize)> {
-    let mut rendered_bytes = 0usize;
-    for _ in 0..8 {
-        let value = who_uses_value(
-            results,
-            returned_targets,
-            sites,
-            byte_limit,
-            rendered_bytes,
-            matched_targets,
-            matched_usages,
-            unbudgeted_bytes,
-        );
-        let rendered = serde_json::to_string(&value)?.len();
-        if rendered == rendered_bytes {
-            return Ok((value, rendered));
-        }
-        rendered_bytes = rendered;
-    }
-    let value = who_uses_value(
-        results,
-        returned_targets,
-        sites,
-        byte_limit,
-        rendered_bytes,
-        matched_targets,
-        matched_usages,
-        unbudgeted_bytes,
-    );
-    let rendered = serde_json::to_string(&value)?.len();
-    Ok((value, rendered))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "response builder keeps result selection and complete byte-budget accounting explicit"
-)]
-fn who_uses_value(
-    results: &[(&query::SymbolTarget, Vec<query::Usage>)],
-    returned_targets: usize,
-    sites: &[(usize, &query::Usage)],
-    byte_limit: usize,
-    rendered_bytes: usize,
-    matched_targets: usize,
-    matched_usages: usize,
-    unbudgeted_bytes: Option<usize>,
-) -> Value {
-    let mut groups = (0..returned_targets)
-        .map(|_| BTreeMap::<&'static str, BTreeMap<String, Vec<Value>>>::new())
-        .collect::<Vec<_>>();
-    let mut dependency_files = (0..returned_targets)
-        .map(|_| BTreeSet::<String>::new())
-        .collect::<Vec<_>>();
-    for (target_index, usage) in sites {
-        let confidence = normalized_confidence(&usage.confidence);
-        let mut site = vec![json!(usage.line), json!(usage.kind)];
-        match (usage.chunk_name.as_deref(), usage.detail.as_deref()) {
-            (Some(chunk), Some(detail)) => {
-                site.push(json!(chunk));
-                site.push(json!(detail));
+impl WhoUsesEnvelope<'_> {
+    fn settle(
+        &self,
+        returned_targets: usize,
+        sites: &[(usize, &query::Usage)],
+        unbudgeted_bytes: Option<usize>,
+    ) -> Result<(Value, usize)> {
+        let mut rendered_bytes = 0usize;
+        for _ in 0..8 {
+            let value = self.value(returned_targets, sites, rendered_bytes, unbudgeted_bytes);
+            let rendered = serde_json::to_string(&value)?.len();
+            if rendered == rendered_bytes {
+                return Ok((value, rendered));
             }
-            (Some(chunk), None) => site.push(json!(chunk)),
-            (None, Some(detail)) => {
-                site.push(Value::Null);
-                site.push(json!(detail));
-            }
-            (None, None) => {}
+            rendered_bytes = rendered;
         }
-        groups[*target_index]
-            .entry(confidence)
-            .or_default()
-            .entry(usage.file.clone())
-            .or_default()
-            .push(Value::Array(site));
-        if usage.file_origin == "dependency" {
-            dependency_files[*target_index].insert(usage.file.clone());
-        }
+        let value = self.value(returned_targets, sites, rendered_bytes, unbudgeted_bytes);
+        let rendered = serde_json::to_string(&value)?.len();
+        Ok((value, rendered))
     }
 
-    let targets = results
-        .iter()
-        .take(returned_targets)
-        .enumerate()
-        .map(|(index, (target, _))| {
-            let mut value = Map::new();
-            value.insert("target".into(), compact_target(target));
-            if !groups[index].is_empty() {
-                value.insert("usages".into(), json!(groups[index]));
+    fn value(
+        &self,
+        returned_targets: usize,
+        sites: &[(usize, &query::Usage)],
+        rendered_bytes: usize,
+        unbudgeted_bytes: Option<usize>,
+    ) -> Value {
+        let mut groups = (0..returned_targets)
+            .map(|_| BTreeMap::<&'static str, BTreeMap<String, Vec<Value>>>::new())
+            .collect::<Vec<_>>();
+        let mut dependency_files = (0..returned_targets)
+            .map(|_| BTreeSet::<String>::new())
+            .collect::<Vec<_>>();
+        for (target_index, usage) in sites {
+            let confidence = normalized_confidence(&usage.confidence);
+            let mut site = vec![json!(usage.line), json!(usage.kind)];
+            match (usage.chunk_name.as_deref(), usage.detail.as_deref()) {
+                (Some(chunk), Some(detail)) => {
+                    site.push(json!(chunk));
+                    site.push(json!(detail));
+                }
+                (Some(chunk), None) => site.push(json!(chunk)),
+                (None, Some(detail)) => {
+                    site.push(Value::Null);
+                    site.push(json!(detail));
+                }
+                (None, None) => {}
             }
-            if !dependency_files[index].is_empty() {
-                value.insert("dependency_files".into(), json!(dependency_files[index]));
+            groups[*target_index]
+                .entry(confidence)
+                .or_default()
+                .entry(usage.file.clone())
+                .or_default()
+                .push(Value::Array(site));
+            if usage.file_origin == "dependency" {
+                dependency_files[*target_index].insert(usage.file.clone());
             }
-            Value::Object(value)
-        })
-        .collect::<Vec<_>>();
+        }
 
-    let returned_usages = sites.len();
-    let omitted_targets = matched_targets.saturating_sub(returned_targets);
-    let omitted_usages = matched_usages.saturating_sub(returned_usages);
-    let truncated = omitted_targets > 0 || omitted_usages > 0;
-    let mut response = Map::new();
-    response.insert("byte_limit".into(), json!(byte_limit));
-    response.insert("rendered_bytes".into(), json!(rendered_bytes));
-    response.insert("matched_targets".into(), json!(matched_targets));
-    response.insert("returned_targets".into(), json!(returned_targets));
-    response.insert("matched_usages".into(), json!(matched_usages));
-    response.insert("returned_usages".into(), json!(returned_usages));
-    if truncated {
-        response.insert("truncated".into(), json!(true));
-        if let Some(unbudgeted_bytes) = unbudgeted_bytes {
-            response.insert("unbudgeted_bytes".into(), json!(unbudgeted_bytes));
+        let targets = self
+            .results
+            .iter()
+            .take(returned_targets)
+            .enumerate()
+            .map(|(index, (target, _))| {
+                let mut value = Map::new();
+                value.insert("target".into(), compact_target(target));
+                if !groups[index].is_empty() {
+                    value.insert("usages".into(), json!(groups[index]));
+                }
+                if !dependency_files[index].is_empty() {
+                    value.insert("dependency_files".into(), json!(dependency_files[index]));
+                }
+                Value::Object(value)
+            })
+            .collect::<Vec<_>>();
+
+        let returned_usages = sites.len();
+        let omitted_targets = self.matched_targets.saturating_sub(returned_targets);
+        let omitted_usages = self.matched_usages.saturating_sub(returned_usages);
+        let truncated = omitted_targets > 0 || omitted_usages > 0;
+        let mut response = Map::new();
+        response.insert("rendered_bytes".into(), json!(rendered_bytes));
+        response.insert("matched_targets".into(), json!(self.matched_targets));
+        response.insert("returned_targets".into(), json!(returned_targets));
+        response.insert("matched_usages".into(), json!(self.matched_usages));
+        response.insert("returned_usages".into(), json!(returned_usages));
+        if truncated {
+            response.insert("truncated".into(), json!(true));
+            if let Some(unbudgeted_bytes) = unbudgeted_bytes {
+                response.insert("unbudgeted_bytes".into(), json!(unbudgeted_bytes));
+            }
+            let mut omitted = Map::new();
+            if omitted_targets > 0 {
+                omitted.insert("targets".into(), json!(omitted_targets));
+            }
+            if omitted_usages > 0 {
+                omitted.insert("usages".into(), json!(omitted_usages));
+            }
+            response.insert("omitted".into(), Value::Object(omitted));
         }
-        let mut omitted = Map::new();
-        if omitted_targets > 0 {
-            omitted.insert("targets".into(), json!(omitted_targets));
-        }
-        if omitted_usages > 0 {
-            omitted.insert("usages".into(), json!(omitted_usages));
-        }
-        response.insert("omitted".into(), Value::Object(omitted));
+        let mut value = symbol_response(self.identity, self.resolution);
+        value.insert(
+            "usage_fields".into(),
+            json!(["line", "kind", "enclosing?", "detail?"]),
+        );
+        value.insert("targets".into(), Value::Array(targets));
+        value.insert("response".into(), Value::Object(response));
+        Value::Object(value)
     }
-    json!({
-        "usage_fields": ["line", "kind", "enclosing?", "detail?"],
-        "targets": targets,
-        "response": response,
-    })
 }
 
 pub(crate) fn definition_string(
     results: &[(query::SymbolTarget, Option<scout::RenderedSource>)],
     matched_targets: usize,
+    identity: &ResponseIdentity,
+    resolution: Option<&query::SymbolAnchorResolution>,
     byte_limit: usize,
 ) -> Result<String> {
     if byte_limit < 256 {
@@ -714,12 +558,25 @@ pub(crate) fn definition_string(
         .map(|(target, source)| compact_definition(target, source.as_ref()))
         .collect::<Vec<_>>();
     let mut omitted_source_bytes = 0usize;
+    let (full, full_bytes) = settle_definitions(
+        &definitions,
+        matched_targets,
+        identity,
+        resolution,
+        None,
+        omitted_source_bytes,
+    )?;
+    if full_bytes <= byte_limit {
+        return Ok(serde_json::to_string(&full)?);
+    }
 
     loop {
         let (value, rendered) = settle_definitions(
             &definitions,
             matched_targets,
-            byte_limit,
+            identity,
+            resolution,
+            Some(full_bytes),
             omitted_source_bytes,
         )?;
         if rendered <= byte_limit {
@@ -758,7 +615,9 @@ pub(crate) fn definition_string(
 fn settle_definitions(
     definitions: &[Value],
     matched_targets: usize,
-    byte_limit: usize,
+    identity: &ResponseIdentity,
+    resolution: Option<&query::SymbolAnchorResolution>,
+    unbudgeted_bytes: Option<usize>,
     omitted_source_bytes: usize,
 ) -> Result<(Value, usize)> {
     let mut rendered_bytes = 0usize;
@@ -766,7 +625,9 @@ fn settle_definitions(
         let value = definitions_value(
             definitions,
             matched_targets,
-            byte_limit,
+            identity,
+            resolution,
+            unbudgeted_bytes,
             rendered_bytes,
             omitted_source_bytes,
         );
@@ -779,7 +640,9 @@ fn settle_definitions(
     let value = definitions_value(
         definitions,
         matched_targets,
-        byte_limit,
+        identity,
+        resolution,
+        unbudgeted_bytes,
         rendered_bytes,
         omitted_source_bytes,
     );
@@ -790,7 +653,9 @@ fn settle_definitions(
 fn definitions_value(
     definitions: &[Value],
     matched_targets: usize,
-    byte_limit: usize,
+    identity: &ResponseIdentity,
+    resolution: Option<&query::SymbolAnchorResolution>,
+    unbudgeted_bytes: Option<usize>,
     rendered_bytes: usize,
     omitted_source_bytes: usize,
 ) -> Value {
@@ -798,12 +663,14 @@ fn definitions_value(
     let omitted_targets = matched_targets.saturating_sub(returned_targets);
     let truncated = omitted_targets > 0 || omitted_source_bytes > 0;
     let mut response = Map::new();
-    response.insert("byte_limit".into(), json!(byte_limit));
     response.insert("rendered_bytes".into(), json!(rendered_bytes));
     response.insert("matched_targets".into(), json!(matched_targets));
     response.insert("returned_targets".into(), json!(returned_targets));
     if truncated {
         response.insert("truncated".into(), json!(true));
+        if let Some(unbudgeted_bytes) = unbudgeted_bytes {
+            response.insert("unbudgeted_bytes".into(), json!(unbudgeted_bytes));
+        }
         let mut omitted = Map::new();
         if omitted_targets > 0 {
             omitted.insert("targets".into(), json!(omitted_targets));
@@ -813,10 +680,31 @@ fn definitions_value(
         }
         response.insert("omitted".into(), Value::Object(omitted));
     }
-    json!({ "definitions": definitions, "response": response })
+    let mut value = symbol_response(identity, resolution);
+    value.insert("definitions".into(), json!(definitions));
+    value.insert("response".into(), Value::Object(response));
+    Value::Object(value)
 }
 
-fn compact_definition(
+fn symbol_response(
+    identity: &ResponseIdentity,
+    resolution: Option<&query::SymbolAnchorResolution>,
+) -> Map<String, Value> {
+    let mut response = Map::new();
+    response.insert("snapshot".into(), json!(identity.snapshot));
+    response.insert(
+        "publication_snapshot".into(),
+        json!(identity.publication_snapshot),
+    );
+    if let Some(resolution) =
+        resolution.filter(|resolution| resolution.requested_anchor != resolution.resolved_anchor)
+    {
+        response.insert("resolution".into(), json!(resolution));
+    }
+    response
+}
+
+pub(crate) fn compact_definition(
     target: &query::SymbolTarget,
     source: Option<&scout::RenderedSource>,
 ) -> Value {
@@ -925,7 +813,14 @@ fn graph_value(
         if node.kind != "symbol" {
             value.insert("kind".into(), json!(node.kind));
         }
-        if let Some(at) = source_at_option(node.file.as_deref(), node.line, node.line) {
+        // Symbol and file anchors already carry the path. Preserve a symbol's
+        // source line without repeating that path; hub/entity keys still need
+        // the complete locator.
+        if node.key.starts_with("sym:") || node.key.starts_with("file:") {
+            if let Some(line) = node.line {
+                value.insert("line".into(), json!(line));
+            }
+        } else if let Some(at) = source_at_option(node.file.as_deref(), node.line, node.line) {
             value.insert("at".into(), json!(at));
         }
         if node
@@ -1027,7 +922,6 @@ pub(crate) fn render_neighborhood(
             neighborhood,
             &neighborhood.nodes,
             &neighborhood.edges,
-            byte_limit,
             unbudgeted_bytes,
             original_nodes,
             original_edges,
@@ -1044,7 +938,6 @@ pub(crate) fn render_neighborhood(
             neighborhood,
             &neighborhood.nodes,
             &neighborhood.edges,
-            byte_limit,
             unbudgeted_bytes,
             rendered_bytes,
             original_nodes,
@@ -1067,7 +960,6 @@ pub(crate) fn render_neighborhood(
                     neighborhood,
                     &nodes,
                     &[],
-                    byte_limit,
                     unbudgeted_bytes,
                     original_nodes,
                     original_edges,
@@ -1079,7 +971,6 @@ pub(crate) fn render_neighborhood(
                     neighborhood,
                     &nodes,
                     &[],
-                    byte_limit,
                     unbudgeted_bytes,
                     original_nodes,
                     original_edges,
@@ -1093,7 +984,6 @@ pub(crate) fn render_neighborhood(
                 neighborhood,
                 &nodes,
                 &neighborhood.edges[..count],
-                byte_limit,
                 unbudgeted_bytes,
                 original_nodes,
                 original_edges,
@@ -1105,7 +995,6 @@ pub(crate) fn render_neighborhood(
                 neighborhood,
                 &nodes,
                 &neighborhood.edges[..retained],
-                byte_limit,
                 unbudgeted_bytes,
                 original_nodes,
                 original_edges,
@@ -1118,7 +1007,6 @@ pub(crate) fn render_neighborhood(
         neighborhood,
         &nodes,
         &[],
-        byte_limit,
         unbudgeted_bytes,
         original_nodes,
         original_edges,
@@ -1199,7 +1087,6 @@ fn settled_neighborhood_size(
     neighborhood: &structural::Neighborhood,
     nodes: &[structural::GraphNode],
     edges: &[structural::GraphEdge],
-    byte_limit: usize,
     unbudgeted_bytes: usize,
     original_nodes: usize,
     original_edges: usize,
@@ -1209,7 +1096,6 @@ fn settled_neighborhood_size(
         neighborhood,
         nodes,
         edges,
-        byte_limit,
         unbudgeted_bytes,
         original_nodes,
         original_edges,
@@ -1221,7 +1107,6 @@ fn render_neighborhood_selection(
     neighborhood: &structural::Neighborhood,
     nodes: &[structural::GraphNode],
     edges: &[structural::GraphEdge],
-    byte_limit: usize,
     unbudgeted_bytes: usize,
     original_nodes: usize,
     original_edges: usize,
@@ -1231,7 +1116,6 @@ fn render_neighborhood_selection(
         neighborhood,
         nodes,
         edges,
-        byte_limit,
         unbudgeted_bytes,
         original_nodes,
         original_edges,
@@ -1241,7 +1125,6 @@ fn render_neighborhood_selection(
         neighborhood,
         nodes,
         edges,
-        byte_limit,
         unbudgeted_bytes,
         rendered_bytes,
         original_nodes,
@@ -1251,15 +1134,10 @@ fn render_neighborhood_selection(
     Ok(rendered)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "fixed-point serialization needs the selected graph and current and original byte counts"
-)]
 fn settle_neighborhood_bytes(
     neighborhood: &structural::Neighborhood,
     nodes: &[structural::GraphNode],
     edges: &[structural::GraphEdge],
-    byte_limit: usize,
     unbudgeted_bytes: usize,
     original_nodes: usize,
     original_edges: usize,
@@ -1270,7 +1148,6 @@ fn settle_neighborhood_bytes(
             neighborhood,
             nodes,
             edges,
-            byte_limit,
             unbudgeted_bytes,
             *rendered_bytes,
             original_nodes,
@@ -1286,7 +1163,6 @@ fn settle_neighborhood_bytes(
         neighborhood,
         nodes,
         edges,
-        byte_limit,
         unbudgeted_bytes,
         *rendered_bytes,
         original_nodes,
@@ -1295,15 +1171,10 @@ fn settle_neighborhood_bytes(
     .len())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "response envelope keeps the selected graph and complete byte-budget metadata explicit"
-)]
 fn neighborhood_value(
     neighborhood: &structural::Neighborhood,
     nodes: &[structural::GraphNode],
     edges: &[structural::GraphEdge],
-    byte_limit: usize,
     unbudgeted_bytes: usize,
     rendered_bytes: usize,
     original_nodes: usize,
@@ -1311,6 +1182,10 @@ fn neighborhood_value(
 ) -> Value {
     let mut response = Map::new();
     response.insert("snapshot".into(), json!(neighborhood.snapshot));
+    response.insert(
+        "publication_snapshot".into(),
+        json!(neighborhood.publication_snapshot),
+    );
     response.insert("anchor".into(), json!(neighborhood.resolved_anchor));
     if neighborhood.requested_anchor != neighborhood.resolved_anchor {
         response.insert(
@@ -1331,7 +1206,6 @@ fn neighborhood_value(
     let omitted_edges = original_edges.saturating_sub(edges.len());
     let truncated = neighborhood.truncated || omitted_nodes > 0 || omitted_edges > 0;
     let mut budget = Map::new();
-    budget.insert("byte_limit".into(), json!(byte_limit));
     budget.insert("rendered_bytes".into(), json!(rendered_bytes));
     if truncated {
         budget.insert("truncated".into(), json!(true));
