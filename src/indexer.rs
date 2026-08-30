@@ -155,6 +155,16 @@ struct PreparedDependencyFile {
     role: &'static str,
 }
 
+struct PreparedPublication {
+    previous: PreviousPublication,
+    dependency_plans: Vec<dependency::PackagePlan>,
+    dependency_files: Vec<PreparedDependencyFile>,
+    previous_checker_identity: Option<String>,
+    checker_contract_changed: bool,
+    code_contract_changed: bool,
+    repository_code_inserted: bool,
+}
+
 struct StoredDependencyFile {
     id: i64,
     hash: String,
@@ -616,7 +626,7 @@ fn index_repo_attempt<F: FileSystem>(
         .map(|provenance| (provenance.path.as_str(), provenance))
         .collect::<HashMap<_, _>>();
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let preparation = (|| -> Result<(_, _, _, _, _, _)> {
+    let preparation = (|| -> Result<PreparedPublication> {
         let previous = PreviousPublication::read(conn)?;
         let previous_checker_identity = checker_retention
             .validates_active()
@@ -680,6 +690,7 @@ fn index_repo_attempt<F: FileSystem>(
         replace_documentation_inventory(conn, &inventory.decisions)?;
         let mut seen = std::collections::HashSet::new();
         let mut published = std::collections::HashSet::new();
+        let mut repository_code_inserted = false;
         for file in &inventory.files {
             let rel = display_repository_path(&root, file);
             let format = formats::repository_code_for_path(file).ok_or_else(|| {
@@ -751,6 +762,7 @@ fn index_repo_attempt<F: FileSystem>(
                         package_path: None,
                     };
                     let (chunks, refs) = insert_file(conn, &identity, &data)?;
+                    repository_code_inserted = true;
                     outcome.indexed += 1;
                     outcome.chunks += chunks;
                     outcome.refs += refs;
@@ -868,23 +880,25 @@ fn index_repo_attempt<F: FileSystem>(
              )",
             [],
         )?;
-        Ok((
+        Ok(PreparedPublication {
             previous,
-            plans,
-            prepared,
+            dependency_plans: plans,
+            dependency_files: prepared,
             previous_checker_identity,
             checker_contract_changed,
             code_contract_changed,
-        ))
+            repository_code_inserted,
+        })
     })();
-    let (
+    let PreparedPublication {
         previous,
-        plans,
-        prepared,
+        dependency_plans,
+        dependency_files,
         previous_checker_identity,
         checker_contract_changed,
         code_contract_changed,
-    ) = match preparation {
+        repository_code_inserted,
+    } = match preparation {
         Ok(preparation) => preparation,
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -892,15 +906,17 @@ fn index_repo_attempt<F: FileSystem>(
         }
     };
     let publication = (|| -> Result<()> {
-        let instances = dependency::synchronize_instances(&root, conn, &workspace, &plans)?;
-        index_dependency_files(conn, &prepared, &instances, &mut outcome)?;
+        let instances =
+            dependency::synchronize_instances(&root, conn, &workspace, &dependency_plans)?;
+        let dependency_code_inserted =
+            index_dependency_files(conn, &dependency_files, &instances, &mut outcome)?;
 
         #[cfg(test)]
         if operation.fail_after_canonical_replacement {
             anyhow::bail!("injected failure after canonical replacement");
         }
 
-        if outcome.indexed > 0 {
+        if repository_code_inserted || dependency_code_inserted {
             crate::embed::materialize_cached_embeddings(conn)?;
         }
 
@@ -1042,15 +1058,13 @@ fn index_repo_attempt<F: FileSystem>(
         // An incomplete cache remains NotReady and never invokes a provider.
         if outcome.extraction_reset
             || previous.documentation_digest.as_deref() != Some(identities.documentation.as_str())
-            || crate::docs::retrieval::cached_generation_rematerialization_needed(
-                conn,
-                &identities.documentation,
-            )?
         {
             crate::docs::retrieval::rematerialize_cached_generations(
                 conn,
                 &identities.documentation,
             )?;
+        } else {
+            crate::docs::retrieval::reconcile_cached_generations(conn, &identities.documentation)?;
         }
         let (rust_files_with_errors, rust_error_count): (i64, i64) = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(parse_error_count), 0)
@@ -2137,9 +2151,10 @@ fn index_dependency_files(
     prepared: &[PreparedDependencyFile],
     instances: &std::collections::BTreeMap<PathBuf, i64>,
     outcome: &mut IndexOutcome,
-) -> Result<()> {
+) -> Result<bool> {
     conn.execute_batch("SAVEPOINT jscout_dependency_files")?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<bool> {
+        let mut inserted_any = false;
         let existing: HashMap<String, StoredDependencyFile> = {
             let mut stmt = conn.prepare(
                 "SELECT path, id, hash, role, corpus, format,
@@ -2214,6 +2229,7 @@ fn index_dependency_files(
                         package_path: Some(&file.package_path),
                     };
                     let (chunks, refs) = insert_file(conn, &identity, &data)?;
+                    inserted_any = true;
                     outcome.indexed += 1;
                     outcome.dependency_files += 1;
                     outcome.chunks += chunks;
@@ -2227,12 +2243,12 @@ fn index_dependency_files(
                 store::delete_file(conn, old.id)?;
             }
         }
-        Ok(())
+        Ok(inserted_any)
     })();
     match result {
-        Ok(()) => {
+        Ok(inserted_any) => {
             conn.execute_batch("RELEASE jscout_dependency_files")?;
-            Ok(())
+            Ok(inserted_any)
         }
         Err(error) => {
             let _ = conn.execute_batch(

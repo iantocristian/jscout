@@ -1343,6 +1343,13 @@ fn documentation_contract_change_rechunks_docs_without_rotating_code() -> Result
          VALUES(1,X'0000803F00000000',?1)",
         [old_profile_id],
     )?;
+    // This row has no relational owner, so replacing guide.md cannot remove it.
+    // Only the documentation-contract rematerialization purge can clear it.
+    conn.execute(
+        "INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id)
+         VALUES(999,X'0000803F00000000',?1)",
+        [old_profile_id],
+    )?;
     conn.execute(
         "UPDATE doc_chunk_meta SET nearest_heading='stale-format-marker'",
         [],
@@ -4085,6 +4092,50 @@ fn manual_docs_only_refresh_preserves_a_valid_checker_publication() -> Result<()
         )?,
         1,
         "a docs-only manual publication must keep validated checker edges projected"
+    );
+    Ok(())
+}
+
+#[test]
+fn docs_only_refresh_does_not_initialize_code_vector_storage() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const stable = 1;\n")?;
+    fs::write(repo.path().join("README.md"), "# Before\n\nOld prose.\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+
+    conn.execute_batch(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','code-only-profile',2,'{}');",
+    )?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='vec_embeddings_2'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?,
+        false
+    );
+
+    fs::write(repo.path().join("README.md"), "# After\n\nNew prose.\n")?;
+    let outcome = index_repo(repo.path(), &conn)?;
+
+    assert_eq!((outcome.indexed, outcome.unchanged), (1, 1));
+    assert_eq!(
+        conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='vec_embeddings_2'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?,
+        false,
+        "documentation changes must not scan or initialize the code-vector plane"
     );
     Ok(())
 }

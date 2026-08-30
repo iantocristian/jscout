@@ -988,26 +988,51 @@ fn materialize_current_generation(
     }
 }
 
-/// Rebuild current-documentation-digest vector occurrences from the shared
-/// durable embedding cache. This is deliberately provider-free and nests under
-/// the indexer's outer publication transaction.
-///
-/// A profile is marked ready only when every current embeddable documentation
-/// occurrence has a cached vector of the profile's declared dimensions.
-/// Incomplete caches are an ordinary not-ready state: stale occurrences and
-/// generation markers are removed, while indexing continues successfully.
-pub(crate) fn cached_generation_rematerialization_needed(
+/// Reconcile non-ready current-format profiles after the indexer has established
+/// that neither extraction nor the documentation digest changed. Each profile
+/// is repaired independently so one incomplete cache cannot churn an already
+/// ready profile. Explicit digest/reset paths use
+/// [`rematerialize_cached_generations`] instead so obsolete contracts are purged.
+pub(crate) fn reconcile_cached_generations(
     conn: &Connection,
     documentation_digest: &str,
-) -> Result<bool> {
+) -> Result<()> {
+    let mut incomplete = Vec::new();
     for profile in documentation_profiles(conn)? {
         if !generation_is_ready(conn, documentation_digest, &profile)? {
-            return Ok(true);
+            incomplete.push(profile);
         }
     }
-    Ok(false)
+    if incomplete.is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch("SAVEPOINT jscout_docs_cached_profile_reconcile")?;
+    let result = (|| -> Result<()> {
+        ensure!(
+            store::current_snapshot(conn)? == documentation_digest,
+            "documentation cached reconciliation requires the published documentation digest"
+        );
+        for profile in &incomplete {
+            let _ = rebuild_profile_generation_from_cache(conn, documentation_digest, profile)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE jscout_docs_cached_profile_reconcile")?,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO jscout_docs_cached_profile_reconcile; RELEASE jscout_docs_cached_profile_reconcile",
+            );
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
+/// Globally purge and rebuild current-documentation-digest vector occurrences
+/// from the shared durable embedding cache. This provider-free path is reserved
+/// for explicit extraction resets and documentation-digest transitions, where
+/// obsolete profile/format materializations must also be removed.
 pub(crate) fn rematerialize_cached_generations(conn: &Connection, snapshot: &str) -> Result<()> {
     conn.execute_batch("SAVEPOINT jscout_docs_cached_rematerialize")?;
     let result = (|| -> Result<()> {
@@ -2229,6 +2254,105 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!(materialized, (1, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_digest_reconciles_missing_profile_without_churning_ready_sibling() -> Result<()> {
+        let (root, conn) = indexed_document()?;
+        let snapshot = store::current_snapshot(&conn)?;
+        let provider = test_provider("http://127.0.0.1:1/v1/embeddings".into())?;
+        let missing_spec = provider.profile_for(CHUNK_FORMAT_VERSION)?;
+        let missing = ensure_profile(&conn, &missing_spec, 2)?;
+        let mut ready_spec = missing_spec.clone();
+        ready_spec.model = "other-docs-model".into();
+        ready_spec.fingerprint = "other-docs-profile".into();
+        let ready = ensure_profile(&conn, &ready_spec, 2)?;
+        let embedding_identity: String = conn.query_row(
+            "SELECT embedding_identity FROM doc_chunk_meta
+             WHERE embedding_identity IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        for profile in [&missing, &ready] {
+            conn.execute(
+                "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES(?1,?2,?3)",
+                params![&embedding_identity, profile.id, vec_to_blob(&[1.0, 0.0])],
+            )?;
+        }
+        assert_eq!(
+            rebuild_profile_generation_from_cache(&conn, &snapshot, &ready)?,
+            Some(1)
+        );
+        conn.execute("DELETE FROM embeddings WHERE profile_id=?1", [ready.id])?;
+        let ready_entry: i64 = conn.query_row(
+            "SELECT id FROM doc_embedding_index_entries WHERE profile_id=?1",
+            [ready.id],
+            |row| row.get(0),
+        )?;
+        assert!(!generation_is_ready(&conn, &snapshot, &missing)?);
+
+        crate::indexer::index_repo(root.path(), &conn)?;
+
+        assert_eq!(store::current_snapshot(&conn)?, snapshot);
+        assert!(generation_is_ready(&conn, &snapshot, &missing)?);
+        assert!(generation_is_ready(&conn, &snapshot, &ready)?);
+        assert_eq!(
+            conn.query_row(
+                "SELECT id FROM doc_embedding_index_entries WHERE profile_id=?1",
+                [ready.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            ready_entry,
+            "reconciling another profile must not rebuild ready occurrences"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_generation_reconciliation_rejects_the_wrong_documentation_digest() -> Result<()> {
+        let (_root, conn) = indexed_document()?;
+        let snapshot = store::current_snapshot(&conn)?;
+        let provider = test_provider("http://127.0.0.1:1/v1/embeddings".into())?;
+        let spec = provider.profile_for(CHUNK_FORMAT_VERSION)?;
+        let profile = ensure_profile(&conn, &spec, 2)?;
+        let embedding_identity: String = conn.query_row(
+            "SELECT embedding_identity FROM doc_chunk_meta
+             WHERE embedding_identity IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES(?1,?2,?3)",
+            params![embedding_identity, profile.id, vec_to_blob(&[1.0, 0.0])],
+        )?;
+
+        let error = reconcile_cached_generations(&conn, "not-the-current-digest").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires the published documentation digest")
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM doc_embedding_index_entries WHERE profile_id=?1",
+                [profile.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+
+        reconcile_cached_generations(&conn, &snapshot)?;
+        assert!(generation_is_ready(&conn, &snapshot, &profile)?);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM doc_embedding_index_entries WHERE profile_id=?1",
+                [profile.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
         Ok(())
     }
 
