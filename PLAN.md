@@ -3769,49 +3769,81 @@ storage-planes contract already records the principle: one database has one
 schema version and one atomic publication transaction, not one invalidation
 identity.
 
-1. Identities. `meta.code_digest` covers code-corpus file and package rows,
-   the code extraction and projection contracts, and module resolution.
-   `meta.documentation_digest` covers documentation-corpus source identity and
-   the documentation chunk-format contract. The existing
-   `documentation_provenance_digest` is unchanged. `meta.snapshot` remains the
-   published current-checkout marker and open-validation key — a fold of the
-   plane digests — and stops being compared by any consumer gate. All publish
-   in the one existing transaction; cross-plane consistency comes from that
-   transaction, not from a shared value.
-2. Re-keyed gates. Checker enrichment batches record and compare the code
-   digest; the annotate, workflow-candidate, and scouting publication guards
-   validate the code digest; the exhaustive-search cursor embeds the code
-   digest; anchor re-resolution reports staleness against the code digest.
-   Documentation vector generations and the `docs embed` guard key on the
-   documentation digest. Code and semantic vector sync are already
-   profile-keyed and do not change.
-3. Public contract. Each surface reports its own plane identity in the
-   existing `snapshot` response field: code and semantic surfaces report the
-   code digest, and `documentation_search` reports the documentation digest.
-   Cross-surface comparison of that field was never meaningful and becomes
-   explicitly undefined. Both MCP server instruction strings change in the
-   same pull request, as with G23: an identity change on a surface means
-   re-verifying that surface's evidence, and a documentation identity change
-   never requires restarting code traversals. `annotate` echoes back the
-   identity it was served, now plane-correct by construction.
+1. Identities. Every current structural-snapshot input is explicitly
+   partitioned; each digest carries its own domain tag and version and keeps
+   the established framing rules — length-prefixed fields and explicit absent
+   markers. `meta.code_digest` covers the code plane: the projection and code
+   extraction contracts with their published markers, the Rust edition
+   context, every `files` row with `corpus='code'` including path, hash,
+   role, origin, format, and package fields with their `package_instances`
+   join, and the module-resolution hash. `meta.documentation_digest` covers
+   the documentation plane: the documentation chunk-format contract with its
+   published marker, and every `files` row with `corpus='docs'` as path,
+   hash, and format only — role, origin, and package fields are excluded
+   because code-side dependency synchronization may rewrite them on
+   documentation rows without changing documentation content. The existing
+   `documentation_provenance_digest` is unchanged. `meta.snapshot` remains
+   the stored publication marker and open-validation key, redefined as a
+   domain-tagged fold of all three digests, and stops being compared by any
+   consumer gate. All publish in the one existing transaction; cross-plane
+   consistency comes from that transaction, not from a shared value.
+2. Re-keyed gates and engine. Checker enrichment batches record and compare
+   the code digest; the annotate, workflow-candidate, and scouting
+   publication guards validate the code digest; the exhaustive-search cursor
+   embeds the code digest; anchor re-resolution reports staleness against the
+   code digest. Documentation vector generations and the `docs embed` guard
+   key on the documentation digest. Code and semantic vector sync are already
+   profile-keyed and do not change. The publication engine re-keys with the
+   gates: structural projection reuse compares the code digest rather than
+   the whole projection identity, checker projection receives the code
+   digest, and checker retention becomes digest-aware — a manual
+   `jscout index` preserves or rebinds an active enrichment batch when the
+   code digest and checker inputs are unchanged instead of unconditionally
+   dropping it — so checker edges survive docs-only publications on every
+   path, not only under watch.
+3. Public contract. Each surface reports two fields: its plane digest in the
+   existing `snapshot` response field — the code digest on code and semantic
+   surfaces; the documentation digest on `documentation_search`,
+   `docs status`, and `docs embed` — and a global `publication_snapshot`
+   carrying the fold, which lets a caller detect that two responses observed
+   different published states. No server gate compares
+   `publication_snapshot`. Both MCP server instruction strings are updated in
+   the same pull request to describe the two fields; behavioral guidance
+   stays minimal. `annotate` echoes back the code digest it was served, now
+   plane-correct by construction.
 4. Boundaries. No new database, schema lifecycle, or second publication
    transaction. Watch classification is untouched: a docs-only publication
    that leaves the code digest byte-identical makes the scheduled enrichment
    pass an exact reuse, while provenance-scoped refresh signals remain the
-   separate watcher optimization. If the deferred observation ledger is ever
-   built, it orders against the documentation digest rather than the global
-   marker; that decision lands with the ledger.
+   separate watcher optimization. Documentation-vector rematerialization
+   triggers whenever extraction was reset or the current generation is absent
+   — never on a documentation-digest comparison — preserving the PR #113
+   invariant that a full refresh restores complete cached generations
+   provider-free. If the deferred observation ledger is ever built, it orders
+   against the documentation digest rather than the global marker; that
+   decision lands with the ledger.
 5. Transition. Existing checker batches, publication inputs, and cursors
    keyed to the old global value invalidate once on the first index under the
    split — the same one-time contract-transition class as the PR #113
-   hash-domain advance — and recurring cross-plane churn ends there.
+   hash-domain advance — and recurring cross-plane churn ends there. Durable
+   provenance columns (`source_snapshot` on semantic artifacts, scout runs,
+   and repository classifications) keep their legacy global values as opaque,
+   never-compared provenance; new rows record the code digest behind a domain
+   prefix so generations remain distinguishable. A pre-split database fails
+   closed into reindex through the existing version gates, and documentation
+   read surfaces fail closed until both plane digests are published.
 
-Acceptance: after a docs-only edit, checker enrichment edges remain projected
-in the same commit, a publication validated against the pre-edit code digest
-succeeds, and an in-flight exhaustive cursor survives; after a code-only
-edit, documentation vector readiness is untouched; a code edit still rotates
+Acceptance: after a docs-only edit — under watch or a manual `jscout index` —
+checker enrichment edges remain projected in the same publication, a
+publication validated against the pre-edit code digest succeeds, and an
+in-flight exhaustive cursor survives; after a code-only incremental
+publication, documentation vector readiness is untouched, and any publication
+that reset extraction rematerializes complete cached documentation
+generations provider-free in the same publication; a code edit still rotates
 the code digest and invalidates every code-bound gate; the foreign plane's
-digest is byte-identical after any cross-plane operation; both MCP
+digest is byte-identical after any cross-plane operation; every surface
+reports its plane digest plus `publication_snapshot`, and equal
+`publication_snapshot` values imply identical published state; both MCP
 instruction strings ship in the same change; and a before/after measurement
 records the checker-stall and discarded-publication deltas against pre-split
 behavior. No implementation milestone is assigned and no current goal is
