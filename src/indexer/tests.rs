@@ -1300,6 +1300,7 @@ fn documentation_contract_change_rechunks_docs_without_rotating_code() -> Result
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
     let code_digest = structural::current_snapshot(&conn)?;
+    let provenance_digest = crate::publication::Identities::read(&conn)?.provenance;
 
     let code_chunk_id: i64 = conn.query_row(
         "SELECT chunk.id
@@ -1307,6 +1308,40 @@ fn documentation_contract_change_rechunks_docs_without_rotating_code() -> Result
          WHERE file.path='main.ts' AND chunk.kind='module'",
         [],
         |row| row.get(0),
+    )?;
+    let old_doc_chunk_id: i64 = conn.query_row(
+        "SELECT chunk.id
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.md'",
+        [],
+        |row| row.get(0),
+    )?;
+    let old_profile_config = serde_json::json!({
+        "document_text": "documentation-v0",
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','old-docs-contract',2,?1)",
+        [&old_profile_config],
+    )?;
+    let old_profile_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO doc_embedding_index_entries(id,chunk_id,profile_id)
+         VALUES(1,?1,?2)",
+        rusqlite::params![old_doc_chunk_id, old_profile_id],
+    )?;
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE vec_doc_embeddings_2 USING vec0(
+           embedding FLOAT[2] distance_metric=cosine,
+           profile_id INTEGER PARTITION KEY
+         );",
+    )?;
+    conn.execute(
+        "INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id)
+         VALUES(1,X'0000803F00000000',?1)",
+        [old_profile_id],
     )?;
     conn.execute(
         "UPDATE doc_chunk_meta SET nearest_heading='stale-format-marker'",
@@ -1324,6 +1359,18 @@ fn documentation_contract_change_rechunks_docs_without_rotating_code() -> Result
         )?;
     }
     let old_format_documentation_digest = crate::publication::compute_documentation_digest(&conn)?;
+    conn.execute(
+        "INSERT INTO doc_vector_generations(
+           snapshot,profile_id,dimensions,chunk_format_version
+         ) VALUES(?1,?2,2,'documentation-v0')",
+        rusqlite::params![old_format_documentation_digest, old_profile_id],
+    )?;
+    crate::publication::Identities::publish_test(
+        &conn,
+        &code_digest,
+        &old_format_documentation_digest,
+        &provenance_digest,
+    )?;
 
     let outcome = index_repo(repo.path(), &conn)?;
 
@@ -1352,6 +1399,56 @@ fn documentation_contract_change_rechunks_docs_without_rotating_code() -> Result
         docs::store::current_snapshot(&conn)?,
         old_format_documentation_digest
     );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM doc_vector_generations", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM doc_embedding_index_entries",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM vec_doc_embeddings_2", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        0
+    );
+
+    let current_doc_chunk_id: i64 = conn.query_row(
+        "SELECT chunk.id
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.md'",
+        [],
+        |row| row.get(0),
+    )?;
+    let current_profile_config = serde_json::json!({
+        "document_text": docs::CHUNK_FORMAT_VERSION,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','current-docs-contract',2,?1)",
+        [&current_profile_config],
+    )?;
+    let current_profile_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO doc_embedding_index_entries(chunk_id,profile_id) VALUES(?1,?2)",
+        rusqlite::params![current_doc_chunk_id, current_profile_id],
+    )?;
+    let reused_row_id = conn.last_insert_rowid();
+    assert_eq!(reused_row_id, 1);
+    conn.execute(
+        "INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id)
+         VALUES(?1,X'0000803F00000000',?2)",
+        rusqlite::params![reused_row_id, current_profile_id],
+    )?;
     Ok(())
 }
 

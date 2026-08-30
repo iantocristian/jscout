@@ -3827,10 +3827,12 @@ identity.
    that leaves the code digest byte-identical makes the scheduled enrichment
    pass an exact reuse, while provenance-scoped refresh signals remain the
    separate watcher optimization. Documentation-vector rematerialization
-   triggers whenever extraction was reset or the current generation is absent
-   — never on a documentation-digest comparison — preserving the PR #113
-   invariant that a full refresh restores complete cached generations
-   provider-free. If the deferred observation ledger is ever built, it orders
+   triggers whenever extraction was reset, the documentation digest changed,
+   or a current generation is absent. Comparing the prior digest is required
+   to purge occurrence rows from obsolete embedding-text contracts, whose
+   profiles are intentionally excluded from current-profile readiness checks;
+   complete current generations are rebuilt provider-free from the durable
+   cache. If the deferred observation ledger is ever built, it orders
    against the documentation digest rather than the global marker; that
    decision lands with the ledger. Implementation uses the slimmed
    response envelope from G28 phase 1: one snapshot location per response and
@@ -3855,8 +3857,10 @@ checker enrichment edges remain projected in the same publication, a
 publication validated against the pre-edit code digest succeeds, and an
 in-flight exhaustive cursor survives; after a code-only incremental
 publication, documentation vector readiness is untouched, and any publication
-that reset extraction rematerializes complete cached documentation
-generations provider-free in the same publication; a code edit still rotates
+that reset extraction or changed the documentation digest rematerializes
+complete cached documentation generations provider-free in the same
+publication; a documentation text-contract transition also purges obsolete
+materialized occurrence rows even when no current-format profile exists; a code edit still rotates
 the code digest and invalidates every code-bound gate; the foreign plane's
 digest is byte-identical after any cross-plane operation; every successful
 atomic query/read response and `annotate` reports its plane digest plus
@@ -3952,8 +3956,9 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    hits drop the per-hit snapshot, file hash, and byte offsets; every
    surface prints compact JSON; `neighborhood` stops repeating the file path
    twice per node; `paths` and `entities` route through the compaction layer
-   or remain full-tier only; resolution blocks appear only when the
-   requested and resolved anchors differ; the caller's own `byte_limit` is
+   or remain full-tier only; resolution blocks appear only when anchor
+   handling is not exact-current, so stale re-resolution remains visible even
+   when the requested and resolved anchor strings are equal; the caller's own `byte_limit` is
    not echoed back. Complete-response budget accounting (invariant 9) is
    retained.
 4. `repository_overview` stops being a catalog. The default response is

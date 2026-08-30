@@ -223,7 +223,8 @@ Vector search joins BM25 only when the current documentation digest has a
 complete vector generation for the configured embedding profile. Ordinary
 search falls back to BM25 when vectors are absent; `--vector` requires vector
 participation and fails instead. Index rebuilds rematerialize complete cached
-documentation generations without provider calls; only new documentation
+documentation generations without provider calls, and documentation digest or
+text-contract changes purge obsolete materialized occurrences; only new documentation
 identities require `jscout docs embed`. Ordinary `jscout embed` and watched
 code embedding never request documentation vectors. Retrieval returns title,
 description, tags, heading context, path, and line range; file hashes and byte

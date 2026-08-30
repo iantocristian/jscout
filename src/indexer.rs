@@ -617,7 +617,7 @@ fn index_repo_attempt<F: FileSystem>(
         .collect::<HashMap<_, _>>();
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let preparation = (|| -> Result<(_, _, _, _, _, _)> {
-        let previous = ProjectionIdentity::read(conn)?;
+        let previous = PreviousPublication::read(conn)?;
         let previous_checker_identity = checker_retention
             .validates_active()
             .then(|| checker_canonical_identity(conn))
@@ -1017,9 +1017,11 @@ fn index_repo_attempt<F: FileSystem>(
         identities.publish(conn)?;
         // Documentation readiness is exact-digest state. Rebuild it from the
         // durable shared cache after the new marker exists, but before the outer
-        // publication commit. An incomplete cache remains a normal NotReady
-        // state and never turns indexing into a provider operation.
+        // publication commit. A digest transition must also purge old-contract
+        // profiles that current-profile readiness checks intentionally skip.
+        // An incomplete cache remains NotReady and never invokes a provider.
         if outcome.extraction_reset
+            || previous.documentation_digest.as_deref() != Some(identities.documentation.as_str())
             || crate::docs::retrieval::cached_generation_rematerialization_needed(
                 conn,
                 &identities.documentation,
@@ -1178,15 +1180,16 @@ fn checker_canonical_identity(conn: &Connection) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Prior code-plane inputs retained across canonical replacement. The code
-/// digest alone gates projection reuse; the separately stored resolution hash
-/// is needed only by the checker-safe rebind optimization.
-struct ProjectionIdentity {
+/// Prior publication inputs retained across canonical replacement. The code
+/// digest gates projection reuse, the documentation digest gates disposable
+/// vector occurrences, and the resolution hash is used by checker-safe rebind.
+struct PreviousPublication {
     code_digest: Option<String>,
+    documentation_digest: Option<String>,
     resolution_hash: Option<String>,
 }
 
-impl ProjectionIdentity {
+impl PreviousPublication {
     fn read(conn: &Connection) -> Result<Self> {
         let read = |key: &str| -> Result<Option<String>> {
             Ok(conn
@@ -1197,6 +1200,7 @@ impl ProjectionIdentity {
         };
         Ok(Self {
             code_digest: read(crate::publication::CODE_DIGEST_META_KEY)?,
+            documentation_digest: read(crate::publication::DOCUMENTATION_DIGEST_META_KEY)?,
             resolution_hash: read("resolution_hash")?,
         })
     }

@@ -101,7 +101,7 @@ flowchart LR
   MISS --> PROV["provider batches of 16, each in its own SAVEPOINT"]
   PROV --> CACHE["INSERT OR IGNORE into embeddings (durable)"]
   CACHE --> MAT["materialize_current_generation: BEGIN IMMEDIATE, recheck documentation digest"]
-  INDEX["jscout index publication"] --> GATE["extraction reset or current generation absent?"]
+  INDEX["jscout index publication"] --> GATE["reset, documentation digest changed, or current generation absent?"]
   GATE -- "yes" --> REMAT["rematerialize_cached_generations (provider-free SAVEPOINT)"]
   GATE -- "no" --> SKIP["current docs generations untouched"]
   MAT --> REBUILD["rebuild_profile_generation_from_cache"]
@@ -111,7 +111,7 @@ flowchart LR
 
 The asymmetry at `REBUILD` matters. Under `REMAT`, an incomplete cache is an ordinary not-ready outcome and indexing continues successfully (`src/docs/retrieval.rs:815-837`). Under `MAT`, the same `None` becomes a hard error — "not every current documentation representation has a cached valid-dimension vector" (`:791-793`) — which rolls back the `BEGIN IMMEDIATE`. `docs embed` was asked to publish; `index` was not.
 
-Two further gates are easy to miss. Indexing rematerializes when extraction was reset or `cached_generation_rematerialization_needed` finds any current documentation profile without complete readiness. This is deliberately not a comparison against the publication fold or even against the previous documentation digest: a full refresh and a missing generation must both recover from the durable cache without contacting a provider. `documentation_profiles` is not "every profile" — it is every `embedding_profiles` row whose `config_json["document_text"]` equals `CHUNK_FORMAT_VERSION`; rows that fail to parse or mismatch are skipped silently. Separately, `embed_current` skips materialization entirely when no profile resolved or `documents` is empty, reporting `occurrences_materialized=0, generation_published=false` without error.
+Two further gates are easy to miss. Indexing rematerializes when extraction was reset, the previous documentation digest differs from the new one, or `cached_generation_rematerialization_needed` finds any current documentation profile without complete readiness. The digest comparison is not a gate on the global publication fold: it is the lifecycle boundary for disposable documentation-vector occurrences. It also forces a global occurrence purge on a text-contract rotation, when every old-format profile is intentionally absent from the current-profile readiness scan. A full refresh and a missing generation recover from the durable cache without contacting a provider. `documentation_profiles` is not "every profile" — it is every `embedding_profiles` row whose `config_json["document_text"]` equals `CHUNK_FORMAT_VERSION`; rows that fail to parse or mismatch are skipped silently. Separately, `embed_current` skips materialization entirely when no profile resolved or `documents` is empty, reporting `occurrences_materialized=0, generation_published=false` without error.
 
 ## The query pipeline
 
