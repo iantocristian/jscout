@@ -1185,7 +1185,7 @@ fn neighborhood_value(
         json!(neighborhood.publication_snapshot),
     );
     response.insert("anchor".into(), json!(neighborhood.resolved_anchor));
-    if neighborhood.requested_anchor != neighborhood.resolved_anchor {
+    if neighborhood.anchor_status != "exact" {
         response.insert(
             "requested_anchor".into(),
             json!(neighborhood.requested_anchor),

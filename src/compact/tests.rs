@@ -506,7 +506,7 @@ fn ten_checker_edges_fit_under_eight_kibibytes() -> anyhow::Result<()> {
         publication_snapshot: "p".repeat(64),
         requested_anchor: root.into(),
         resolved_anchor: root.into(),
-        anchor_status: "current".into(),
+        anchor_status: "exact".into(),
         nodes,
         edges,
         truncated: false,
@@ -517,6 +517,28 @@ fn ten_checker_edges_fit_under_eight_kibibytes() -> anyhow::Result<()> {
     assert!(compact.len() < 8_000);
     let value: serde_json::Value = serde_json::from_str(&compact)?;
     assert_eq!(value["graph"]["edges"].as_array().map(Vec::len), Some(10));
+    Ok(())
+}
+
+#[test]
+fn compact_neighborhood_exposes_same_anchor_reresolution() -> anyhow::Result<()> {
+    let root = "sym:src/workflow.ts#::start@1";
+    let neighborhood = Neighborhood {
+        snapshot: "s".repeat(64),
+        publication_snapshot: "p".repeat(64),
+        requested_anchor: root.into(),
+        resolved_anchor: root.into(),
+        anchor_status: "re-resolved".into(),
+        nodes: vec![node(root, 1)],
+        edges: Vec::new(),
+        truncated: false,
+    };
+
+    let rendered = render_neighborhood(&neighborhood, 4_000)?;
+    let value: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(value["anchor"], root);
+    assert_eq!(value["requested_anchor"], root);
+    assert_eq!(value["anchor_status"], "re-resolved");
     Ok(())
 }
 
@@ -634,7 +656,7 @@ fn neighborhood_prefix_search_matches_linear_budget_shedding() -> anyhow::Result
         publication_snapshot: "p".repeat(64),
         requested_anchor: root.into(),
         resolved_anchor: root.into(),
-        anchor_status: "current".into(),
+        anchor_status: "exact".into(),
         nodes,
         edges,
         truncated: false,
@@ -679,7 +701,7 @@ fn neighborhood_prefix_search_matches_linear_isolated_node_shedding() -> anyhow:
         publication_snapshot: "p".repeat(64),
         requested_anchor: root.into(),
         resolved_anchor: root.into(),
-        anchor_status: "current".into(),
+        anchor_status: "exact".into(),
         nodes,
         edges: Vec::new(),
         truncated: false,

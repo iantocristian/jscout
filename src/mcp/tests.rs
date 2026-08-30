@@ -2427,6 +2427,30 @@ fn search_anchors_round_trip_exact_same_named_methods() -> Result<()> {
     )?;
     let neighborhood: serde_json::Value = serde_json::from_str(&neighborhood)?;
     assert_eq!(neighborhood["anchor"], second_class_anchor);
+    assert!(neighborhood.get("anchor_status").is_none());
+
+    let re_resolved_neighborhood = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "neighborhood",
+        &json!({
+            "anchor": second_class_anchor,
+            "snapshot": search["publication_snapshot"]
+        }),
+    )?;
+    let re_resolved_neighborhood: serde_json::Value =
+        serde_json::from_str(&re_resolved_neighborhood)?;
+    assert_eq!(
+        re_resolved_neighborhood["requested_anchor"],
+        second_class_anchor
+    );
+    assert_eq!(
+        re_resolved_neighborhood["anchor_status"],
+        "re-resolved"
+    );
 
     let fuzzy_snapshot = call_tool(
         repo.path(),
