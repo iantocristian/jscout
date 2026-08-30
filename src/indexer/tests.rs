@@ -4109,24 +4109,21 @@ fn docs_only_refresh_does_not_initialize_code_vector_storage() -> Result<()> {
            provider,model,config_fingerprint,dimensions,config_json
          ) VALUES('test','tiny','code-only-profile',2,'{}');",
     )?;
-    assert_eq!(
-        conn.query_row(
-            "SELECT EXISTS(
+    assert!(!conn.query_row(
+        "SELECT EXISTS(
                SELECT 1 FROM sqlite_master
                WHERE type='table' AND name='vec_embeddings_2'
              )",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?,
-        false
-    );
+        [],
+        |row| row.get::<_, bool>(0),
+    )?);
 
     fs::write(repo.path().join("README.md"), "# After\n\nNew prose.\n")?;
     let outcome = index_repo(repo.path(), &conn)?;
 
     assert_eq!((outcome.indexed, outcome.unchanged), (1, 1));
-    assert_eq!(
-        conn.query_row(
+    assert!(
+        !conn.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM sqlite_master
                WHERE type='table' AND name='vec_embeddings_2'
@@ -4134,7 +4131,6 @@ fn docs_only_refresh_does_not_initialize_code_vector_storage() -> Result<()> {
             [],
             |row| row.get::<_, bool>(0),
         )?,
-        false,
         "documentation changes must not scan or initialize the code-vector plane"
     );
     Ok(())
