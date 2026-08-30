@@ -2443,6 +2443,60 @@ fn search_anchors_round_trip_exact_same_named_methods() -> Result<()> {
             .to_string()
             .contains("only valid with exact")
     );
+
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         )
+         SELECT symbol.file_id,symbol.name,symbol.kind,symbol.start,symbol.end,
+                symbol.decl_start,symbol.decl_end,symbol.scope_chain,symbol.line,
+                symbol.exported
+         FROM symbols symbol JOIN graph_nodes node ON node.native_id=symbol.id
+         WHERE node.native_table='symbols' AND node.node_key=?1",
+        [&second_anchor],
+    )?;
+    let overload_id = conn.last_insert_rowid();
+    let (anchor_prefix, _) = second_anchor
+        .rsplit_once('@')
+        .expect("canonical symbol anchor has an ordinal");
+    let overload_anchor = format!("{anchor_prefix}@2");
+    conn.execute(
+        "INSERT INTO graph_nodes(
+           node_key,node_kind,native_table,native_id,display_name,file_id,line,meta_json
+         )
+         SELECT ?1,'symbol','symbols',symbol.id,symbol.name,symbol.file_id,
+                symbol.line,'{}'
+         FROM symbols symbol WHERE symbol.id=?2",
+        rusqlite::params![overload_anchor, overload_id],
+    )?;
+
+    call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        &method_arguments,
+    )?;
+    let stale_overload = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        &json!({
+            "anchor": second_anchor,
+            "snapshot": search["publication_snapshot"],
+            "origins": ["repository"]
+        }),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(stale_overload.contains("stale anchor"));
+    assert!(stale_overload.contains("ambiguous after re-resolution"));
+    assert!(stale_overload.contains("current response's `snapshot`"));
     Ok(())
 }
 

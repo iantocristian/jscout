@@ -3590,6 +3590,12 @@ fn resolve_anchor(
             symbol_candidates(conn, Some(&path), Some(&scope), &name)?,
             allowed_origins,
         )?;
+        if candidates.len() > 1 {
+            bail!(
+                "stale anchor `{anchor}` is ambiguous after re-resolution in the current snapshot; relocalize the symbol and retry with the current response's `snapshot`; candidates: {}",
+                candidates.join(", ")
+            );
+        }
         return unique_anchor(anchor, candidates, "re-resolved");
     }
     if structural_graph_node_exists(conn, anchor)? {

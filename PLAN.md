@@ -3958,7 +3958,9 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    twice per node; `paths` and `entities` route through the compaction layer
    or remain full-tier only; resolution blocks appear only when anchor
    handling is not exact-current, so stale re-resolution remains visible even
-   when the requested and resolved anchor strings are equal; the caller's own `byte_limit` is
+   when the requested and resolved anchor strings are equal; an ambiguous
+   stale re-resolution fails closed with a relocalization diagnostic rather
+   than presenting the ambiguity as current exact-anchor failure; the caller's own `byte_limit` is
    not echoed back. Complete-response budget accounting (invariant 9) is
    retained.
 4. `repository_overview` stops being a catalog. The default response is
