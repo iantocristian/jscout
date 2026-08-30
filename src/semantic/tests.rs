@@ -986,6 +986,19 @@ fn annotate_rejects_untrusted_confidence_bad_spans_and_stale_snapshots() -> Resu
             .contains("line count")
     );
 
+    let publication_snapshot = AnnotateInput {
+        confidence: "likely".into(),
+        snapshot: crate::publication::current_publication_snapshot(&conn)?,
+        supports: vec![support("/claim", alpha, "a.ts")],
+        ..bad_span.clone()
+    };
+    assert_eq!(
+        annotate(repo.path(), &conn, &publication_snapshot)
+            .unwrap_err()
+            .to_string(),
+        "annotation snapshot is the current `publication_snapshot`; pass the code digest from the response's `snapshot` field"
+    );
+
     let stale_snapshot = AnnotateInput {
         snapshot: "0".repeat(64),
         supports: vec![support("/claim", alpha, "a.ts")],

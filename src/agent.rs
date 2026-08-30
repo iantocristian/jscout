@@ -130,6 +130,7 @@ mod tests {
             "Never synthesize locator arguments",
             "`scope.origins`",
             "`scope.formats`",
+            "response's top-level `snapshot` and the echoed scope",
             "separate non-exhaustive",
             "Baseline forces both unavailable stages off",
             "semantic_memory",

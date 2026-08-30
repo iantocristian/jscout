@@ -100,8 +100,8 @@ known code.
    expanded search can orient a cross-file route. Expand at most once, after
    localization. For an exact-identifier follow-up, set `vector: false` and
    `rerank: false` unless lexical results are insufficient.
-6. A completeness answer must state the echoed scope: corpus, file roles,
-   origins, formats, and snapshot. Exhaustive coverage is by indexed chunk plus unique
+6. A completeness answer must state the response's top-level `snapshot` and the echoed scope:
+   corpus, file roles, origins, and formats. Exhaustive coverage is by indexed chunk plus unique
    `match_lines`; it is not regex, substring, or within-line occurrence
    coverage. Use repository-local text search when that stronger literal
    representation is required.

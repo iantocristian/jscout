@@ -377,6 +377,12 @@ pub struct SymbolAnchorResolution {
     pub anchor_status: String,
 }
 
+impl SymbolAnchorResolution {
+    pub(crate) fn is_exact_current(&self) -> bool {
+        self.requested_anchor == self.resolved_anchor && self.anchor_status == "exact"
+    }
+}
+
 /// Resolve one name-mode CLI target back to its canonical structural anchor.
 /// A declaration-line match wins; otherwise the target is exact only when its
 /// file and name identify one symbol node. Ambiguity deliberately falls back

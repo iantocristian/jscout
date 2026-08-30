@@ -2313,6 +2313,36 @@ fn search_anchors_round_trip_exact_same_named_methods() -> Result<()> {
         definition.len()
     );
 
+    let re_resolved_definition = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        &json!({
+            "anchor": second_class_anchor,
+            "snapshot": search["publication_snapshot"]
+        }),
+    )?;
+    let re_resolved_value: serde_json::Value = serde_json::from_str(&re_resolved_definition)?;
+    assert_eq!(
+        re_resolved_value["resolution"]["requested_anchor"],
+        second_class_anchor
+    );
+    assert_eq!(
+        re_resolved_value["resolution"]["resolved_anchor"],
+        second_class_anchor
+    );
+    assert_eq!(
+        re_resolved_value["resolution"]["anchor_status"],
+        "re-resolved"
+    );
+    assert_eq!(
+        re_resolved_value["response"]["rendered_bytes"],
+        re_resolved_definition.len()
+    );
+
     let method_arguments = json!({
         "anchor": second_anchor,
         "snapshot": search["snapshot"],
@@ -2357,6 +2387,34 @@ fn search_anchors_round_trip_exact_same_named_methods() -> Result<()> {
     );
     assert!(!usages_rendered.contains("targetName"));
     assert!(!usages_rendered.contains("candidateCount"));
+
+    let debug_re_resolved = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "who_uses",
+        &json!({
+            "anchor": second_anchor,
+            "snapshot": search["publication_snapshot"],
+            "origins": ["repository"],
+            "debug": true
+        }),
+    )?;
+    let debug_re_resolved: serde_json::Value = serde_json::from_str(&debug_re_resolved)?;
+    assert_eq!(
+        debug_re_resolved["resolution"]["requested_anchor"],
+        second_anchor
+    );
+    assert_eq!(
+        debug_re_resolved["resolution"]["resolved_anchor"],
+        second_anchor
+    );
+    assert_eq!(
+        debug_re_resolved["resolution"]["anchor_status"],
+        "re-resolved"
+    );
 
     let neighborhood = call_tool(
         repo.path(),

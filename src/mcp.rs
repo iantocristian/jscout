@@ -1736,7 +1736,7 @@ fn identity_value(identity: &crate::publication::ResponseIdentity) -> Value {
 fn visible_symbol_resolution(
     resolution: Option<&query::SymbolAnchorResolution>,
 ) -> Option<&query::SymbolAnchorResolution> {
-    resolution.filter(|resolution| resolution.requested_anchor != resolution.resolved_anchor)
+    resolution.filter(|resolution| !resolution.is_exact_current())
 }
 
 fn json_string_array(args: &Value, key: &str) -> Vec<String> {

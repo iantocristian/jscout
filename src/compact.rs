@@ -696,9 +696,7 @@ fn symbol_response(
         "publication_snapshot".into(),
         json!(identity.publication_snapshot),
     );
-    if let Some(resolution) =
-        resolution.filter(|resolution| resolution.requested_anchor != resolution.resolved_anchor)
-    {
+    if let Some(resolution) = resolution.filter(|resolution| !resolution.is_exact_current()) {
         response.insert("resolution".into(), json!(resolution));
     }
     response

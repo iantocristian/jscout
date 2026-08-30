@@ -636,7 +636,7 @@ fn annotate_with_identity(
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| {
         let identity = Identities::read(conn)?.response(Plane::Code);
-        let supports = validate_annotate_input_at_snapshot(root, conn, input, &identity.snapshot)?;
+        let supports = validate_annotate_input_at_identity(root, conn, input, &identity)?;
         let artifact_id = persist_validated_artifact(
             conn,
             input,
@@ -686,19 +686,25 @@ pub(crate) fn validate_annotate_input(
     conn: &Connection,
     input: &AnnotateInput,
 ) -> Result<(String, Vec<ValidatedSupport>)> {
-    let snapshot = structural::current_snapshot(conn)?;
-    let supports = validate_annotate_input_at_snapshot(root, conn, input, &snapshot)?;
-    Ok((snapshot, supports))
+    let identity = Identities::read(conn)?.response(Plane::Code);
+    let supports = validate_annotate_input_at_identity(root, conn, input, &identity)?;
+    Ok((identity.snapshot, supports))
 }
 
-fn validate_annotate_input_at_snapshot(
+fn validate_annotate_input_at_identity(
     root: &Path,
     conn: &Connection,
     input: &AnnotateInput,
-    snapshot: &str,
+    identity: &ResponseIdentity,
 ) -> Result<Vec<ValidatedSupport>> {
     validate_input(input)?;
+    let snapshot = identity.snapshot.as_str();
     if input.snapshot != snapshot {
+        if input.snapshot == identity.publication_snapshot {
+            bail!(
+                "annotation snapshot is the current `publication_snapshot`; pass the code digest from the response's `snapshot` field"
+            );
+        }
         bail!("annotation snapshot is stale; current snapshot is {snapshot}");
     }
     if let Some(supersedes) = input.supersedes {
