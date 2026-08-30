@@ -24,6 +24,19 @@ pub enum ToolProfile {
     Structural,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolAccess {
+    Read,
+    Write,
+}
+
+fn tool_access(profile: ToolProfile, name: &str) -> ToolAccess {
+    match (profile, name) {
+        (ToolProfile::Structural, "annotate") => ToolAccess::Write,
+        _ => ToolAccess::Read,
+    }
+}
+
 impl ToolProfile {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
@@ -300,7 +313,7 @@ pub fn serve(
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let started = Instant::now();
                 let retrieval_timings = RefCell::new(RetrievalStageMetrics::default());
-                let result = if name == "annotate" && profile == ToolProfile::Structural {
+                let result = if tool_access(profile, name) == ToolAccess::Write {
                     // The server is read-only until the one write-capable tool
                     // is actually selected. Keep schema writes and writer locks
                     // out of every retrieval-only MCP session.
@@ -1091,7 +1104,7 @@ struct RetrievalStageMetrics {
 }
 
 fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) -> Result<String> {
-    if name == "annotate" {
+    if tool_access(context.profile, name) == ToolAccess::Write {
         return call_tool_inner(context, name, args);
     }
 
@@ -1243,10 +1256,14 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
                 as usize;
             let identity = crate::publication::Identities::read(conn)?
                 .response(crate::publication::Plane::Code);
-            let graph = query::ModuleGraph::load(conn)?;
             let origins = configured_origins(args, search_defaults);
             let formats = code_formats(args)?;
             let (targets, resolution) = symbol_targets(conn, args, &origins, &formats)?;
+            let graph = if resolution.is_none() && !targets.is_empty() {
+                Some(query::ModuleGraph::load(conn)?)
+            } else {
+                None
+            };
             let mut results = Vec::new();
             for t in &targets {
                 let usages = if let Some(resolution) = &resolution {
@@ -1257,7 +1274,16 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
                         &formats,
                     )?
                 } else {
-                    query::who_uses_in_scope(conn, &graph, t.file_id, &t.name, &origins, &formats)?
+                    query::who_uses_in_scope(
+                        conn,
+                        graph
+                            .as_ref()
+                            .expect("fuzzy symbol lookup loaded the module graph"),
+                        t.file_id,
+                        &t.name,
+                        &origins,
+                        &formats,
+                    )?
                 };
                 results.push((t, usages));
             }
@@ -1830,33 +1856,73 @@ pub(crate) fn render_bounded_object_arrays(
         "omitted_items": 0,
     });
     response["response_budget"] = budget;
-    settle_unbudgeted_response(&mut response)?;
-
-    while serde_json::to_string(&response)?.len() > byte_limit {
-        let removed = fields.iter().any(|field| {
-            response[*field]
-                .as_array_mut()
-                .is_some_and(|items| items.pop().is_some())
-        });
-        if !removed {
-            let minimum = serde_json::to_string(&response)?.len();
-            anyhow::bail!(
-                "response byte limit {byte_limit} is below the minimum response envelope ({minimum} bytes)"
-            );
-        }
-        response["response_budget"]["truncated"] = json!(true);
-        if response.get("truncated").is_some() {
-            response["truncated"] = json!(true);
-        }
-        let remaining: usize = fields
-            .iter()
-            .map(|field| response[*field].as_array().map_or(0, Vec::len))
-            .sum();
-        response["response_budget"]["omitted_items"] = json!(original_items - remaining);
-        settle_value_rendered_bytes(&mut response)?;
+    let mut rendered = settle_unbudgeted_response(&mut response)?;
+    if rendered <= byte_limit {
+        return Ok(serde_json::to_string(&response)?);
     }
-    settle_value_rendered_bytes(&mut response)?;
-    Ok(serde_json::to_string(&response)?)
+
+    for field in fields {
+        let Some(items) = response[*field].as_array_mut().map(std::mem::take) else {
+            continue;
+        };
+        if items.is_empty() {
+            continue;
+        }
+        let mut low = 0usize;
+        let mut high = items.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            rendered = set_bounded_array_prefix(
+                &mut response,
+                fields,
+                field,
+                &items,
+                middle,
+                original_items,
+            )?;
+            if rendered <= byte_limit {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let retained = low.saturating_sub(1);
+        rendered = set_bounded_array_prefix(
+            &mut response,
+            fields,
+            field,
+            &items,
+            retained,
+            original_items,
+        )?;
+        if rendered <= byte_limit {
+            return Ok(serde_json::to_string(&response)?);
+        }
+    }
+    anyhow::bail!(
+        "response byte limit {byte_limit} is below the minimum response envelope ({rendered} bytes)"
+    )
+}
+
+fn set_bounded_array_prefix(
+    response: &mut Value,
+    fields: &[&str],
+    field: &str,
+    items: &[Value],
+    retained: usize,
+    original_items: usize,
+) -> Result<usize> {
+    response[field] = Value::Array(items[..retained].to_vec());
+    response["response_budget"]["truncated"] = json!(true);
+    if response.get("truncated").is_some() {
+        response["truncated"] = json!(true);
+    }
+    let remaining: usize = fields
+        .iter()
+        .map(|field| response[*field].as_array().map_or(0, Vec::len))
+        .sum();
+    response["response_budget"]["omitted_items"] = json!(original_items - remaining);
+    settle_value_rendered_bytes(response)
 }
 
 fn settle_unbudgeted_response(value: &mut Value) -> Result<usize> {

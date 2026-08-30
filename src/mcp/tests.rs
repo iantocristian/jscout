@@ -8,11 +8,13 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use super::{
-    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile,
+    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolAccess, ToolProfile,
     call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
     exhaustive_telemetry_metrics, expansion_role_metrics, initialize_result, log_request,
-    render_bounded_items, render_tool_result, search_options_from_args, semantic_artifact_metrics,
-    server_instructions, sum_durations, telemetry_snapshot, tool_defs,
+    render_bounded_items, render_bounded_object_arrays, render_tool_result,
+    search_options_from_args, semantic_artifact_metrics, server_instructions,
+    settle_unbudgeted_response, settle_value_rendered_bytes, sum_durations, telemetry_snapshot,
+    tool_access, tool_defs,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
 
@@ -2447,10 +2449,7 @@ fn search_anchors_round_trip_exact_same_named_methods() -> Result<()> {
         re_resolved_neighborhood["requested_anchor"],
         second_class_anchor
     );
-    assert_eq!(
-        re_resolved_neighborhood["anchor_status"],
-        "re-resolved"
-    );
+    assert_eq!(re_resolved_neighborhood["anchor_status"], "re-resolved");
 
     let fuzzy_snapshot = call_tool(
         repo.path(),
@@ -2698,6 +2697,110 @@ fn bounded_item_envelope_accounts_for_json_overhead() -> Result<()> {
         complete.len()
     );
     Ok(())
+}
+
+fn linearly_shed_bounded_object_array_states(
+    mut response: serde_json::Value,
+    fields: &[&str],
+) -> Result<Vec<String>> {
+    let original_items: usize = fields
+        .iter()
+        .map(|field| response[*field].as_array().map_or(0, Vec::len))
+        .sum();
+    response["response_budget"] = json!({
+        "rendered_bytes": 0,
+        "unbudgeted_bytes": 0,
+        "truncated": false,
+        "omitted_items": 0,
+    });
+    settle_unbudgeted_response(&mut response)?;
+    let mut states = Vec::with_capacity(original_items + 1);
+    loop {
+        settle_value_rendered_bytes(&mut response)?;
+        states.push(serde_json::to_string(&response)?);
+        let removed = fields.iter().any(|field| {
+            response[*field]
+                .as_array_mut()
+                .is_some_and(|items| items.pop().is_some())
+        });
+        if !removed {
+            break;
+        }
+        response["response_budget"]["truncated"] = json!(true);
+        if response.get("truncated").is_some() {
+            response["truncated"] = json!(true);
+        }
+        let remaining: usize = fields
+            .iter()
+            .map(|field| response[*field].as_array().map_or(0, Vec::len))
+            .sum();
+        response["response_budget"]["omitted_items"] = json!(original_items - remaining);
+    }
+    Ok(states)
+}
+
+#[test]
+fn bounded_array_prefix_search_matches_linear_shedding() -> Result<()> {
+    let response = json!({
+        "snapshot": "code",
+        "publication_snapshot": "publication",
+        "truncated": false,
+        "first": (0..73).map(|index| match index % 3 {
+            0 => json!(index),
+            1 => json!("a".repeat(index % 7)),
+            _ => json!({ "index": index, "text": "b".repeat(index % 5) }),
+        }).collect::<Vec<_>>(),
+        "second": (0..39).map(|index| json!({
+            "index": index,
+            "text": "c".repeat(index % 11),
+        })).collect::<Vec<_>>(),
+    });
+    let full = render_bounded_object_arrays(response.clone(), &["first", "second"], usize::MAX)?;
+    let linear_states =
+        linearly_shed_bounded_object_array_states(response.clone(), &["first", "second"])?;
+    assert_eq!(linear_states.first(), Some(&full));
+    let minimum = linear_states
+        .last()
+        .expect("linear shedding always records the empty envelope")
+        .len();
+    for limit in 1..=full.len() + 1 {
+        let expected = linear_states
+            .iter()
+            .find(|rendered| rendered.len() <= limit)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "response byte limit {limit} is below the minimum response envelope ({minimum} bytes)"
+                )
+            });
+        let actual = render_bounded_object_arrays(response.clone(), &["first", "second"], limit);
+        match (expected, actual) {
+            (Ok(expected), Ok(actual)) => assert_eq!(actual, expected, "limit={limit}"),
+            (Err(expected), Err(actual)) => {
+                assert_eq!(actual.to_string(), expected.to_string(), "limit={limit}");
+            }
+            (expected, actual) => {
+                panic!("budget result differed at {limit}: expected={expected:?} actual={actual:?}")
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn tool_access_classifies_only_structural_annotate_as_a_write() {
+    assert_eq!(
+        tool_access(ToolProfile::Structural, "annotate"),
+        ToolAccess::Write
+    );
+    assert_eq!(
+        tool_access(ToolProfile::Structural, "search"),
+        ToolAccess::Read
+    );
+    assert_eq!(
+        tool_access(ToolProfile::Baseline, "annotate"),
+        ToolAccess::Read
+    );
 }
 
 #[test]
