@@ -108,8 +108,13 @@ impl RuntimeConfig {
                     .unwrap_or("<provider default>")
             ),
             format!(
-                "mcp: profile={} source_view={} result_transport={} telemetry={} request_log={}",
+                "mcp: profile={} tools={} source_view={} result_transport={} telemetry={} request_log={}",
                 self.effective.mcp.profile,
+                if self.effective.mcp.tools.is_empty() {
+                    "all".to_string()
+                } else {
+                    self.effective.mcp.tools.join(",")
+                },
                 self.effective.mcp.source_view,
                 self.effective.mcp.result_transport,
                 display_optional_path(self.effective.telemetry.file.as_deref()),

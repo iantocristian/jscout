@@ -430,7 +430,13 @@ fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Resul
     )?;
     recon::reconcile_file_policy(repo.path(), &conn)?;
 
-    let response = overview_response(&conn, &OverviewOptions::default())?;
+    let response = overview_response(
+        &conn,
+        &OverviewOptions {
+            reconnaissance_limit: 12,
+            ..Default::default()
+        },
+    )?;
     assert_eq!(response.overview.totals["files"], 2);
     assert_eq!(response.overview.files_by_origin["repository"], 2);
     let overlay = response
@@ -514,6 +520,38 @@ fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Resul
         .is_err()
     );
 
+    // G28 phase 2: the default overview carries no reconnaissance prose, and
+    // when a budget bites, reconnaissance classifications are shed before any
+    // structural count.
+    let silent = overview_response(&conn, &OverviewOptions::default())?;
+    assert!(silent.reconnaissance.is_none());
+    assert_eq!(OverviewOptions::default().reconnaissance_limit, 0);
+    let full = overview_response(
+        &conn,
+        &OverviewOptions {
+            reconnaissance_limit: 12,
+            ..Default::default()
+        },
+    )?;
+    let full_bytes = serde_json::to_string(&full)?.len();
+    let squeezed = overview_response(
+        &conn,
+        &OverviewOptions {
+            reconnaissance_limit: 12,
+            response_byte_limit: full_bytes - 40,
+            ..Default::default()
+        },
+    )?;
+    assert!(
+        squeezed
+            .response_budget
+            .omitted_reconnaissance_classifications
+            >= 1
+    );
+    assert_eq!(squeezed.response_budget.omitted_areas, 0);
+    assert_eq!(squeezed.response_budget.omitted_relations, 0);
+    assert_eq!(squeezed.response_budget.omitted_entity_inventory, 0);
+
     let without_reconnaissance = overview_response(
         &conn,
         &OverviewOptions {
@@ -528,9 +566,15 @@ fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Resul
         "export const later = 1;\n",
     )?;
     indexer::index_repo(repo.path(), &conn)?;
-    let stale = overview_response(&conn, &OverviewOptions::default())?
-        .reconnaissance
-        .expect("historical reconnaissance status");
+    let stale = overview_response(
+        &conn,
+        &OverviewOptions {
+            reconnaissance_limit: 12,
+            ..Default::default()
+        },
+    )?
+    .reconnaissance
+    .expect("historical reconnaissance status");
     assert_eq!(stale.status, "no_current_classifications");
     assert_eq!(stale.matched, 0);
     assert!(stale.classifications.is_empty());
@@ -540,6 +584,7 @@ fn overview_surfaces_current_cited_reconnaissance_and_effective_roles() -> Resul
             .expect("refresh hint")
             .contains("jscout scout repository")
     );
+
     Ok(())
 }
 

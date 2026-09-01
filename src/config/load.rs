@@ -194,6 +194,7 @@ struct McpFileConfig {
     profile: Option<String>,
     source_view: Option<String>,
     result_transport: Option<String>,
+    tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -919,9 +920,12 @@ impl RuntimeConfig {
         };
         validate_nonempty("sidecars.node", &sidecars.node)?;
 
-        let profile = resolver.string("mcp.profile", raw.mcp.profile, None, "structural");
-        if !matches!(profile.as_str(), "baseline" | "structural") {
-            bail!("mcp.profile must be baseline or structural");
+        let profile = resolver.string("mcp.profile", raw.mcp.profile, None, "core");
+        if !matches!(
+            profile.as_str(),
+            "core" | "full" | "baseline" | "structural"
+        ) {
+            bail!("mcp.profile must be core, full, baseline, or structural");
         }
         let source_view = resolver.string("mcp.source_view", raw.mcp.source_view, None, "full");
         if !matches!(source_view.as_str(), "full" | "elided") {
@@ -936,10 +940,13 @@ impl RuntimeConfig {
         if !matches!(result_transport.as_str(), "auto" | "text" | "structured") {
             bail!("mcp.result_transport must be auto, text, or structured");
         }
+        let tools = resolver.configured_or("mcp.tools", raw.mcp.tools, Vec::<String>::new());
+        crate::mcp::validate_tool_names(&tools)?;
         let mcp = McpSettings {
             profile,
             source_view,
             result_transport,
+            tools,
         };
 
         let telemetry = TelemetrySettings {

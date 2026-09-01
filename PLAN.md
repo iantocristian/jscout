@@ -3885,7 +3885,7 @@ scratch artifacts are not checked in. The implementation, corpus counts,
 integrity checks, artifact hashes, and full measurement limits are recorded in
 [eval/results/g27-plane-identities-2026-08-30.md](eval/results/g27-plane-identities-2026-08-30.md).
 
-## G28 — agent surface economy (phase 1 code implemented; replay pending)
+## G28 — agent surface economy (phases 0–2 implemented; replay pending)
 
 The surface costs more than the work. An out-of-box MCP session pays the
 structural profile's 13 tool definitions plus instructions — roughly 27 KB,
@@ -3976,13 +3976,23 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    `eval/` before they are lost. The replay rig is the three-arm cardHistory
    comparison, the links-iteration session, and the still-pending G23
    acceptance replay; every phase closes with a replay against the recorded
-   baselines. Phase 0 — tiered skill, installer destinations, and registration
-   config — remains pending. Phase 1 response economy is implemented with G27
-   and pinned by response-shape and differential tests, but its byte/quality
-   replay acceptance has not run. Phase 2, the overview redesign, remains
-   pending. The G27 isolation measurement is evidence for G27, not a substitute
-   for G28's surface-cost and answer-quality thresholds. Documentation and Rust
-   guidance remains subject to its first production telemetry window.
+   baselines. Phase 0 is implemented: `integrations/jscout/{core,full}/SKILL.md`
+   are the tiered skills (core under 3 KB), `agent-guide --tier --dest`
+   installs to `.agents/`, `.claude/`, or `.codex/`, `mcp.profile` defaults to
+   `core` (alias `baseline`; `full` aliases `structural`), `[mcp].tools`
+   narrows registration and is enforced at the call boundary, both server
+   instruction strings are identity, skill pointer, and the two mechanical
+   contracts, and tool descriptions are one line with duplicated property
+   prose removed; the surface-size, one-liner, and allowlist gates are pinned
+   by tests. Phase 1 response economy is implemented with G27 and pinned by
+   response-shape and differential tests. Phase 2 is implemented: the overview
+   defaults `reconnaissance_limit` to zero, a subject implies one, and budget
+   eviction sheds reconnaissance prose before structural counts. The
+   byte/quality replay acceptance has not run, and the 2026-08-22/24 telemetry
+   write-up into `eval/` remains owed. The G27 isolation measurement is
+   evidence for G27, not a substitute for G28's surface-cost and
+   answer-quality thresholds. Documentation and Rust guidance remains subject
+   to its first production telemetry window.
 
 Acceptance: the default registered surface, instructions included, costs
 less than a third of today's structural surface, and the core skill stays
@@ -3995,8 +4005,9 @@ baselines, the skill-guided arm's call count and answer quality do not
 regress and the use-every-endpoint arm's bytes drop by at least half; and
 every routing rule exists in exactly one surface — the skill — with the
 instruction strings reduced to identity, pointer, and mechanical contracts.
-Phase 1 code is complete, but G28 remains open until phases 0 and 2 land and
-the recorded byte/quality replay gates pass.
+Phases 0–2 are implemented; G28 remains open until the recorded
+byte/quality replay gates pass and the production telemetry windows are
+written up.
 
 ## Evaluation decisions already made
 

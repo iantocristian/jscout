@@ -239,7 +239,7 @@ pub(super) enum Command {
         /// Append every incoming MCP request as JSONL, including tool arguments
         #[arg(long)]
         request_log: Option<PathBuf>,
-        /// Evaluation tool surface: baseline or structural
+        /// Tool surface: core (alias baseline) or full (alias structural)
         #[arg(long)]
         profile: Option<String>,
         /// Definition source representation: full or deterministic elided source
@@ -358,8 +358,8 @@ pub(super) enum Command {
         /// Restrict semantic overlay types (cards are excluded by default)
         #[arg(long = "semantic-type", value_delimiter = ',')]
         semantic_types: Vec<String>,
-        /// Maximum current reconnaissance classifications with cited explanations
-        #[arg(long, default_value_t = 12)]
+        /// Maximum reconnaissance classifications; 0 omits reconnaissance prose (a subject implies 1)
+        #[arg(long, default_value_t = 0)]
         reconnaissance_limit: usize,
         /// Exact reconnaissance subject key to drill into
         #[arg(long)]
@@ -497,12 +497,18 @@ pub(super) enum Command {
     },
     /// Print, install, or update the jscout agent-integration skill
     AgentGuide {
-        /// Install into ROOT/.agents/skills/jscout/SKILL.md; print when omitted
+        /// Install the skill under ROOT at --dest; print it when omitted
         #[arg(long, conflicts_with = "update")]
         install: Option<PathBuf>,
-        /// Replace ROOT/.agents/skills/jscout/SKILL.md with the shipped guide
+        /// Replace the skill under ROOT at --dest with the shipped guide
         #[arg(long, conflicts_with = "install")]
         update: Option<PathBuf>,
+        /// Skill tier: core (baseline tool surface) or full (structural)
+        #[arg(long, default_value = "core")]
+        tier: String,
+        /// Skill location: agents (.agents/skills), claude (.claude/skills), or codex (.codex/skills)
+        #[arg(long, default_value = "agents")]
+        dest: String,
     },
     /// Enrich exact member-call occurrences with bounded TypeScript checker facts
     Enrich {

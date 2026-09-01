@@ -89,6 +89,7 @@ impl Command {
             Self::AgentGuide {
                 install: None,
                 update: None,
+                ..
             } => None,
             Self::Config { command } => Some(command.root()),
         }
@@ -408,6 +409,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                     profile: mcp::ToolProfile::parse(profile)?,
                     source_view: source_view::SourceView::parse(source_view)?,
                     result_transport: mcp::ResultTransportPolicy::parse(result_transport)?,
+                    tools: runtime.effective.mcp.tools.clone(),
                 },
                 runtime,
             )
@@ -696,15 +698,22 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                 file_origins,
             },
         ),
-        Command::AgentGuide { install, update } => {
+        Command::AgentGuide {
+            install,
+            update,
+            tier,
+            dest,
+        } => {
+            let tier = agent::Tier::parse(&tier)?;
+            let destination = agent::Destination::parse(&dest)?;
             if let Some(root) = install {
-                let target = agent::install(&root)?;
+                let target = agent::install(&root, tier, destination)?;
                 println!("installed {}", target.display());
             } else if let Some(root) = update {
-                let target = agent::update(&root)?;
+                let target = agent::update(&root, tier, destination)?;
                 println!("updated {}", target.display());
             } else {
-                print!("{}", agent::GUIDE);
+                print!("{}", tier.guide());
             }
             Ok(())
         }

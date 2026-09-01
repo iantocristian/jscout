@@ -333,7 +333,7 @@ fn init_refuses_to_overwrite_and_emits_the_current_schema() -> anyhow::Result<()
     assert!(loaded.config_loaded);
     assert!(loaded.effective.docs.enabled);
     assert_eq!(loaded.effective.docs.include, ["**/*.md", "**/*.mdx"]);
-    assert_eq!(loaded.effective.mcp.profile, "structural");
+    assert_eq!(loaded.effective.mcp.profile, "core");
     assert_eq!(loaded.effective.mcp.result_transport, "auto");
     assert!(init(root.path(), None).is_err());
     assert!(TEMPLATE.contains("rerank = true"));

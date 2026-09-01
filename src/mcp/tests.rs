@@ -9,12 +9,12 @@ use serde_json::json;
 
 use super::{
     AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolAccess, ToolProfile,
-    call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
+    allowed_tool_defs, call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
     exhaustive_telemetry_metrics, expansion_role_metrics, initialize_result, log_request,
     render_bounded_items, render_bounded_object_arrays, render_tool_result,
     search_options_from_args, semantic_artifact_metrics, server_instructions,
     settle_unbudgeted_response, settle_value_rendered_bytes, sum_durations, telemetry_snapshot,
-    tool_access, tool_defs,
+    tool_access, tool_defs, validate_tool_names,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
 
@@ -1202,91 +1202,49 @@ fn baseline_ranked_search_forces_unavailable_configured_stages_off() -> Result<(
 }
 
 #[test]
-fn profile_instructions_encode_g23_workflows_and_capabilities() {
+fn profile_instructions_are_identity_pointer_and_mechanical_contracts() {
     let baseline = server_instructions(ToolProfile::Baseline, true);
     let structural = server_instructions(ToolProfile::Structural, true);
 
     for instructions in [&baseline, &structural] {
         for marker in [
-            "Investigation loop",
-            "exhaustive=true",
+            "jscout agent-guide --tier",
+            "plane digest as snapshot",
+            "canonical indexed publication identity as publication_snapshot",
             "next_cursor",
             "truncated=false",
-            "broad_or_query",
-            "abandon that query",
-            "never page merely because next_cursor exists",
-            "partial abandoned pages",
-            "total_chunks",
-            "page-local returned",
-            "match_lines",
             "response_budget_too_small",
             "minimum_bytes=N",
             "response_bytes=N",
-            "one returned sym: anchor plus the response snapshot",
-            "For a file hit, pass its path to file_outline",
-            "plane digest as snapshot",
-            "canonical indexed publication identity as publication_snapshot",
-            "Human-authored symbol mode",
-            "spans all registered code formats by default",
-            "original search's explicit origins and formats allowlists",
-            "never synthesize it from echoed scope.origins or scope.formats",
-            "response snapshot and echoed scope fields corpus, file_roles, origins, and formats",
-            "convention",
-            "safe",
-            "localize first",
-            "vector=false and rerank=false",
-            "selection predicate",
-            "selected subject's metadata",
-            "sequential",
-            "snapshot change",
         ] {
             assert!(
                 instructions.contains(marker),
                 "missing server-instruction contract: {marker}"
             );
         }
-    }
-
-    for unavailable in [
-        "semantic_memory",
-        "repository_overview",
-        "neighborhood",
-        "entities",
-        "paths",
-        "annotate",
-        "include_memory",
-        "expand=true",
-    ] {
+        // G28: routing rules live in the skill, not here.
+        for routing in [
+            "Investigation loop",
+            "Inquiry loop",
+            "localize first",
+            "broad_or_query",
+            "repository_overview",
+            "semantic_memory",
+            "convention",
+        ] {
+            assert!(
+                !instructions.contains(routing),
+                "server instructions restate a skill routing rule: {routing}"
+            );
+        }
         assert!(
-            !baseline.contains(unavailable),
-            "baseline advertises unavailable capability: {unavailable}"
+            instructions.len() < 1_000,
+            "server instructions grew past identity, pointer, and contracts: {} bytes",
+            instructions.len()
         );
     }
-    for available in [
-        "Inquiry loop",
-        "semantic_memory",
-        "repository_overview once",
-        "exact returned anchor or file",
-        "simple occurrence and convention questions do not need memory",
-        "broad semantic_memory only for genuinely anchor-free architecture or workflow questions",
-        "include_memory=false",
-        "expand=false",
-        "one separate expand=true",
-        "neighborhood",
-        "entities",
-        "paths",
-        "Annotate",
-    ] {
-        assert!(
-            structural.contains(available),
-            "structural instructions omit capability: {available}"
-        );
-    }
-    assert!(baseline.contains("structural profile"));
-    assert!(baseline.contains("calls for exact member-method"));
-    assert!(baseline.contains("forces unavailable expansion and attached memory off"));
-    assert!(structural.contains("calls, events, and file_outline"));
-    assert!(structural.contains("expand=false and include_memory=false"));
+    assert!(baseline.contains("--tier core"));
+    assert!(structural.contains("--tier full"));
 
     for profile in [ToolProfile::Baseline, ToolProfile::Structural] {
         let tools = tool_defs(profile, true);
@@ -1296,23 +1254,8 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             .iter()
             .find(|tool| tool["name"] == "semantic_search")
             .expect("search definition");
-        assert!(
-            search["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("Profile-specific"))
-        );
         let origins = &search["inputSchema"]["properties"]["origins"];
         assert!(origins.get("default").is_none());
-        assert!(
-            origins["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("repository configuration"))
-        );
-        assert!(
-            origins["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("not the whole repository"))
-        );
         let formats = &search["inputSchema"]["properties"]["formats"];
         assert!(formats.get("default").is_none());
         assert_eq!(
@@ -1333,13 +1276,93 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
                 .find(|tool| tool["name"] == tool_name)
                 .unwrap_or_else(|| panic!("{tool_name} definition"));
             let formats = &tool["inputSchema"]["properties"]["formats"];
+            assert!(formats.get("default").is_none());
             assert_eq!(formats["minItems"], 1);
-            assert_eq!(
-                formats["items"]["enum"],
-                json!(["javascript", "typescript", "rust"])
+        }
+        for tool in tools.as_array().expect("tool definitions") {
+            let description = tool["description"].as_str().expect("description");
+            assert!(
+                description.len() < 200,
+                "{} description is not a one-liner: {} bytes",
+                tool["name"],
+                description.len()
+            );
+            assert!(
+                !description.contains("repository configuration"),
+                "{} restates configuration prose",
+                tool["name"]
             );
         }
     }
+}
+
+#[test]
+fn default_surface_costs_under_a_third_of_the_pre_g28_structural_surface() {
+    // The pre-G28 structural profile with documentation cost 26,828 bytes of
+    // tool definitions plus instructions; G28 accepts the default (core)
+    // surface only under a third of that.
+    const PRE_G28_STRUCTURAL_SURFACE: usize = 26_828;
+    let surface = |profile: ToolProfile| -> usize {
+        serde_json::to_string(&tool_defs(profile, true))
+            .expect("serialize tool definitions")
+            .len()
+            + server_instructions(profile, true).len()
+    };
+    let core = surface(ToolProfile::Baseline);
+    assert!(
+        core * 3 < PRE_G28_STRUCTURAL_SURFACE,
+        "core surface is {core} bytes; the G28 gate is under {}",
+        PRE_G28_STRUCTURAL_SURFACE / 3
+    );
+    let full = surface(ToolProfile::Structural);
+    println!("surface bytes: core={core} full={full}");
+    // The full profile keeps every schema; its gate is only "no regrowth".
+    assert!(
+        full < 20_000,
+        "full surface is {full} bytes; the schema-only full profile should stay under 20 KB"
+    );
+}
+
+#[test]
+fn tool_allowlist_narrows_registration_and_rejects_calls() -> Result<()> {
+    let allow = ["definition".to_string(), "who_uses".to_string()];
+    let names = |value: serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .expect("tool definitions")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+    // Registration order follows the definition order, not the allowlist.
+    assert_eq!(
+        names(allowed_tool_defs(ToolProfile::Structural, true, &allow)),
+        ["who_uses", "definition"]
+    );
+    // The allowlist only narrows: a structural-only tool stays absent in baseline.
+    let structural_only = ["neighborhood".to_string(), "definition".to_string()];
+    assert_eq!(
+        names(allowed_tool_defs(
+            ToolProfile::Baseline,
+            true,
+            &structural_only
+        )),
+        ["definition"]
+    );
+    assert!(
+        allowed_tool_defs(ToolProfile::Structural, true, &[])
+            .as_array()
+            .unwrap()
+            .len()
+            == 13
+    );
+    assert!(
+        validate_tool_names(&["definitions".to_string()])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown tool `definitions`")
+    );
+    Ok(())
 }
 
 #[test]

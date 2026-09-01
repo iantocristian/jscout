@@ -320,7 +320,7 @@ impl Default for OverviewOptions {
             include_semantic: false,
             semantic_limit: 8,
             semantic_types: Vec::new(),
-            reconnaissance_limit: 12,
+            reconnaissance_limit: 0,
             reconnaissance_subject: None,
             reconnaissance_detail: false,
             response_byte_limit: 24_000,
@@ -616,9 +616,13 @@ pub fn overview_response(
     if options.reconnaissance_detail && options.reconnaissance_subject.is_none() {
         bail!("reconnaissance detail requires an exact reconnaissance subject");
     }
-    if options.reconnaissance_detail && options.reconnaissance_limit == 0 {
-        bail!("reconnaissance detail cannot be requested with a zero reconnaissance limit");
-    }
+    // Reconnaissance prose is opt-in (G28): the default limit is zero, and an
+    // explicit subject implies at least one classification.
+    let reconnaissance_limit = if options.reconnaissance_subject.is_some() {
+        options.reconnaissance_limit.max(1)
+    } else {
+        options.reconnaissance_limit
+    };
     validate_semantic_types(&options.semantic_types)?;
     store::with_read_snapshot(conn, "jscout_repository_overview_pack", || {
         let identity = Identities::read(conn)?.response(Plane::Code);
@@ -632,12 +636,12 @@ pub fn overview_response(
             .include_semantic
             .then(|| semantic_overlay(conn, &options.semantic_types, options.semantic_limit))
             .transpose()?;
-        let reconnaissance = (options.reconnaissance_limit > 0)
+        let reconnaissance = (reconnaissance_limit > 0)
             .then(|| {
                 reconnaissance_overlay(
                     conn,
                     &options.file_origins,
-                    options.reconnaissance_limit,
+                    reconnaissance_limit,
                     options.reconnaissance_subject.as_deref(),
                     options.reconnaissance_detail,
                 )
@@ -1057,6 +1061,19 @@ fn apply_overview_budget(response: &mut RepositoryOverviewResponse) -> Result<()
             settle_overview_bytes(response)?;
             continue;
         }
+        // Prose is shed before structural counts: a per-project reconnaissance
+        // paragraph is the most expensive and least load-bearing row here.
+        if let Some(overlay) = response.reconnaissance.as_mut()
+            && overlay.classifications.pop().is_some()
+        {
+            overlay.returned = overlay.classifications.len();
+            overlay.truncated = true;
+            response
+                .response_budget
+                .omitted_reconnaissance_classifications += 1;
+            settle_overview_bytes(response)?;
+            continue;
+        }
         if response.overview.relations.pop().is_some() {
             response.overview.relations_truncated = true;
             response.response_budget.omitted_relations += 1;
@@ -1072,17 +1089,6 @@ fn apply_overview_budget(response: &mut RepositoryOverviewResponse) -> Result<()
         if response.overview.entity_inventory.pop().is_some() {
             response.overview.entity_inventory_truncated = true;
             response.response_budget.omitted_entity_inventory += 1;
-            settle_overview_bytes(response)?;
-            continue;
-        }
-        if let Some(overlay) = response.reconnaissance.as_mut()
-            && overlay.classifications.pop().is_some()
-        {
-            overlay.returned = overlay.classifications.len();
-            overlay.truncated = true;
-            response
-                .response_budget
-                .omitted_reconnaissance_classifications += 1;
             settle_overview_bytes(response)?;
             continue;
         }

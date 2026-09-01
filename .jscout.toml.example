@@ -105,7 +105,13 @@ node = "node"
 # checker = "/absolute/path/to/checker/src/main.mjs"
 
 [mcp]
-profile = "structural"
+# core registers the production-selected surface (search, definition, who_uses,
+# calls, file_outline, events, documentation_search); full adds semantic memory,
+# repository_overview, neighborhood, entities, paths, and annotate. baseline and
+# structural remain accepted aliases.
+profile = "core"
+# Optional per-project allowlist; only narrows what the profile registers.
+# tools = ["semantic_search", "definition", "who_uses"]
 source_view = "full"
 # auto emits structuredContent only to clients verified by jscout while always
 # retaining the JSON-text fallback. Use text for universal compatibility or

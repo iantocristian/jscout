@@ -1237,7 +1237,7 @@ async function main() {
         let installedSkillSha = null;
         const database = usesJscout ? path.join(runDir, "jscout.db") : null;
         if (usesJscout) {
-          execFileSync(jscout, ["agent-guide", "--install", workspace], {
+          execFileSync(jscout, ["agent-guide", "--install", workspace, "--tier", profile === "baseline" ? "core" : "full"], {
             stdio: ["ignore", "pipe", "pipe"],
           });
           installedSkillSha = sha256(
