@@ -140,7 +140,7 @@ fn documentation_provenance_is_default_off_and_freshness_queries_fail_closed() -
 
     let lexical_options = docs::retrieval::SearchOptions {
         response_bytes: usize::MAX,
-        output: docs::retrieval::SearchOutput::Pretty,
+        output: docs::retrieval::SearchOutput::Debug,
         vector: false,
         rerank: false,
         ..docs::retrieval::SearchOptions::default()
@@ -384,7 +384,9 @@ fn provenance_only_author_rewrite_rotates_its_digest_without_structural_churn() 
 
     let conn = store::open(repo.path())?;
     index_repo_with_docs_freshness(repo.path(), &conn)?;
-    let snapshot = structural::current_snapshot(&conn)?;
+    let code_snapshot = structural::current_snapshot(&conn)?;
+    let snapshot = docs::store::current_snapshot(&conn)?;
+    let publication_snapshot = crate::publication::current_publication_snapshot(&conn)?;
     let provenance_digest: String = conn.query_row(
         "SELECT value FROM meta WHERE key=?1",
         [docs::PROVENANCE_DIGEST_META_KEY],
@@ -467,7 +469,12 @@ fn provenance_only_author_rewrite_rotates_its_digest_without_structural_churn() 
         !refreshed.projection_rebuilt,
         "provenance-only history changes must not rebuild the structural projection"
     );
-    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    assert_eq!(structural::current_snapshot(&conn)?, code_snapshot);
+    assert_eq!(docs::store::current_snapshot(&conn)?, snapshot);
+    assert_ne!(
+        crate::publication::current_publication_snapshot(&conn)?,
+        publication_snapshot
+    );
     assert_ne!(
         conn.query_row(
             "SELECT value FROM meta WHERE key=?1",
@@ -818,8 +825,7 @@ fn mdx_uses_the_docs_corpus_without_entering_code_surfaces() -> Result<()> {
         assert_eq!(rows, expected, "docs FTS query {query}");
     }
 
-    let snapshot = structural::current_snapshot(&conn)?;
-    let docs_hits = docs::store::lexical_search(&conn, &snapshot, "mdxOnlyNeedle", 10)?;
+    let docs_hits = docs::store::lexical_search(&conn, "mdxOnlyNeedle", 10)?;
     assert_eq!(docs_hits.len(), 1);
     assert_eq!(docs_hits[0].path, "guide.mdx");
     assert!(
@@ -1284,7 +1290,7 @@ fn failure_after_canonical_replacement_restores_the_last_good_publication() -> R
 }
 
 #[test]
-fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot() -> Result<()> {
+fn documentation_contract_change_rechunks_docs_without_rotating_code() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
         repo.path().join("main.ts"),
@@ -1293,6 +1299,8 @@ fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot()
     fs::write(repo.path().join("guide.md"), "# Guide\n\nCurrent body.\n")?;
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
+    let code_digest = structural::current_snapshot(&conn)?;
+    let provenance_digest = crate::publication::Identities::read(&conn)?.provenance;
 
     let code_chunk_id: i64 = conn.query_row(
         "SELECT chunk.id
@@ -1300,6 +1308,47 @@ fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot()
          WHERE file.path='main.ts' AND chunk.kind='module'",
         [],
         |row| row.get(0),
+    )?;
+    let old_doc_chunk_id: i64 = conn.query_row(
+        "SELECT chunk.id
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.md'",
+        [],
+        |row| row.get(0),
+    )?;
+    let old_profile_config = serde_json::json!({
+        "document_text": "documentation-v0",
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','old-docs-contract',2,?1)",
+        [&old_profile_config],
+    )?;
+    let old_profile_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO doc_embedding_index_entries(id,chunk_id,profile_id)
+         VALUES(1,?1,?2)",
+        rusqlite::params![old_doc_chunk_id, old_profile_id],
+    )?;
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE vec_doc_embeddings_2 USING vec0(
+           embedding FLOAT[2] distance_metric=cosine,
+           profile_id INTEGER PARTITION KEY
+         );",
+    )?;
+    conn.execute(
+        "INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id)
+         VALUES(1,X'0000803F00000000',?1)",
+        [old_profile_id],
+    )?;
+    // This row has no relational owner, so replacing guide.md cannot remove it.
+    // Only the documentation-contract rematerialization purge can clear it.
+    conn.execute(
+        "INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id)
+         VALUES(999,X'0000803F00000000',?1)",
+        [old_profile_id],
     )?;
     conn.execute(
         "UPDATE doc_chunk_meta SET nearest_heading='stale-format-marker'",
@@ -1316,10 +1365,18 @@ fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot()
             [format!("format_contract_version:{format}")],
         )?;
     }
-    let old_format_snapshot = structural::compute_snapshot(&conn)?;
+    let old_format_documentation_digest = crate::publication::compute_documentation_digest(&conn)?;
     conn.execute(
-        "UPDATE meta SET value=?1 WHERE key='snapshot'",
-        [&old_format_snapshot],
+        "INSERT INTO doc_vector_generations(
+           snapshot,profile_id,dimensions,chunk_format_version
+         ) VALUES(?1,?2,2,'documentation-v0')",
+        rusqlite::params![old_format_documentation_digest, old_profile_id],
+    )?;
+    crate::publication::Identities::publish_test(
+        &conn,
+        &code_digest,
+        &old_format_documentation_digest,
+        &provenance_digest,
     )?;
 
     let outcome = index_repo(repo.path(), &conn)?;
@@ -1344,7 +1401,61 @@ fn documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot()
         |row| row.get(0),
     )?;
     assert_eq!(persisted_format, crate::docs::CHUNK_FORMAT_VERSION);
-    assert_ne!(structural::current_snapshot(&conn)?, old_format_snapshot);
+    assert_eq!(structural::current_snapshot(&conn)?, code_digest);
+    assert_ne!(
+        docs::store::current_snapshot(&conn)?,
+        old_format_documentation_digest
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM doc_vector_generations", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM doc_embedding_index_entries",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM vec_doc_embeddings_2", [], |row| {
+            row.get::<_, i64>(0)
+        })?,
+        0
+    );
+
+    let current_doc_chunk_id: i64 = conn.query_row(
+        "SELECT chunk.id
+         FROM chunks chunk JOIN files file ON file.id=chunk.file_id
+         WHERE file.path='guide.md'",
+        [],
+        |row| row.get(0),
+    )?;
+    let current_profile_config = serde_json::json!({
+        "document_text": docs::CHUNK_FORMAT_VERSION,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','current-docs-contract',2,?1)",
+        [&current_profile_config],
+    )?;
+    let current_profile_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO doc_embedding_index_entries(chunk_id,profile_id) VALUES(?1,?2)",
+        rusqlite::params![current_doc_chunk_id, current_profile_id],
+    )?;
+    let reused_row_id = conn.last_insert_rowid();
+    assert_eq!(reused_row_id, 1);
+    conn.execute(
+        "INSERT INTO vec_doc_embeddings_2(rowid,embedding,profile_id)
+         VALUES(?1,X'0000803F00000000',?2)",
+        rusqlite::params![reused_row_id, current_profile_id],
+    )?;
     Ok(())
 }
 
@@ -1492,6 +1603,7 @@ fn extraction_version_change_forces_unchanged_files_through_extraction() -> Resu
     let second = index_repo(repo.path(), &conn)?;
     assert_eq!((second.indexed, second.unchanged), (0, 1));
     let current_contract_snapshot = structural::current_snapshot(&conn)?;
+    let current_identities = crate::publication::Identities::read(&conn)?;
 
     conn.execute(
         "UPDATE meta SET value='legacy' WHERE key='extraction_version'",
@@ -1504,9 +1616,11 @@ fn extraction_version_change_forces_unchanged_files_through_extraction() -> Resu
     )?;
     let legacy_contract_snapshot = structural::compute_snapshot(&conn)?;
     assert_ne!(legacy_contract_snapshot, current_contract_snapshot);
-    conn.execute(
-        "UPDATE meta SET value=?1 WHERE key='snapshot'",
-        [&legacy_contract_snapshot],
+    crate::publication::Identities::publish_test(
+        &conn,
+        &legacy_contract_snapshot,
+        &current_identities.documentation,
+        &current_identities.provenance,
     )?;
     let third = index_repo(repo.path(), &conn)?;
     assert_eq!((third.indexed, third.unchanged), (1, 0));
@@ -2033,6 +2147,86 @@ fn indexes_scoped_dependency_selected_by_exact_name() -> Result<()> {
     assert_eq!(
         resolved,
         ("@scope/pkg".into(), "2.0.0".into(), "index.js".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn dependency_only_insert_materializes_cached_code_vectors() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("main.ts"),
+        "import value from 'selected-dep';\nexport const result = value;\n",
+    )?;
+    let dependency = repo.path().join("node_modules/selected-dep");
+    fs::create_dir_all(&dependency)?;
+    fs::write(
+        dependency.join("package.json"),
+        r#"{"name":"selected-dep","version":"1.0.0","main":"index.js"}"#,
+    )?;
+    fs::write(
+        dependency.join("index.js"),
+        "export const dependencyVectorMarker = 42;\nexport default dependencyVectorMarker;\n",
+    )?;
+
+    let conn = store::open(repo.path())?;
+    let options = IndexOptions {
+        dependencies: vec!["selected-dep".into()],
+        ..Default::default()
+    };
+    index_repo_with_options(repo.path(), &conn, &options)?;
+    let dependency_chunk_hash: String = conn.query_row(
+        "SELECT chunk.hash FROM chunks chunk
+         JOIN files file ON file.id=chunk.file_id
+         WHERE file.origin='dependency'
+         ORDER BY chunk.id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+
+    index_repo(repo.path(), &conn)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE origin='dependency'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
+    let profile_config = serde_json::json!({
+        "document_text": "content-v2",
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','dependency-code-profile',2,?1)",
+        [profile_config],
+    )?;
+    let profile_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO embeddings(chunk_hash,profile_id,vec)
+         VALUES(?1,?2,X'0000803F00000000')",
+        rusqlite::params![&dependency_chunk_hash, profile_id],
+    )?;
+
+    let outcome = index_repo_with_options(repo.path(), &conn, &options)?;
+
+    assert_eq!(outcome.indexed, 1);
+    assert_eq!(outcome.dependency_files, 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM vec_embeddings_2 vector
+             JOIN embedding_index_entries entry ON entry.id=vector.rowid
+             JOIN chunks chunk ON chunk.id=entry.chunk_id
+             JOIN files file ON file.id=chunk.file_id
+             WHERE entry.profile_id=?1 AND chunk.hash=?2
+               AND file.origin='dependency'",
+            rusqlite::params![profile_id, &dependency_chunk_hash],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "a dependency-only insertion must trigger cached code-vector materialization"
     );
     Ok(())
 }
@@ -2619,9 +2813,10 @@ fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()>
     // Durable cache and memory rows deliberately coexist with disposable
     // rows in one database.
     conn.execute_batch(
-        "INSERT INTO embedding_profiles(
+        r#"INSERT INTO embedding_profiles(
            id, provider, model, config_fingerprint, dimensions, config_json
-         ) VALUES(1, 'test', 'tiny', 'test-profile', 2, '{}');
+         ) VALUES(1, 'test', 'tiny', 'test-profile', 2,
+                  '{"document_text":"content-v2"}');
          INSERT INTO checker_enrichment_batches(
            id, source_snapshot, checker_version, checker_source,
            checker_input_fingerprint, sidecar_protocol, created_at, active
@@ -2647,7 +2842,7 @@ fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()>
            scout_run_id, input_fingerprint, artifact_fingerprint
          ) VALUES(3, 'annotation', 'stable behavior', '{}', 'test-model',
                   'v1', 'likely', 'old', '2026-01-01T00:01:00Z', 7,
-                  'memory-fp', 'artifact-fp');",
+                  'memory-fp', 'artifact-fp');"#,
     )?;
     conn.execute(
         "UPDATE checker_enrichment_batches SET source_snapshot=?1 WHERE id=1",
@@ -2717,7 +2912,16 @@ fn full_refresh_rebuilds_snapshot_and_preserves_expensive_planes() -> Result<()>
             |row| row.get::<_, i64>(0),
         )?,
         0,
-        "a checker batch must not survive a different structural snapshot"
+        "manual indexing must discard a checker batch that cannot be validated"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM resolved_edges WHERE provenance='checker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+        "a checker batch from another code digest must not enter the projection"
     );
     Ok(())
 }
@@ -3215,6 +3419,8 @@ fn normalize_g26_phase_zero_sections(sections: &mut [(String, String)]) {
                     key != "schema_version"
                         && key != "root"
                         && key != "snapshot"
+                        && key != "code_digest"
+                        && key != "documentation_digest"
                         && key != "documentation_provenance_enabled"
                         && key != "documentation_provenance_digest"
                         && key != "documentation_provenance_format_version"
@@ -3507,6 +3713,7 @@ fn rust_contract_invalidation_reextracts_only_rust() -> Result<()> {
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
     let original_snapshot = structural::current_snapshot(&conn)?;
+    let original_identities = crate::publication::Identities::read(&conn)?;
     let original_ids = conn
         .prepare(
             "SELECT file.path,file.id,MIN(chunk.id)
@@ -3527,9 +3734,11 @@ fn rust_contract_invalidation_reextracts_only_rust() -> Result<()> {
     )?;
     let stale_snapshot = structural::compute_snapshot(&conn)?;
     assert_ne!(stale_snapshot, original_snapshot);
-    conn.execute(
-        "UPDATE meta SET value=?1 WHERE key='snapshot'",
-        [&stale_snapshot],
+    crate::publication::Identities::publish_test(
+        &conn,
+        &stale_snapshot,
+        &original_identities.documentation,
+        &original_identities.provenance,
     )?;
 
     let outcome = index_repo(repo.path(), &conn)?;
@@ -3728,7 +3937,7 @@ fn incremental_and_full_refresh_publish_the_same_structural_identity() -> Result
             |row| row.get::<_, i64>(0),
         )?,
         0,
-        "manual full indexing always resets checker enrichment"
+        "manual full indexing discards a checker batch that cannot be validated"
     );
     Ok(())
 }
@@ -3872,7 +4081,39 @@ fn checker_rebind_fixture() -> Result<(
     i64,
     i64,
 )> {
+    checker_rebind_fixture_with_fragmented_ids(false)
+}
+
+fn fragmented_checker_rebind_fixture() -> Result<(
+    tempfile::TempDir,
+    tempfile::TempDir,
+    rusqlite::Connection,
+    i64,
+    String,
+    i64,
+    i64,
+)> {
+    checker_rebind_fixture_with_fragmented_ids(true)
+}
+
+fn checker_rebind_fixture_with_fragmented_ids(
+    fragment_ids: bool,
+) -> Result<(
+    tempfile::TempDir,
+    tempfile::TempDir,
+    rusqlite::Connection,
+    i64,
+    String,
+    i64,
+    i64,
+)> {
     let repo = tempfile::tempdir()?;
+    if fragment_ids {
+        fs::write(
+            repo.path().join("000-removed.ts"),
+            "declare const warmupProbe: { warmup(): void };\nwarmupProbe.warmup();\n",
+        )?;
+    }
     fs::write(
         repo.path().join("service.ts"),
         "export class Service { load() {} }\n\
@@ -3883,6 +4124,10 @@ fn checker_rebind_fixture() -> Result<(
     fs::write(&input, "declare interface ExternalInput { stable: true }\n")?;
     let conn = store::open(repo.path())?;
     index_repo(repo.path(), &conn)?;
+    if fragment_ids {
+        fs::remove_file(repo.path().join("000-removed.ts"))?;
+        index_repo(repo.path(), &conn)?;
+    }
     let (batch, target, source_file, member_call) =
         seed_active_checker_publication(repo.path(), &conn, &input)?;
     Ok((
@@ -3894,6 +4139,87 @@ fn checker_rebind_fixture() -> Result<(
         source_file,
         member_call,
     ))
+}
+
+#[test]
+fn manual_docs_only_refresh_preserves_a_valid_checker_publication() -> Result<()> {
+    let (repo, _external, conn, _batch, target, _, _) = checker_rebind_fixture()?;
+    let before = crate::publication::Identities::read(&conn)?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Service\n\nThe service loads its current state.\n",
+    )?;
+
+    refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+
+    let after = crate::publication::Identities::read(&conn)?;
+    assert_eq!(after.code, before.code);
+    assert_ne!(after.documentation, before.documentation);
+    assert_ne!(after.publication, before.publication);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_snapshot FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        after.code
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges
+             WHERE provenance='checker' AND dst_key=?1",
+            [&target],
+            |row| row.get::<_, i64>(0),
+        )?,
+        1,
+        "a docs-only manual publication must keep validated checker edges projected"
+    );
+    Ok(())
+}
+
+#[test]
+fn docs_only_refresh_does_not_initialize_code_vector_storage() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const stable = 1;\n")?;
+    fs::write(repo.path().join("README.md"), "# Before\n\nOld prose.\n")?;
+    let conn = store::open(repo.path())?;
+    index_repo(repo.path(), &conn)?;
+
+    let profile_config = serde_json::json!({
+        "document_text": "content-v2",
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO embedding_profiles(
+           provider,model,config_fingerprint,dimensions,config_json
+         ) VALUES('test','tiny','code-only-profile',2,?1)",
+        [profile_config],
+    )?;
+    assert!(!conn.query_row(
+        "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='vec_embeddings_2'
+             )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?);
+
+    fs::write(repo.path().join("README.md"), "# After\n\nNew prose.\n")?;
+    let outcome = index_repo(repo.path(), &conn)?;
+
+    assert_eq!((outcome.indexed, outcome.unchanged), (1, 1));
+    assert!(
+        !conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM sqlite_master
+               WHERE type='table' AND name='vec_embeddings_2'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?,
+        "documentation changes must not scan or initialize the code-vector plane"
+    );
+    Ok(())
 }
 
 #[test]
@@ -4068,27 +4394,23 @@ fn stale_checker_inputs_are_unpublished_even_when_rust_snapshot_is_unchanged() -
     Ok(())
 }
 
-#[test]
-fn identical_watch_full_refresh_preserves_checker_edges_on_reproduced_rowids() -> Result<()> {
+fn assert_identical_full_refresh_remaps_fragmented_checker_rowids(
+    refresh: fn(
+        &std::path::Path,
+        &rusqlite::Connection,
+        &IndexOptions,
+    ) -> Result<super::IndexOutcome>,
+    preserve_old_batch: bool,
+) -> Result<()> {
     let (repo, _external, conn, batch, target, old_file_id, old_call_id) =
-        checker_rebind_fixture()?;
+        fragmented_checker_rebind_fixture()?;
     let snapshot = structural::current_snapshot(&conn)?;
 
-    let outcome =
-        watch_full_refresh_repo_with_options(repo.path(), &conn, &IndexOptions::default())?;
+    let outcome = refresh(repo.path(), &conn, &IndexOptions::default())?;
     assert!(outcome.extraction_reset);
     assert!(outcome.projection_rebuilt);
     assert!(!outcome.checker_rebound);
     assert_eq!(structural::current_snapshot(&conn)?, snapshot);
-    assert_eq!(
-        conn.query_row(
-            "SELECT id FROM checker_enrichment_batches WHERE active=1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?,
-        batch,
-        "an identical watcher refresh must retain the active checker publication"
-    );
 
     let current_ids: (i64, i64) = conn.query_row(
         "SELECT file.id,call.rowid FROM files file
@@ -4097,11 +4419,43 @@ fn identical_watch_full_refresh_preserves_checker_edges_on_reproduced_rowids() -
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    assert_eq!(
+    assert_ne!(
         current_ids,
         (old_file_id, old_call_id),
-        "identical extraction must deterministically reproduce checker source rowids"
+        "the fixture must reach the same code digest through fragmented row IDs"
     );
+    let (current_batch, current_batch_snapshot): (i64, String) = conn.query_row(
+        "SELECT id,source_snapshot FROM checker_enrichment_batches WHERE active=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_ne!(current_batch, batch);
+    assert_eq!(current_batch_snapshot, snapshot);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_file_id,member_call_id
+             FROM checker_enrichments WHERE batch_id=?1",
+            [current_batch],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?,
+        current_ids,
+        "the retained checker publication must use rebuilt extraction row IDs"
+    );
+    let old_batch_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM checker_enrichment_batches WHERE id=?1",
+        [batch],
+        |row| row.get(0),
+    )?;
+    if preserve_old_batch {
+        assert_eq!(old_batch_count, 1);
+        assert!(!conn.query_row(
+            "SELECT active FROM checker_enrichment_batches WHERE id=?1",
+            [batch],
+            |row| row.get::<_, bool>(0),
+        )?);
+    } else {
+        assert_eq!(old_batch_count, 0);
+    }
     assert_eq!(
         conn.query_row(
             "SELECT COUNT(*) FROM resolved_edges
@@ -4113,6 +4467,80 @@ fn identical_watch_full_refresh_preserves_checker_edges_on_reproduced_rowids() -
         "the retained checker fact must re-project against the rebuilt canonical row"
     );
     Ok(())
+}
+
+#[test]
+fn identical_manual_full_refresh_remaps_fragmented_checker_rowids() -> Result<()> {
+    assert_identical_full_refresh_remaps_fragmented_checker_rowids(refresh_repo_with_options, false)
+}
+
+#[test]
+fn identical_watch_full_refresh_remaps_fragmented_checker_rowids() -> Result<()> {
+    assert_identical_full_refresh_remaps_fragmented_checker_rowids(
+        watch_full_refresh_repo_with_options,
+        true,
+    )
+}
+
+fn assert_full_refresh_fails_closed_when_checker_rows_cannot_be_remapped(
+    refresh: fn(
+        &std::path::Path,
+        &rusqlite::Connection,
+        &IndexOptions,
+    ) -> Result<super::IndexOutcome>,
+    preserve_old_batch: bool,
+) -> Result<()> {
+    let (repo, _external, conn, batch, _target, _file_id, _call_id) = checker_rebind_fixture()?;
+    conn.execute(
+        "UPDATE checker_enrichments SET call_start=call_start+1 WHERE batch_id=?1",
+        [batch],
+    )?;
+
+    let outcome = refresh(repo.path(), &conn, &IndexOptions::default())?;
+    assert!(outcome.extraction_reset);
+    assert!(!outcome.checker_rebound);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM checker_enrichment_batches WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+        "an unremappable checker publication must not remain active",
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolved_edges WHERE provenance='checker'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM checker_enrichment_batches WHERE id=?1",
+            [batch],
+            |row| row.get::<_, i64>(0),
+        )?,
+        i64::from(preserve_old_batch),
+    );
+    Ok(())
+}
+
+#[test]
+fn manual_full_refresh_drops_unremappable_checker_rows() -> Result<()> {
+    assert_full_refresh_fails_closed_when_checker_rows_cannot_be_remapped(
+        refresh_repo_with_options,
+        false,
+    )
+}
+
+#[test]
+fn watch_full_refresh_hides_unremappable_checker_rows_as_carry() -> Result<()> {
+    assert_full_refresh_fails_closed_when_checker_rows_cannot_be_remapped(
+        watch_full_refresh_repo_with_options,
+        true,
+    )
 }
 
 #[test]
@@ -4181,7 +4609,7 @@ fn rust_only_full_refresh_rebinds_checker_rows_after_rowids_move() -> Result<()>
 }
 
 #[test]
-fn identical_manual_full_refresh_clears_the_exact_checker_batch() -> Result<()> {
+fn identical_manual_full_refresh_discards_an_unproven_checker_batch() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
         repo.path().join("service.ts"),

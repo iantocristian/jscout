@@ -5,7 +5,8 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{file_role, formats, origin, semantic, store, structural};
+use crate::publication::{Identities, Plane, ResponseIdentity};
+use crate::{file_role, formats, origin, semantic, store};
 
 const OVERVIEW_CITATIONS_PER_CLASSIFICATION: usize = 3;
 const OVERVIEW_CITATION_CHARS: usize = 320;
@@ -71,12 +72,24 @@ pub struct EntityRecord {
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityLookup {
     pub snapshot: String,
+    pub publication_snapshot: String,
     pub entities: Vec<EntityRecord>,
     pub matched_entities: usize,
     pub truncated: bool,
 }
 
 pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<EntityLookup> {
+    store::with_read_snapshot(conn, "jscout_entities", || {
+        let identity = Identities::read(conn)?.response(Plane::Code);
+        entities_in_snapshot(conn, options, &identity)
+    })
+}
+
+fn entities_in_snapshot(
+    conn: &Connection,
+    options: &EntityLookupOptions,
+    identity: &ResponseIdentity,
+) -> Result<EntityLookup> {
     if options.limit == 0 || options.occurrences_per_entity == 0 {
         bail!("entity and occurrence limits must be greater than zero");
     }
@@ -175,7 +188,8 @@ pub fn entities(conn: &Connection, options: &EntityLookupOptions) -> Result<Enti
         });
     }
     Ok(EntityLookup {
-        snapshot: structural::current_snapshot(conn)?,
+        snapshot: identity.snapshot.clone(),
+        publication_snapshot: identity.publication_snapshot.clone(),
         entities,
         matched_entities,
         truncated: matched_entities > options.limit,
@@ -269,7 +283,6 @@ pub struct RelationCount {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RepositoryOverview {
-    pub snapshot: String,
     pub totals: BTreeMap<String, usize>,
     pub files_by_origin: BTreeMap<String, usize>,
     pub files_by_role: BTreeMap<String, usize>,
@@ -393,6 +406,7 @@ pub struct ReconnaissanceOverlay {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct OverviewResponseBudget {
+    #[serde(skip)]
     pub byte_limit: usize,
     pub rendered_bytes: usize,
     pub unbudgeted_bytes: usize,
@@ -407,6 +421,8 @@ pub struct OverviewResponseBudget {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RepositoryOverviewResponse {
+    pub snapshot: String,
+    pub publication_snapshot: String,
     #[serde(flatten)]
     pub overview: RepositoryOverview,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -569,7 +585,6 @@ fn overview_unpinned(
     relations.truncate(relation_limit);
 
     Ok(RepositoryOverview {
-        snapshot: structural::current_snapshot(conn)?,
         totals,
         files_by_origin,
         files_by_role,
@@ -606,6 +621,7 @@ pub fn overview_response(
     }
     validate_semantic_types(&options.semantic_types)?;
     store::with_read_snapshot(conn, "jscout_repository_overview_pack", || {
+        let identity = Identities::read(conn)?.response(Plane::Code);
         let overview = overview_unpinned(
             conn,
             &options.file_origins,
@@ -647,6 +663,8 @@ pub fn overview_response(
             || omitted_entity_inventory > 0
             || omitted_reconnaissance_classifications > 0;
         let mut response = RepositoryOverviewResponse {
+            snapshot: identity.snapshot,
+            publication_snapshot: identity.publication_snapshot,
             overview,
             semantic_overlay,
             reconnaissance,
@@ -1090,13 +1108,13 @@ fn settle_overview_unbudgeted_bytes(response: &mut RepositoryOverviewResponse) -
 
 fn settle_overview_bytes(response: &mut RepositoryOverviewResponse) -> Result<usize> {
     for _ in 0..8 {
-        let rendered = serde_json::to_string_pretty(response)?.len();
+        let rendered = serde_json::to_string(response)?.len();
         if response.response_budget.rendered_bytes == rendered {
             return Ok(rendered);
         }
         response.response_budget.rendered_bytes = rendered;
     }
-    Ok(serde_json::to_string_pretty(response)?.len())
+    Ok(serde_json::to_string(response)?.len())
 }
 
 fn repository_area(path: &str) -> String {

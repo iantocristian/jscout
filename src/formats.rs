@@ -171,14 +171,6 @@ impl FormatSpec {
         matches!(self.structural, StructuralPolicy::DocumentationMetadata)
     }
 
-    pub const fn legacy_snapshot_contract(self) -> Option<&'static str> {
-        match self.snapshot_contract {
-            SnapshotContractPolicy::LegacyCode => Some(crate::entity::EXTRACTION_VERSION),
-            SnapshotContractPolicy::LegacyDocumentation => Some(crate::docs::CHUNK_FORMAT_VERSION),
-            SnapshotContractPolicy::PerFormatWhenPresent => None,
-        }
-    }
-
     pub const fn exact_definition_eligible(self) -> bool {
         matches!(self.exact_definition, ExactDefinitionPolicy::NamedChunks)
     }

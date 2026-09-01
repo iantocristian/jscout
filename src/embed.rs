@@ -1165,6 +1165,22 @@ fn named_table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(Into::into)
 }
 
+pub(crate) fn dimensioned_vector_tables(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
+    let pattern = format!("{prefix}[0-9]*");
+    let suffix_start =
+        i64::try_from(prefix.len() + 1).context("vector table prefix is too long")?;
+    let mut statement = conn.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type='table' AND name GLOB ?1
+           AND substr(name, ?2) NOT GLOB '*[^0-9]*'
+         ORDER BY name",
+    )?;
+    let rows = statement.query_map(params![pattern, suffix_start], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 fn code_vector_table_has_format_partition(conn: &Connection, table: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(
@@ -1596,18 +1612,44 @@ fn materialize_profile(conn: &Connection, profile_id: i64, table: &str) -> Resul
     Ok(())
 }
 
+/// Profiles in the shared durable cache that represent code documents. The
+/// absent marker admits profiles created before representation identity became
+/// explicit; documentation and semantic formats are always excluded.
+fn code_embedding_profiles(conn: &Connection) -> Result<Vec<(i64, usize)>> {
+    let mut statement =
+        conn.prepare("SELECT id, dimensions, config_json FROM embedding_profiles ORDER BY id")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut profiles = Vec::new();
+    for row in rows {
+        let (id, dimensions, config_json) = row?;
+        let Ok(Value::Object(configuration)) = serde_json::from_str::<Value>(&config_json) else {
+            continue;
+        };
+        if configuration
+            .get("document_text")
+            .is_some_and(|format| format.as_str() != Some(DOCUMENT_TEXT_FORMAT))
+        {
+            continue;
+        }
+        profiles.push((
+            id,
+            usize::try_from(dimensions).context("code embedding dimensions are negative")?,
+        ));
+    }
+    Ok(profiles)
+}
+
 /// Materialize newly indexed chunk occurrences that can reuse durable cached
 /// embeddings. Indexing calls this after canonical chunk changes; it does not
 /// perform the expensive legacy virtual-row audit owned by `jscout embed`.
 pub fn materialize_cached_embeddings(conn: &Connection) -> Result<()> {
-    let profiles = {
-        let mut statement =
-            conn.prepare("SELECT id, dimensions FROM embedding_profiles ORDER BY id")?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
+    let profiles = code_embedding_profiles(conn)?;
     if profiles.is_empty() {
         return Ok(());
     }
@@ -2064,28 +2106,16 @@ pub fn delete_vector_rows_for_file(conn: &Connection, file_id: i64) -> Result<()
 }
 
 pub fn clear_vector_rows(conn: &Connection) -> Result<()> {
-    let dimensions = {
-        let mut statement = conn.prepare("SELECT DISTINCT dimensions FROM embedding_profiles")?;
-        let rows = statement.query_map([], |row| Ok(row.get::<_, i64>(0)? as usize))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    for dimension in dimensions {
-        let table = ensure_vector_table(conn, dimension)?;
+    let mut code_tables = dimensioned_vector_tables(conn, "vec_embeddings_")?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (_, dimensions) in code_embedding_profiles(conn)? {
+        code_tables.insert(ensure_vector_table(conn, dimensions)?);
+    }
+    for table in code_tables {
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
-    let doc_tables = {
-        let mut statement = conn.prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type='table'
-               AND name GLOB 'vec_doc_embeddings_[0-9]*'
-               AND substr(name, length('vec_doc_embeddings_') + 1)
-                   NOT GLOB '*[^0-9]*'
-             ORDER BY name",
-        )?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    for table in doc_tables {
+    for table in dimensioned_vector_tables(conn, "vec_doc_embeddings_")? {
         conn.execute(&format!("DELETE FROM {table}"), [])?;
     }
     Ok(())

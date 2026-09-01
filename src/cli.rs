@@ -43,7 +43,7 @@ pub(super) enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Rebuild the structural snapshot (.jscout.db in the repo root)
+    /// Rebuild the canonical index publication (.jscout.db in the repo root)
     Index {
         /// Repository root
         root: PathBuf,
@@ -381,7 +381,7 @@ pub(super) enum Command {
         /// Current symbol anchors or uniquely resolvable symbol names; file anchors are rejected
         #[arg(required = true)]
         seeds: Vec<String>,
-        /// Optional expected structural snapshot
+        /// Optional expected code snapshot
         #[arg(long)]
         snapshot: Option<String>,
         /// Ranked traversal depth
@@ -567,9 +567,9 @@ pub(super) enum Command {
 
 #[derive(Subcommand)]
 pub(super) enum DocsCommand {
-    /// Materialize missing Markdown/MDX vectors for the shared repository snapshot
+    /// Materialize missing Markdown/MDX vectors for the current documentation digest
     Embed {
-        /// Repository root whose shared snapshot is already indexed
+        /// Repository root whose documentation corpus is already indexed
         root: PathBuf,
         /// Use the main index database at this path instead of the configured path
         #[arg(long)]
@@ -583,7 +583,7 @@ pub(super) enum DocsCommand {
     },
     /// Search indexed Markdown/MDX with BM25 and optional vectors
     Search {
-        /// Repository root whose shared snapshot is already indexed
+        /// Repository root whose documentation corpus is already indexed
         root: PathBuf,
         /// Natural-language or identifier query
         query: String,

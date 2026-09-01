@@ -1,7 +1,8 @@
 use rusqlite::Connection;
 
 use super::{
-    DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, ResolvedProfile, VectorFailureKind,
+    DOCUMENT_TEXT_FORMAT, ProfileSpec, Protocol, Provider, ResolvedProfile,
+    SEMANTIC_DOCUMENT_TEXT_FORMAT, VectorFailureKind, clear_vector_rows,
     code_vector_failure_action, embed_missing_for_selection_report, embed_semantic_missing_report,
     embed_text, ensure_profile, exact_semantic_vector_search, exact_vector_search,
     existing_profile, materialize_cached_embeddings, missing_embedding_documents,
@@ -601,6 +602,62 @@ fn sqlite_vec_materializes_current_chunk_occurrences() -> anyhow::Result<()> {
     let cache_rows: i64 =
         connection.query_row("SELECT count(*) FROM embeddings", [], |row| row.get(0))?;
     assert_eq!(cache_rows, 1, "content-addressed cache should survive");
+    Ok(())
+}
+
+#[test]
+fn index_time_code_materialization_skips_other_profile_planes() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let connection = crate::store::open(directory.path())?;
+    let profiles = [
+        (
+            1_i64,
+            2_usize,
+            serde_json::json!({ "document_text": DOCUMENT_TEXT_FORMAT }).to_string(),
+            true,
+        ),
+        (
+            2,
+            3,
+            serde_json::json!({ "document_text": crate::docs::CHUNK_FORMAT_VERSION }).to_string(),
+            false,
+        ),
+        (
+            3,
+            4,
+            serde_json::json!({ "document_text": SEMANTIC_DOCUMENT_TEXT_FORMAT }).to_string(),
+            false,
+        ),
+        (4, 5, "{}".to_string(), true),
+    ];
+    for (id, dimensions, config_json, _) in &profiles {
+        connection.execute(
+            "INSERT INTO embedding_profiles(
+               id,provider,model,config_fingerprint,dimensions,config_json
+             ) VALUES(?1,'test','tiny',?2,?3,?4)",
+            rusqlite::params![
+                id,
+                format!("profile-{id}"),
+                i64::try_from(*dimensions)?,
+                config_json
+            ],
+        )?;
+    }
+
+    let assert_profile_tables = || -> anyhow::Result<()> {
+        for (_, dimensions, _, expected) in &profiles {
+            assert_eq!(
+                vector_table_exists(&connection, *dimensions)?,
+                *expected,
+                "unexpected code-vector materialization for dimension {dimensions}"
+            );
+        }
+        Ok(())
+    };
+    clear_vector_rows(&connection)?;
+    assert_profile_tables()?;
+    materialize_cached_embeddings(&connection)?;
+    assert_profile_tables()?;
     Ok(())
 }
 

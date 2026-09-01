@@ -26,13 +26,15 @@ documentation route below.
 
 Use `documentation_search` when the question is about repository Markdown or MDX,
 written procedures, design notes, or current authored guidance. Documentation
-shares the repository snapshot but has a separate result and ranking corpus;
-do not treat a documentation hit as code-search evidence or semantic memory.
+has its own `snapshot` invalidation identity and a separate result and ranking
+corpus; `publication_snapshot` correlates it with the canonical index
+publication observed by other responses. Do not treat a documentation hit as
+code-search evidence or semantic memory.
 Start with the default hybrid posture. Set `vector: false` for a BM25-only
 comparison, and set `require_vector: true` only when failure is preferable to
 lexical fallback.
-Use returned path, heading, line range, shared snapshot, and indexed
-file hash as the evidence boundary. Conflicting prose remains authored source,
+Use the returned path, heading, line range, and top-level documentation
+`snapshot` as the evidence boundary. Conflicting prose remains authored source,
 not runtime proof; verify behavior in code when the answer depends on what the
 software actually does.
 
@@ -61,7 +63,7 @@ known code.
 3. For a correctly specified traversal, page sequentially. Record the response
    `snapshot` and the full G22 envelope:
    `effective.{vector,rerank,expand,include_memory,
-   page_size}`, normalized `scope.{corpus,file_roles,origins,formats,snapshot}`,
+   page_size}`, normalized `scope.{corpus,file_roles,origins,formats}`,
    `total_chunks`, page-local `returned`, `truncated`, and `next_cursor`, plus
    each hit's `match_lines`. While `truncated` is true, preserve the original
    query and filter inputs and set only `cursor` to the returned `next_cursor`
@@ -77,20 +79,18 @@ known code.
    retry with `response_bytes: N` on the same page with its input cursor
    unchanged; the error itself is not progress. Keep that budget for later
    pages unless another page reports a larger minimum.
-4. Copy a returned complete follow-up argument object unchanged. For exact
-   drill-down, otherwise use `definition` with one exact returned `sym:` anchor
-   and the response snapshot. Never shorten, reconstruct, or invent an opaque
+4. For exact drill-down, pair one returned `sym:` anchor with the response's
+   top-level `snapshot`; never shorten, reconstruct, or invent an opaque
    anchor. For an ambiguous `anchors` hit, preserve the ambiguity and inspect
-   the returned symbol anchors individually or localize the file. For a file
-   hit, copy its returned file-compatible call. If no complete call is present,
-   strip only the leading `file:` from its returned file anchor and pass the
-   remainder as `file_outline.path`; never pass the prefixed anchor as `path`.
-   When no exact anchor is available, human-authored `symbol` mode remains a
-   fuzzy localization fallback, not evidence of same-name exactness. Whenever
-   manually constructing a compatible locator follow-up, copy the original
-   search's explicit `origins` and `formats` allowlists unchanged; if the search
-   omitted either input, keep it omitted. Never synthesize follow-up arguments
-   from echoed `scope.origins` or `scope.formats`.
+   the returned symbol anchors individually or localize the file. For a
+   `file:` anchor, strip only that leading prefix and pass the remainder as
+   `file_outline.path`; never pass the prefixed anchor as `path`. When no exact
+   symbol anchor is available, human-authored `symbol` mode remains a fuzzy
+   localization fallback, not evidence of same-name exactness. Copy the
+   originating search request's explicit `origins` and `formats` allowlists
+   unchanged into `definition` and `who_uses`; if the search omitted either
+   input, keep it omitted. `neighborhood` does not accept `formats`.
+   Never synthesize locator arguments from echoed `scope.origins` or `scope.formats`.
 5. Only after lexical localization, use a separate non-exhaustive ranked
    `semantic_search` with `vector: true` or `who_uses` when looking for aliases
    or callers that source-text matches do not enumerate. In the structural
@@ -100,8 +100,8 @@ known code.
    expanded search can orient a cross-file route. Expand at most once, after
    localization. For an exact-identifier follow-up, set `vector: false` and
    `rerank: false` unless lexical results are insufficient.
-6. A completeness answer must state the echoed scope: corpus, file roles,
-   origins, formats, and snapshot. Exhaustive coverage is by indexed chunk plus unique
+6. A completeness answer must state the response's top-level `snapshot` and the echoed scope:
+   corpus, file roles, origins, and formats. Exhaustive coverage is by indexed chunk plus unique
    `match_lines`; it is not regex, substring, or within-line occurrence
    coverage. Use repository-local text search when that stronger literal
    representation is required.

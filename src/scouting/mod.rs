@@ -1862,7 +1862,7 @@ fn finish_claimed_workflow(
     let published = (|| -> Result<i64> {
         let current = structural::current_snapshot(conn)?;
         if current != candidate_set.snapshot {
-            bail!("structural snapshot changed during publication");
+            bail!("code snapshot changed during publication");
         }
         for (file, entry) in &evidence.files {
             let indexed: String = conn
@@ -2148,7 +2148,7 @@ fn finish_claimed_card(
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let published = (|| -> Result<i64> {
         if structural::current_snapshot(conn)? != snapshot {
-            bail!("structural snapshot changed during publication");
+            bail!("code snapshot changed during publication");
         }
         for (file, entry) in &evidence.files {
             let indexed: String = conn
@@ -2517,7 +2517,7 @@ fn finish_claimed_concept(
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let published = (|| -> Result<i64> {
         if structural::current_snapshot(conn)? != snapshot {
-            bail!("structural snapshot changed during publication");
+            bail!("code snapshot changed during publication");
         }
         for source in &sources {
             let current: Option<Option<String>> = conn
@@ -3121,7 +3121,7 @@ fn finish_claimed_summary(
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let published = (|| -> Result<i64> {
         if structural::current_snapshot(conn)? != snapshot {
-            bail!("structural snapshot changed during publication");
+            bail!("code snapshot changed during publication");
         }
         // The summary's evidence is its children: every planned child must
         // still be current with the exact fingerprint the summary was

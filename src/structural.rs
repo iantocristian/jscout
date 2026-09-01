@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::publication::{Identities, Plane, ResponseIdentity};
 use crate::{file_role, origin, query::ModuleGraph, store};
 
 pub const PROJECTION_VERSION: &str = "12";
@@ -234,6 +235,7 @@ impl Default for NeighborhoodOptions {
 #[derive(Debug, Serialize)]
 pub struct Neighborhood {
     pub snapshot: String,
+    pub publication_snapshot: String,
     pub requested_anchor: String,
     pub resolved_anchor: String,
     pub anchor_status: String,
@@ -352,6 +354,7 @@ pub struct GraphPath {
 #[derive(Debug, Clone, Serialize)]
 pub struct PathSearch {
     pub snapshot: String,
+    pub publication_snapshot: String,
     pub requested_from: String,
     pub requested_to: String,
     pub resolved_from: String,
@@ -366,21 +369,18 @@ pub struct PathSearch {
 }
 
 pub fn current_snapshot(conn: &Connection) -> Result<String> {
-    conn.query_row("SELECT value FROM meta WHERE key='snapshot'", [], |r| {
-        r.get(0)
-    })
-    .context("no structural snapshot; run `jscout index <root>` first")
+    crate::publication::current_code_digest(conn)
 }
 
 #[cfg(test)]
 pub fn compute_snapshot(conn: &Connection) -> Result<String> {
     let resolution_hash = compute_resolution_hash(conn)?;
-    compute_snapshot_with_resolution(conn, &resolution_hash)
+    crate::publication::compute_code_digest(conn, &resolution_hash)
 }
 
 /// Deterministic digest of the module-resolution outcome. Resolution reads
 /// unindexed inputs such as tsconfigs, manifests, and `node_modules`, so this
-/// digest is part of the public structural snapshot as well as the no-op
+/// digest is part of the public code snapshot as well as the no-op
 /// projection identity.
 pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
@@ -430,138 +430,14 @@ pub(crate) fn compute_resolution_hash(conn: &Connection) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub(crate) fn compute_snapshot_with_resolution(
-    conn: &Connection,
-    resolution_hash: &str,
-) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-structural-snapshot-v6\0");
-    hasher.update(PROJECTION_VERSION.as_bytes());
-    hasher.update(b"\0code-extraction-contract\0");
-    hasher.update(crate::entity::EXTRACTION_VERSION.as_bytes());
-    let extraction_version = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key='extraction_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .unwrap_or_default();
-    // Hash the producer contract and the marker that describes the published
-    // rows. A mismatch therefore cannot preserve an apparently current digest.
-    hasher.update(b"\0code-published-extraction-contract\0");
-    hasher.update(extraction_version.as_bytes());
-    hasher.update(b"\0documentation-parser-contract\0");
-    hasher.update(crate::docs::CHUNK_FORMAT_VERSION.as_bytes());
-    let documentation_chunk_format = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key='documentation_chunk_format_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .unwrap_or_default();
-    // The persisted value describes the contract that produced the currently
-    // stored docs rows. It normally equals the binary constant above; hashing
-    // both also makes an interrupted or pre-upgrade mismatch fail closed.
-    hasher.update(b"\0documentation-published-chunk-format\0");
-    hasher.update(documentation_chunk_format.as_bytes());
-    for format in crate::formats::ALL {
-        let present = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE format=?1)",
-            [format.id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !present {
-            continue;
-        }
-        let key = crate::formats::contract_meta_key(format);
-        let persisted = conn
-            .query_row("SELECT value FROM meta WHERE key=?1", [&key], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()?
-            .unwrap_or_default();
-        // Preserve the byte-exact phase-0 digest while the per-format marker
-        // is only a spelling of an existing legacy snapshot input. As soon as
-        // one format's producer diverges from that shared contract, its own
-        // producer/published pair extends the snapshot independently.
-        if format
-            .legacy_snapshot_contract()
-            .is_some_and(|legacy| format.extractor_version == legacy && persisted == legacy)
-        {
-            continue;
-        }
-        hasher.update(b"\0active-format-contract\0");
-        hasher.update(format.id.as_bytes());
-        hasher.update(b"\0producer\0");
-        hasher.update(format.extractor_version.as_bytes());
-        hasher.update(b"\0published\0");
-        hasher.update(persisted.as_bytes());
-    }
-    let rust_present = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE format=?1)",
-        [crate::formats::RUST],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if rust_present {
-        let edition_context = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key=?1",
-                [crate::rust_lang::EDITION_CONTEXT_META_KEY],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .unwrap_or_default();
-        hasher.update(b"\0rust-edition-context\0");
-        hasher.update(edition_context.as_bytes());
-    }
-    let mut stmt = conn.prepare(
-        "SELECT f.path, f.hash, f.role, f.origin, f.corpus, f.format,
-                COALESCE(f.package_path, ''),
-                COALESCE(p.origin, ''), COALESCE(p.name, ''),
-                COALESCE(p.version, ''), COALESCE(p.locator, ''),
-                COALESCE(p.manifest_hash, ''), COALESCE(p.status, '')
-         FROM files f
-         LEFT JOIN package_instances p ON p.id = f.package_instance_id
-         ORDER BY f.path",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok([
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
-            r.get::<_, String>(7)?,
-            r.get::<_, String>(8)?,
-            r.get::<_, String>(9)?,
-            r.get::<_, String>(10)?,
-            r.get::<_, String>(11)?,
-            r.get::<_, String>(12)?,
-        ])
-    })?;
-    for row in rows {
-        for value in row? {
-            hasher.update(b"\0");
-            hasher.update(value.as_bytes());
-        }
-    }
-    hasher.update(b"\0module-resolution\0");
-    hasher.update(resolution_hash.as_bytes());
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
 /// Rebuild the disposable structural graph from canonical extraction tables.
-pub fn rebuild_projection(conn: &Connection, snapshot: &str) -> Result<()> {
-    rebuild_projection_with_timing(conn, snapshot, false)
+pub fn rebuild_projection(conn: &Connection, code_digest: &str) -> Result<()> {
+    rebuild_projection_with_timing(conn, code_digest, false)
 }
 
 pub fn rebuild_projection_with_timing(
     conn: &Connection,
-    snapshot: &str,
+    code_digest: &str,
     timing: bool,
 ) -> Result<()> {
     // A savepoint makes projection replacement atomic both on its own and as
@@ -678,7 +554,7 @@ pub fn rebuild_projection_with_timing(
             );
         }
         let stage_started = Instant::now();
-        project_checker_enrichments(conn, &files, &symbols, snapshot, &mut insert_edge)?;
+        project_checker_enrichments(conn, &files, &symbols, code_digest, &mut insert_edge)?;
         if timing {
             eprintln!(
                 "timing project-checker-enrichments={:?}",
@@ -691,16 +567,6 @@ pub fn rebuild_projection_with_timing(
             eprintln!("timing project-events={:?}", stage_started.elapsed());
         }
 
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('snapshot', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [snapshot],
-        )?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('projection_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [PROJECTION_VERSION],
-        )?;
         Ok(())
     })();
     match result {
@@ -716,9 +582,9 @@ pub fn rebuild_projection_with_timing(
 }
 
 /// Remove the optional checker batch and its projected edges without changing
-/// the deterministic structural snapshot. Watch uses this before an explicit
+/// the deterministic code snapshot. Watch uses this before an explicit
 /// enrichment cycle so config-only events fail closed even when module
-/// resolution produces the same snapshot hash.
+/// resolution produces the same code digest.
 #[cfg(test)]
 pub(crate) fn clear_checker_plane(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -2274,11 +2140,11 @@ fn checker_occurrence_coverage(
 
 /// Recreate the targeted `checker` edges of the active batch, fact by fact.
 ///
-/// A checker batch belongs to exactly one structural snapshot. Within that
-/// snapshot, source occurrence and target fingerprints are still checked
-/// defensively. A different snapshot never projects: manual indexing drops
-/// it, while watch may keep it hidden only long enough to construct a newly
-/// rebound batch for the current snapshot.
+/// A checker batch belongs to exactly one code digest. Within that digest,
+/// source occurrence and target fingerprints are still checked defensively.
+/// A different digest never projects; indexing may rebind a batch only after
+/// validating its canonical inputs, while watch may retain hidden predecessors
+/// long enough to carry their proven per-project work forward.
 fn project_checker_enrichments(
     conn: &Connection,
     files: &HashMap<i64, String>,
@@ -2577,7 +2443,8 @@ pub fn neighborhood(
     options: &NeighborhoodOptions,
 ) -> Result<Neighborhood> {
     store::with_read_snapshot(conn, "jscout_neighborhood", || {
-        neighborhood_in_snapshot(conn, anchor, options)
+        let identity = Identities::read(conn)?.response(Plane::Code);
+        neighborhood_in_snapshot(conn, anchor, options, &identity)
     })
 }
 
@@ -2585,6 +2452,7 @@ fn neighborhood_in_snapshot(
     conn: &Connection,
     anchor: &str,
     options: &NeighborhoodOptions,
+    identity: &ResponseIdentity,
 ) -> Result<Neighborhood> {
     if !matches!(options.direction.as_str(), "in" | "out" | "both") {
         bail!("direction must be one of: in, out, both");
@@ -2597,14 +2465,14 @@ fn neighborhood_in_snapshot(
     if options.node_limit == 0 || options.edge_limit == 0 {
         bail!("node and edge limits must be greater than zero");
     }
-    let snapshot = current_snapshot(conn)?;
+    let snapshot = &identity.snapshot;
     let allowed_file_origins: HashSet<&str> =
         options.file_origins.iter().map(String::as_str).collect();
     let (resolved_anchor, anchor_status) = resolve_anchor(
         conn,
         anchor,
         options.expected_snapshot.as_deref(),
-        &snapshot,
+        snapshot,
         &allowed_file_origins,
     )?;
     let allowed_kinds: HashSet<&str> = options.kinds.iter().map(String::as_str).collect();
@@ -2707,7 +2575,8 @@ fn neighborhood_in_snapshot(
     });
     let edges = edges.into_iter().map(|entry| entry.edge).collect();
     Ok(Neighborhood {
-        snapshot,
+        snapshot: identity.snapshot.clone(),
+        publication_snapshot: identity.publication_snapshot.clone(),
         requested_anchor: anchor.to_string(),
         resolved_anchor,
         anchor_status,
@@ -3214,6 +3083,19 @@ fn workflow_runtime_boundary_kind(kind: &str) -> Option<(&'static str, bool)> {
 }
 
 pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> Result<PathSearch> {
+    store::with_read_snapshot(conn, "jscout_paths", || {
+        let identity = Identities::read(conn)?.response(Plane::Code);
+        paths_in_snapshot(conn, from, to, options, &identity)
+    })
+}
+
+fn paths_in_snapshot(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    options: &PathOptions,
+    identity: &ResponseIdentity,
+) -> Result<PathSearch> {
     if options.max_depth == 0 || options.max_depth > 8 {
         bail!("path depth must be between 1 and 8");
     }
@@ -3229,15 +3111,15 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
     origin::validate_all(&options.file_origins)?;
     file_role::validate_all(&options.file_roles)?;
     let allowed_origins: HashSet<&str> = options.file_origins.iter().map(String::as_str).collect();
-    let snapshot = current_snapshot(conn)?;
+    let snapshot = &identity.snapshot;
     let (resolved_to, to_status) = resolve_anchor(
         conn,
         to,
         options.expected_snapshot.as_deref(),
-        &snapshot,
+        snapshot,
         &allowed_origins,
     )?;
-    let neighborhood = neighborhood(
+    let neighborhood = neighborhood_in_snapshot(
         conn,
         from,
         &NeighborhoodOptions {
@@ -3252,6 +3134,7 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
             file_origins: options.file_origins.clone(),
             penalize_file_roles: true,
         },
+        identity,
     )?;
     let mut node_by_key: HashMap<String, GraphNode> = neighborhood
         .nodes
@@ -3375,7 +3258,8 @@ pub fn paths(conn: &Connection, from: &str, to: &str, options: &PathOptions) -> 
         })
         .collect();
     Ok(PathSearch {
-        snapshot: neighborhood.snapshot,
+        snapshot: identity.snapshot.clone(),
+        publication_snapshot: identity.publication_snapshot.clone(),
         requested_from: from.to_string(),
         requested_to: to.to_string(),
         resolved_from: neighborhood.resolved_anchor,
@@ -3632,15 +3516,24 @@ fn round_score(score: f64) -> f64 {
     (score * 1_000_000.0).round() / 1_000_000.0
 }
 
-/// Resolve a user-facing anchor against the current structural snapshot for a
+/// Resolve a user-facing anchor against the current code snapshot for a
 /// durable semantic support. Ambiguity remains an error; stored supports use
 /// the returned exact node key. This write path deliberately considers every
 /// indexed origin, unlike retrieval defaults, so a shorthand cannot silently
 /// bind to first-party code when a dependency introduces the same symbol.
+#[cfg(test)]
 pub fn resolve_current_anchor(conn: &Connection, anchor: &str) -> Result<String> {
-    let all = origin::ALL.iter().copied().collect();
     let snapshot = current_snapshot(conn)?;
-    resolve_anchor(conn, anchor, None, &snapshot, &all).map(|(resolved, _)| resolved)
+    resolve_anchor_at_snapshot(conn, anchor, &snapshot)
+}
+
+pub(crate) fn resolve_anchor_at_snapshot(
+    conn: &Connection,
+    anchor: &str,
+    snapshot: &str,
+) -> Result<String> {
+    let all = origin::ALL.iter().copied().collect();
+    resolve_anchor(conn, anchor, None, snapshot, &all).map(|(resolved, _)| resolved)
 }
 
 pub fn resolve_current_anchor_in_origins(
@@ -3648,14 +3541,23 @@ pub fn resolve_current_anchor_in_origins(
     anchor: &str,
     file_origins: &[String],
 ) -> Result<String> {
+    let snapshot = current_snapshot(conn)?;
+    resolve_anchor_in_origins_at_snapshot(conn, anchor, &snapshot, file_origins)
+}
+
+pub(crate) fn resolve_anchor_in_origins_at_snapshot(
+    conn: &Connection,
+    anchor: &str,
+    snapshot: &str,
+    file_origins: &[String],
+) -> Result<String> {
     origin::validate_all(file_origins)?;
     let allowed = file_origins.iter().map(String::as_str).collect();
-    let snapshot = current_snapshot(conn)?;
-    resolve_anchor(conn, anchor, None, &snapshot, &allowed).map(|(resolved, _)| resolved)
+    resolve_anchor(conn, anchor, None, snapshot, &allowed).map(|(resolved, _)| resolved)
 }
 
 /// Resolve an exact or user-facing anchor against an explicitly expected
-/// structural snapshot and origin boundary. Read surfaces use this to consume
+/// code snapshot and origin boundary. Read surfaces use this to consume
 /// copy-safe anchors returned by an earlier query without routing them through
 /// a lossy `path:name` symbol lookup. A stale symbol anchor is re-resolved by
 /// path, scope, and name using the same fail-closed ambiguity policy as
@@ -3688,6 +3590,12 @@ fn resolve_anchor(
             symbol_candidates(conn, Some(&path), Some(&scope), &name)?,
             allowed_origins,
         )?;
+        if candidates.len() > 1 {
+            bail!(
+                "stale anchor `{anchor}` is ambiguous after re-resolution in the current snapshot; relocalize the symbol and retry with the current response's `snapshot`; candidates: {}",
+                candidates.join(", ")
+            );
+        }
         return unique_anchor(anchor, candidates, "re-resolved");
     }
     if structural_graph_node_exists(conn, anchor)? {

@@ -103,6 +103,7 @@ pub fn claim_run(conn: &Connection, spec: &RunSpec, rebuild: bool) -> Result<Run
             // replace it rather than creating a parallel current record.
             spec.supersedes_artifact_id.or(current_artifact)
         };
+        let source_snapshot = crate::publication::durable_code_source(&spec.source_snapshot);
         let inserted = conn.execute(
             "INSERT INTO scout_runs(
                scout_kind, status, gateway_protocol, provider, model, billing_path,
@@ -118,7 +119,7 @@ pub fn claim_run(conn: &Connection, spec: &RunSpec, rebuild: bool) -> Result<Run
                 spec.billing_path,
                 spec.reasoning,
                 spec.prompt_version,
-                spec.source_snapshot,
+                source_snapshot,
                 spec.input_fingerprint,
                 spec.request_hash,
                 spec.config_json,

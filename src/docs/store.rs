@@ -5,13 +5,15 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::corpus::Decision;
+use crate::publication::{Identities, Plane};
 
-/// A read-only summary of the documentation projection inside the current
-/// shared structural snapshot. Documentation has no database or snapshot of
-/// its own.
+/// A read-only summary of the documentation plane in the shared database.
+/// Vector generations bind the documentation digest rather than the global
+/// publication marker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
     pub snapshot: String,
+    pub publication_snapshot: String,
     pub canonical_root: Option<String>,
     pub inventory_count: usize,
     pub indexed_file_count: usize,
@@ -30,12 +32,11 @@ pub struct FrontMatterStatus {
     pub state: String,
 }
 
-/// One current-snapshot documentation chunk hydrated from the shared
+/// One current-documentation-digest chunk hydrated from the shared
 /// `files`/`chunks` tables and the documentation ranking sidecars.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchHit {
     pub chunk_id: i64,
-    pub snapshot: String,
     pub path: String,
     pub title: String,
     #[serde(default)]
@@ -45,10 +46,13 @@ pub struct SearchHit {
     pub breadcrumb: String,
     pub nearest_heading: Option<String>,
     pub rendered_body: String,
+    #[serde(skip_serializing, default)]
     pub source_start: u64,
+    #[serde(skip_serializing, default)]
     pub source_end: u64,
     pub start_line: u32,
     pub end_line: u32,
+    #[serde(skip_serializing, default)]
     pub file_hash: String,
     #[serde(skip_serializing, default)]
     pub embedding_identity: Option<String>,
@@ -58,7 +62,7 @@ pub struct SearchHit {
     #[serde(skip_serializing, default)]
     pub freshness_committer_time: Option<i64>,
     // Operational Git failures are emitted by indexing. They are not part of
-    // a hit's stable retrieval contract or the shared snapshot identity.
+    // a hit's stable retrieval contract or the documentation identity.
     #[serde(skip_serializing, default)]
     pub freshness_detail: Option<String>,
     pub score: f64,
@@ -67,7 +71,7 @@ pub struct SearchHit {
 
 pub fn current_snapshot(conn: &Connection) -> Result<String> {
     crate::store::validate_published_contracts(conn)?;
-    crate::structural::current_snapshot(conn)
+    crate::publication::current_documentation_digest(conn)
 }
 
 /// Read status from one pinned SQLite snapshot so a concurrent `jscout index`
@@ -77,7 +81,8 @@ pub fn status(conn: &Connection) -> Result<Status> {
 }
 
 fn status_inner(conn: &Connection) -> Result<Status> {
-    let snapshot = current_snapshot(conn)?;
+    crate::store::validate_published_contracts(conn)?;
+    let identity = Identities::read(conn)?.response(Plane::Documentation);
     let metadata_formats =
         crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationMetadata);
     let vector_formats =
@@ -91,7 +96,8 @@ fn status_inner(conn: &Connection) -> Result<Status> {
     let indexed_file_count = count_query(
         conn,
         "SELECT COUNT(*) FROM files
-         WHERE format IN (SELECT value FROM json_each(?1))",
+         WHERE corpus='docs'
+           AND format IN (SELECT value FROM json_each(?1))",
         [&metadata_formats],
     )?;
     let rejection_count = count_query(
@@ -103,7 +109,8 @@ fn status_inner(conn: &Connection) -> Result<Status> {
         conn,
         "SELECT COUNT(*)
          FROM chunks c JOIN files f ON f.id=c.file_id
-         WHERE f.format IN (SELECT value FROM json_each(?1))",
+         WHERE f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?1))",
         [&metadata_formats],
     )?;
     let embeddable_chunk_count = count_query(
@@ -112,7 +119,8 @@ fn status_inner(conn: &Connection) -> Result<Status> {
          FROM doc_chunk_meta m
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
-         WHERE f.format IN (SELECT value FROM json_each(?1))
+         WHERE f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?1))
            AND m.embedding_identity IS NOT NULL",
         [&vector_formats],
     )?;
@@ -125,7 +133,8 @@ fn status_inner(conn: &Connection) -> Result<Status> {
            FROM doc_chunk_meta m
            JOIN chunks c ON c.id=m.chunk_id
            JOIN files f ON f.id=c.file_id
-           WHERE f.format IN (SELECT value FROM json_each(?1))
+           WHERE f.corpus='docs'
+             AND f.format IN (SELECT value FROM json_each(?1))
              AND m.embedding_identity=e.chunk_hash
          )",
         [&vector_formats],
@@ -133,11 +142,12 @@ fn status_inner(conn: &Connection) -> Result<Status> {
     let ready_vector_generation_count = count_query(
         conn,
         "SELECT COUNT(*) FROM doc_vector_generations WHERE snapshot=?1",
-        [&snapshot],
+        [&identity.snapshot],
     )?;
 
     Ok(Status {
-        snapshot,
+        snapshot: identity.snapshot,
+        publication_snapshot: identity.publication_snapshot,
         canonical_root,
         inventory_count,
         indexed_file_count,
@@ -181,7 +191,8 @@ fn front_matter_status(conn: &Connection) -> Result<Vec<FrontMatterStatus>> {
          FROM files f
          JOIN chunks c ON c.file_id=f.id
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
-         WHERE f.format IN (SELECT value FROM json_each(?1))
+         WHERE f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?1))
          GROUP BY f.id, f.path
          ORDER BY f.path COLLATE BINARY",
     )?;
@@ -198,12 +209,7 @@ fn front_matter_status(conn: &Connection) -> Result<Vec<FrontMatterStatus>> {
 /// Weighted documentation BM25. User input is treated as terms rather than
 /// exposed as FTS syntax, and all exact-score ties use the normative source
 /// key before the result is truncated.
-pub fn lexical_search(
-    conn: &Connection,
-    snapshot: &str,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<SearchHit>> {
+pub fn lexical_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
     if query.trim().is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
@@ -228,10 +234,11 @@ pub fn lexical_search(
          JOIN files f ON f.id=c.file_id
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
          WHERE docs_fts MATCH ?1
+           AND f.corpus='docs'
            AND f.format IN (SELECT value FROM json_each(?2))",
     )?;
     let rows = statement.query_map([query.as_str(), eligible_formats.as_str()], |row| {
-        row_to_hit(row, snapshot, 0.0, Some(18))
+        row_to_hit(row, 0.0, Some(18))
     })?;
     let mut hits = rows
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -241,12 +248,7 @@ pub fn lexical_search(
     Ok(hits)
 }
 
-pub(crate) fn load_hit(
-    conn: &Connection,
-    snapshot: &str,
-    chunk_id: i64,
-    score: f64,
-) -> Result<SearchHit> {
+pub(crate) fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<SearchHit> {
     let eligible_formats =
         crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationLexical);
     conn.query_row(
@@ -261,22 +263,21 @@ pub(crate) fn load_hit(
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
          JOIN docs_fts ON docs_fts.rowid=c.id
          WHERE c.id=?1
+           AND f.corpus='docs'
            AND f.format IN (SELECT value FROM json_each(?2))",
         rusqlite::params![chunk_id, eligible_formats],
-        |row| row_to_hit(row, snapshot, score, None),
+        |row| row_to_hit(row, score, None),
     )
     .with_context(|| format!("load documentation chunk {chunk_id}"))
 }
 
 fn row_to_hit(
     row: &rusqlite::Row<'_>,
-    snapshot: &str,
     fallback_score: f64,
     score_index: Option<usize>,
 ) -> rusqlite::Result<SearchHit> {
     Ok(SearchHit {
         chunk_id: row.get(0)?,
-        snapshot: snapshot.to_owned(),
         path: row.get(1)?,
         title: row.get(2)?,
         description: row.get(3)?,
@@ -378,10 +379,7 @@ mod tests {
     fn fixture() -> Result<(tempfile::TempDir, Connection)> {
         let root = tempfile::tempdir()?;
         let conn = crate::store::open(root.path())?;
-        conn.execute(
-            "INSERT INTO meta(key,value) VALUES('snapshot','shared-1')",
-            [],
-        )?;
+        crate::publication::Identities::publish_test(&conn, "code-1", "shared-1", "provenance-1")?;
         conn.execute(
             "INSERT INTO meta(key,value) VALUES('extraction_version',?1)",
             [crate::entity::EXTRACTION_VERSION],
@@ -456,18 +454,25 @@ mod tests {
     }
 
     #[test]
-    fn status_and_lexical_search_use_the_shared_snapshot() -> Result<()> {
+    fn status_exposes_documentation_and_publication_identities() -> Result<()> {
         let (_root, conn) = fixture()?;
         let status = status(&conn)?;
         assert_eq!(status.snapshot, "shared-1");
+        assert_eq!(
+            status.publication_snapshot,
+            crate::publication::current_publication_snapshot(&conn)?
+        );
         assert_eq!(status.indexed_file_count, 3);
         assert_eq!(status.chunk_count, 2);
 
-        let hits = lexical_search(&conn, &status.snapshot, "needle", 10)?;
+        let hits = lexical_search(&conn, "needle", 10)?;
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|hit| hit.path.ends_with(".md")));
-        assert_eq!(hits[0].snapshot, "shared-1");
         assert_eq!(hits[0].title, "Needle");
+        let serialized = serde_json::to_value(&hits[0])?;
+        for private in ["snapshot", "source_start", "source_end", "file_hash"] {
+            assert!(serialized.get(private).is_none(), "serialized {private}");
+        }
         Ok(())
     }
 
@@ -490,9 +495,7 @@ mod tests {
         )?;
         let conn = crate::store::open(root.path())?;
         crate::indexer::index_repo(root.path(), &conn)?;
-        let snapshot = current_snapshot(&conn)?;
-
-        let lexical = lexical_search(&conn, &snapshot, "recoverable metadata", 10)?;
+        let lexical = lexical_search(&conn, "recoverable metadata", 10)?;
         assert_eq!(lexical.len(), 1);
         let hit = &lexical[0];
         assert_eq!(hit.title, "Release Guide");
@@ -502,7 +505,7 @@ mod tests {
         );
         assert_eq!(hit.tags, ["alpha", "comma,tag", "", "snowman ☃"]);
 
-        let loaded = load_hit(&conn, &snapshot, hit.chunk_id, 0.25)?;
+        let loaded = load_hit(&conn, hit.chunk_id, 0.25)?;
         assert_eq!(loaded.description, hit.description);
         assert_eq!(loaded.tags, hit.tags);
         assert_eq!(loaded.score, 0.25);
@@ -512,7 +515,7 @@ mod tests {
     #[test]
     fn fts_input_is_terms_not_query_syntax() -> Result<()> {
         let (_root, conn) = fixture()?;
-        let hits = lexical_search(&conn, "shared-1", "needle OR NOT (", 10)?;
+        let hits = lexical_search(&conn, "needle OR NOT (", 10)?;
         assert_eq!(hits.len(), 2);
         Ok(())
     }

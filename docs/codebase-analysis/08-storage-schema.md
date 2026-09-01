@@ -1,83 +1,85 @@
 # Storage: SQLite schema, indexes, and vectors
 
-Everything jscout persists lives in one file per repository, `.jscout.db` (`src/store.rs:7`), and the whole storage layer is one module: a connection factory, one idempotent `init_schema` batch, one compatibility boundary, and a handful of truncation routines. There are no per-version migration steps. `SCHEMA_VERSION` is `"31"` (`src/store.rs:8`) and `DURABLE_SCHEMA_FLOOR` is `16` (`:9`); those two numbers encode the entire upgrade policy — anything in `[16, 31)` gets its source-derived half dropped and recreated, anything outside is refused. The file holds three lifecycles under one version: a disposable structural snapshot (now spanning a code corpus and a documentation corpus), a durable content-addressed embedding cache, and durable semantic memory from scouting. Forty-seven regular tables, two FTS5 virtual tables, two views, four triggers, fifty-seven named indexes, and three dynamically named sqlite-vec families implement that split.
+Everything jscout persists lives in one file per repository, `.jscout.db`, behind one schema version and one atomic index publication. `SCHEMA_VERSION` is `"34"` and `DURABLE_SCHEMA_FLOOR` is `16`; compatible older files keep durable cache/memory while their disposable state is rebuilt, and newer or too-old files are refused. The disposable index exposes code, documentation, and provenance component identities plus their folded `publication_snapshot`. The fold is not itself a gate.
 
 ## Four gates on every read
 
 `open`/`open_path` (`src/store.rs:52`, `:153`) are the writer paths. They create parent directories, register sqlite-vec once through `sqlite3_auto_extension` (`:13`, guarded by a `Once` because the registration `transmute`s the init symbol and is process-global), set `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, and run `init_schema`, which is safely repeatable because every object is `IF NOT EXISTS`.
 
-`open_read_only`/`open_path_read_only` (`:59`, `:63`) create and migrate nothing. The file must already be a regular file; the connection is opened `SQLITE_OPEN_READ_ONLY` with `foreign_keys=ON` and then `query_only=ON` (`:73`–`:74`); and four checks must pass before the handle is returned:
+`open_read_only`/`open_path_read_only` create and migrate nothing. The file must already be a regular file; the connection is opened `SQLITE_OPEN_READ_ONLY` with `foreign_keys=ON` and then `query_only=ON`; and four gate groups pass in this order before the handle is returned:
 
 | Gate | Compared against | Source |
 | --- | --- | --- |
-| `meta.schema_version == "31"` | `store::SCHEMA_VERSION` | `src/store.rs:88` |
-| `meta.snapshot` exists and `meta.projection_version` matches | `structural::PROJECTION_VERSION` = `"12"` | `src/store.rs:94`–`:113`, `src/structural.rs:13` |
-| `meta.extraction_version` matches | `entity::EXTRACTION_VERSION` = `"7"` | `src/store.rs:132`, `src/entity.rs:14` |
-| `meta.documentation_chunk_format_version` matches | `docs::CHUNK_FORMAT_VERSION` = `"documentation-v1"` | `src/store.rs:139`, `src/docs/mod.rs:11` |
+| `meta.schema_version == "34"` | `store::SCHEMA_VERSION` | `src/store.rs` |
+| `meta.projection_version` exists and matches | `structural::PROJECTION_VERSION` | `src/store.rs` |
+| legacy and active per-format producer contracts match | extraction, documentation, and registered format contracts | `store::validate_published_contracts` |
+| code, documentation, provenance, and folded publication identities all exist and the fold verifies | `publication::Identities::read` | `src/publication.rs` |
 
-The last two live in `validate_published_contracts` (`src/store.rs:123`–`:145`); a missing key reads as the literal `"missing"` and fails. The documentation-format gate is new at v31: a read surface must never reinterpret Markdown rows produced by an older chunker. All four failures print the same repair instruction, because indexing is the only repair path.
+Producer-contract gates live in `validate_published_contracts`; identity completeness and fold consistency live in `Identities::read`. A read surface must never reinterpret code or Markdown rows produced by an incompatible contract. All failures point to indexing as the repair.
 
-The gates are meaningful because the writer unpublishes before it republishes. The indexer's preparation closure ends with `DELETE FROM meta WHERE key IN ('snapshot','projection_version','resolution_hash')` (`src/indexer.rs:636`–`:639`), inside the same `BEGIN IMMEDIATE` that covers the whole write, so a reader sees either the previous complete publication or nothing.
+The gates are meaningful because the writer removes the component digests, folded marker, projection/resolution markers, and provenance digest before recomputing them, inside the same `BEGIN IMMEDIATE` that covers the whole write. `Identities::publish` writes the four identity rows together. A concurrent reader sees the previous complete publication until commit, never the unpublished intermediate state.
 
-## The 47 tables
+## The 49 regular tables
 
-Column-level detail is in the schema batch (`src/store.rs:313`–`1134`); this inventory names each table, where it is defined, and whether it survives an in-place upgrade.
+Column-level detail is in the schema batch in `src/store.rs`; this inventory names each table and whether it survives an in-place upgrade.
 
-| Table | Line | Plane | Survives legacy rebuild |
-| --- | --- | --- | --- |
-| `meta` | 315 | contract | yes (six keys pruned) |
-| `package_instances` | 319 | snapshot | no |
-| `files` | 333 | snapshot | no |
-| `chunks` | 347 | snapshot | no |
-| `doc_chunk_meta` | 368 | docs | no |
-| `doc_inventory` | 442 | docs | no |
-| `symbols` | 453 | structural | no |
-| `exports` | 469 | structural | no |
-| `imports` | 478 | structural | no |
-| `contract_exports` | 489 | structural | no |
-| `contract_imports` | 498 | structural | no |
-| `module_edges` | 506 | structural | no |
-| `refs` | 518 | occurrence | no |
-| `events` | 536 | occurrence | no |
-| `member_calls` | 547 | occurrence | no |
-| `receiver_value_flows` | 570 | flow | no |
-| `function_return_flows` | 599 | flow | no |
-| `value_binding_flows` | 615 | flow | no |
-| `class_value_flows` | 626 | flow | no |
-| `instance_method_value_flows` | 640 | flow | no |
-| `class_member_value_flow_blockers` | 648 | flow | no |
-| `entity_sites` | 657 | entity | no |
-| `entities` | 682 | entity | no |
-| `entity_occurrences` | 693 | entity | no |
-| `entity_edges` | 714 | entity | no |
-| `embedding_profiles` | 728 | **durable cache** | yes |
-| `embeddings` | 739 | **durable cache** | yes |
-| `semantic_embeddings` | 749 | **durable cache** | yes |
-| `embedding_index_entries` | 756 | vector occurrence | no |
-| `doc_embedding_index_entries` | 767 | vector occurrence | no |
-| `doc_vector_generations` | 776 | vector readiness | no |
-| `graph_nodes` | 784 | projection | no |
-| `resolved_edges` | 799 | projection | no |
-| `checker_enrichment_batches` | 822 | checker | no |
-| `checker_project_runs` | 840 | checker | no |
-| `checker_project_inputs` | 857 | checker | no |
-| `checker_enrichments` | 868 | checker | no |
-| `checker_occurrence_projects` | 897 | checker | no |
-| `scout_runs` | 917 | **durable memory** | yes |
-| `repository_classifications` | 951 | **durable memory** | yes |
-| `repository_file_policy` | 980 | scout projection | no |
-| `repository_current_classifications` | 1000 | scout projection | no |
-| `scout_classifications` | 1024 | **durable memory** | yes |
-| `semantic_artifacts` | 1033 | **durable memory** | yes |
-| `semantic_relations` | 1053 | **durable memory** | yes |
-| `semantic_supports` | 1076 | **durable memory** | yes |
-| `semantic_embedding_index_entries` | 1096 | vector occurrence | no |
+| Table | Plane | Survives legacy rebuild |
+| --- | --- | --- |
+| `meta` | contract | yes (disposable keys pruned) |
+| `package_instances` | snapshot | no |
+| `files` | snapshot | no |
+| `chunks` | snapshot | no |
+| `doc_chunk_meta` | docs | no |
+| `doc_file_provenance` | docs provenance | no |
+| `doc_blame_cache` | docs provenance cache | no |
+| `doc_inventory` | docs | no |
+| `symbols` | structural | no |
+| `exports` | structural | no |
+| `imports` | structural | no |
+| `contract_exports` | structural | no |
+| `contract_imports` | structural | no |
+| `module_edges` | structural | no |
+| `refs` | occurrence | no |
+| `events` | occurrence | no |
+| `member_calls` | occurrence | no |
+| `receiver_value_flows` | flow | no |
+| `function_return_flows` | flow | no |
+| `value_binding_flows` | flow | no |
+| `class_value_flows` | flow | no |
+| `instance_method_value_flows` | flow | no |
+| `class_member_value_flow_blockers` | flow | no |
+| `entity_sites` | entity | no |
+| `entities` | entity | no |
+| `entity_occurrences` | entity | no |
+| `entity_edges` | entity | no |
+| `embedding_profiles` | **durable cache** | yes |
+| `embeddings` | **durable cache** | yes |
+| `semantic_embeddings` | **durable cache** | yes |
+| `embedding_index_entries` | vector occurrence | no |
+| `doc_embedding_index_entries` | vector occurrence | no |
+| `doc_vector_generations` | vector readiness | no |
+| `graph_nodes` | projection | no |
+| `resolved_edges` | projection | no |
+| `checker_enrichment_batches` | checker | no |
+| `checker_project_runs` | checker | no |
+| `checker_project_inputs` | checker | no |
+| `checker_enrichments` | checker | no |
+| `checker_occurrence_projects` | checker | no |
+| `scout_runs` | **durable memory** | yes |
+| `repository_classifications` | **durable memory** | yes |
+| `repository_file_policy` | scout projection | no |
+| `repository_current_classifications` | scout projection | no |
+| `scout_classifications` | **durable memory** | yes |
+| `semantic_artifacts` | **durable memory** | yes |
+| `semantic_relations` | **durable memory** | yes |
+| `semantic_supports` | **durable memory** | yes |
+| `semantic_embedding_index_entries` | vector occurrence | no |
 
 Ten tables survive an in-place upgrade: `meta` plus nine durable ones. Note `semantic_embedding_index_entries` is *dropped* by the legacy rebuild (`src/store.rs:255`) even though `reset_extraction_state` preserves it — the two truncation surfaces are not the same set.
 
-Alongside the tables: 54 `CREATE INDEX IF NOT EXISTS` plus three partial `CREATE UNIQUE INDEX IF NOT EXISTS` statements. The three unique ones encode constraints table-level uniqueness cannot express — `idx_checker_one_active_batch ON checker_enrichment_batches(active) WHERE active=1` (`:835`), `idx_scout_runs_active ON scout_runs(scout_kind, input_fingerprint) WHERE status IN ('running','completed')` (`:941`), and `idx_semantic_artifacts_one_successor` (`:1072`). One live checker batch, one live claim per scout input, one successor per superseded artifact.
+Alongside the tables: 51 ordinary `CREATE INDEX IF NOT EXISTS` statements plus three partial `CREATE UNIQUE INDEX IF NOT EXISTS` statements. The unique indexes enforce one live checker batch, one live claim per scout input, and one successor per superseded artifact.
 
-`init_schema` also carries exactly one in-place `ALTER TABLE`, adding `repository_classifications.cited_evidence_json` when absent (`src/store.rs:1117`–`:1132`). That column landed while v20 was under review, so databases from an early v20 commit hold durable reconnaissance history a version bump would discard; a `pragma_table_info` probe plus one `ALTER` is cheaper than declaring them unreadable.
+`init_schema` also carries one production in-place `ALTER TABLE`, adding `repository_classifications.cited_evidence_json` when absent. That column landed while v20 was under review, so databases from an early v20 commit hold durable reconnaissance history a version bump would discard; a `pragma_table_info` probe plus one `ALTER` is cheaper than declaring them unreadable.
 
 ## The structural core
 
@@ -122,6 +124,8 @@ Documentation shares `files`, `chunks`, and `embeddings` with code, and gets its
 erDiagram
     files ||--o{ chunks : "file_id CASCADE"
     chunks ||--|| doc_chunk_meta : "chunk_id PK and FK CASCADE"
+    files ||--|| doc_file_provenance : "file_id PK and FK CASCADE"
+    doc_blame_cache }o..o{ files : "path-keyed, no FK"
     chunks ||..|| docs_fts : "rowid, docs only"
     doc_inventory }o..o{ files : "standalone, no FK"
     embedding_profiles ||--o{ embeddings : "profile_id CASCADE"
@@ -156,7 +160,7 @@ erDiagram
 
 `N` is validated to `1..=8192` before interpolation (`src/embed.rs:1128`–`:1131`). vec0 tables carry no foreign keys, so the three regular entries tables are authoritative and their `id` *is* the vec0 rowid. Documentation gets a separate family rather than a `corpus` partition key because sqlite-vec applies KNN's `k` before any relational filter could run — sharing one table would let code rows consume a documentation query's entire `k` budget. Only the code family partitions on `origin`, which lets origin-filtered code search push that filter below KNN.
 
-**Documentation readiness is all-or-nothing.** `doc_vector_generations` (`:776`) has primary key `(snapshot, profile_id, dimensions, chunk_format_version)`, and a row exists only when `rebuild_profile_generation_from_cache` found a cached vector of exactly the right blob width for every embeddable documentation chunk. It returns `Ok(None)` — a normal not-ready state, never an error — if any vector is missing, if any blob width is wrong, or if there are no embeddable chunks at all (`src/docs/retrieval.rs:938`–`:946`). At query time `resolve_vector_ranking` checks `generation_is_ready` first and falls back to BM25-only when the row is absent (`:502`–`:509`); a second, defensive count check inside `vector_search` (`:1040`–`:1057`) instead degrades to `VectorStatus::Degraded` and propagates the error only under `--vector-required` (`:441`–`:444`). One missing vector therefore demotes a whole profile, and an interrupted `jscout docs embed` yields lexical-only results until rerun. Code and semantic vectors use a different mechanism entirely — `meta` keys `embedding_index_synced_v1:{profile_id}` and `semantic_embedding_index_synced_v1:{profile_id}`.
+**Documentation readiness is all-or-nothing.** `doc_vector_generations` has primary key `(snapshot, profile_id, dimensions, chunk_format_version)`, where `snapshot` stores the documentation digest. A row exists only when every embeddable documentation occurrence has a valid cached vector. One missing vector demotes that profile to BM25, while a code-only publication leaves a ready docs generation untouched. Code and semantic vectors use profile sync markers instead.
 
 `doc_inventory` (`:442`) deliberately has no primary key and no foreign key to `files`: it records every membership decision for the current snapshot — subjects `directory`/`file`/`entry` and rules from `hard-skip` through `oversized` to `indexed` — and rejected paths by definition have no `files` row. Its `path_base64`/`path_encoding` columns carry non-UTF-8 paths whose display `path` is not authoritative.
 
@@ -190,29 +194,29 @@ erDiagram
 
 ## Two reset surfaces, and what each keeps
 
-`reset_extraction_state` (`src/store.rs:1211`) exists because cascading `delete_file` across tens of thousands of files re-scans the large evidence tables and the FTS index once per file. It calls `embed::clear_vector_rows`, `DELETE`s from 29 tables children-first, then drops and recreates both FTS tables from `CHUNKS_FTS_CREATE`/`DOCS_FTS_CREATE`. `symbols` is *not* in the delete list — it is emptied by the foreign-key cascade from `DELETE FROM files`, so the routine is correct only with `foreign_keys=ON`. Survivors: `embedding_profiles`, `embeddings`, `semantic_embeddings`, `semantic_embedding_index_entries`, `package_instances`, the five checker tables, `scout_runs`, `scout_classifications`, `repository_classifications`, the three `semantic_*` tables, and `meta`.
+`reset_extraction_state` exists because cascading `delete_file` across tens of thousands of files re-scans the large evidence tables and the FTS index once per file. It calls `embed::clear_vector_rows`, deletes the source-derived tables children-first, then drops and recreates both FTS tables from `CHUNKS_FTS_CREATE`/`DOCS_FTS_CREATE`. `symbols` is *not* in the delete list — it is emptied by the foreign-key cascade from `DELETE FROM files`, so the routine is correct only with `foreign_keys=ON`. Durable embedding and semantic/scout state survives.
 
-`reset_snapshot_state` (`:1261`) is that plus `DELETE FROM package_instances` and removal of the four publication meta keys. The indexer picks between them at `src/indexer.rs:481`–`:487`: `FullRefresh` takes the wider one, an incremental pass the narrower one once extractor-version churn crosses a threshold. That threshold is asymmetric — the numerator counts only `corpus='code'` files with a blanked hash, but the denominator is every non-dependency file, documentation included (`:476`–`:482`).
+`reset_snapshot_state` is that plus `DELETE FROM package_instances` and removal of the snapshot/projection markers. `FullRefresh` is the only index mode that invokes it. Incremental producer-contract changes instead invalidate rows selectively by format; there is no reset-percentage heuristic.
 
 `clear_vector_rows` (`src/embed.rs:1875`) is asymmetric too. Code vec tables are enumerated from `embedding_profiles.dimensions` via `ensure_vector_table` — which *creates* the table as a side effect of clearing it — while documentation vec tables are found by GLOB over `sqlite_master`. A `vec_embeddings_N` left behind for a dimension with no surviving profile is therefore never emptied. Neither routine touches `vec_semantic_embeddings_*`, since semantic artifacts survive snapshot rebuilds.
 
 `clear_checker_batches` and `preserve_active_checker_batch_for_watch` (`:1274`, `:1283`) express the manual-versus-watch checker retention policy as two one-line statements: delete every batch, or delete only `active=0` and keep one hidden active batch as a carry source.
 
-`delete_file` (`:1290`) is the per-file path and is idempotent — an existence probe returns early if the row is already gone. It removes vec0 rows, then both FTS mirrors by rowid (FTS5 is not FK-aware), then the `files` row, letting cascades take the rest. One wrinkle: `delete_vector_rows_for_file` clears `doc_vector_generations` for the entire profile whenever any documentation vector row for that file is removed (`src/embed.rs:1867`–`:1870`), so deleting a single file demotes every documentation generation for that profile to not-ready.
+`delete_file` is the per-file path and is idempotent — an existence probe returns early if the row is already gone. It removes vec0 rows, then both FTS mirrors by rowid (FTS5 is not FK-aware), then the `files` row, letting cascades take the rest. Removing a documentation vector row clears the profile generation transiently; the same index publication rematerializes a complete generation from cache when all remaining documentation identities are present.
 
-## v29 to v31, and the legacy rebuild
+## v29 to v34, and the legacy rebuild
 
-`git log -S` shows `SCHEMA_VERSION` moving from `"29"` straight to `"31"` in one commit, `e3229ad "feat: add unified Markdown retrieval"` — the string `"30"` never appears in `src/store.rs`. v30 is nonetheless load-bearing: it sits inside the durable window `[16, 31)`, so a writer rebuilds such a file rather than refusing it, and the test `v30_rebuild_installs_explicit_file_classification` (`src/store.rs:1678`) pins that by hand-building a v30 `files` table without `corpus`/`format`. The v31 delta over v29 is four new tables (`doc_chunk_meta`, `doc_inventory`, `doc_embedding_index_entries`, `doc_vector_generations`), two new `files` columns, a second FTS5 table, two views, four triggers, a second vec0 family, and the documentation-contract gate. The snapshot digest changed with it: `compute_snapshot_with_resolution` (`src/structural.rs:429`) moved its domain tag from `jscout-structural-snapshot-v2` to `-v4` — skipping v3 — hashes both contract constants alongside their published `meta` values, and includes `f.corpus` and `f.format` in the per-file tuple, so a contract mismatch cannot preserve an apparently current digest.
+`git log -S` shows `SCHEMA_VERSION` moving from `"29"` straight to `"31"` in one commit, `e3229ad "feat: add unified Markdown retrieval"` — the string `"30"` never appears in `src/store.rs`. v30 is nonetheless load-bearing: it is inside the durable rebuild window, and `v30_rebuild_installs_explicit_file_classification` pins reconstruction of a pre-`corpus`/`format` file table. v31 introduced the unified documentation corpus; v34 adds per-format contracts, provenance sidecars, and component publication identities.
 
-`rebuild_legacy_disposable_schema` (`:217`–`:311`) is the whole migration story. It collects the three vec0 families by GLOB over `sqlite_master`, then in one `BEGIN IMMEDIATE` re-validates each name's suffix digit-by-digit (table names cannot be bound as SQL parameters) and empties each; then one `execute_batch` drops both views and 40 tables, deletes six `meta` keys plus both `%_synced_v1:%` marker families, and stamps `schema_version='31'`. Vector tables are emptied rather than dropped because their rows materialize snapshot-local entry rowids and are worthless, while the vec0 table itself is dimension-shaped state the next materialization would recreate anyway. The drop list still names `checker_input_files`, a table the current schema no longer creates — deliberate, since a v16-era file may have one.
+`rebuild_legacy_disposable_schema` is the migration boundary: it preserves durable embedding and semantic/scout history while dropping source-derived rows, vec occurrence materialization, checker batches, and publication markers. The v33→v34 transition deliberately requires this rebuild because old durable `source_snapshot` values and checker rows were keyed to the former global digest; a read-only open fails closed until a writer rebuilds and `jscout index` publishes the new identity quartet.
 
-The tradeoff of a single boundary instead of a migration ladder: everything below the cache line is recomputable from the checkout, so recreating it is cheap and always correct, but a future *durable*-plane change has no in-place path at all — it needs an explicit export/import or a cache-compatibility decision. Files below 16 or above 31 are refused outright, with an error telling the user to preserve the old file if its embedding cache or semantic memory matters.
+The tradeoff of a single boundary instead of a migration ladder: everything below the cache line is recomputable from the checkout, so recreating it is cheap and always correct, but a future *durable*-plane change has no in-place path at all — it needs an explicit export/import or a cache-compatibility decision. Files below 16 or above 34 are refused outright, with an error telling the user to preserve the old file if its embedding cache or semantic memory matters.
 
 ## The snapshot log does not exist
 
-There is no `snapshot_log` table, and no snapshot history of any kind. The single publication marker is the `meta` row keyed `snapshot`. PR #102's branch name (`g24-snapshot-log`) is misleading: its commits touch `PLAN.md` and the two G24 design documents only. `snapshot_log` (sequence, digest, published-at), `doc_block_state`, and `doc_block_observations` are described at `PLAN.md:3266` and in `docs/plans/g24-adr-one-store-separate-ranking-2026-08-25.md:25` as *deferred* durable-plane tables for a block-observation ledger, gated on the cache-compatibility decision any durable change requires.
+There is no `snapshot_log` table and no snapshot history. `meta.snapshot` is the current folded publication marker; `code_digest`, `documentation_digest`, and `documentation_provenance_digest` are its current components. The deferred block-observation ledger still does not exist.
 
-Publication order is the closest thing to a log, and it is strict. Either `current.publish(conn)` (unchanged inputs, `src/indexer.rs:695`) or `structural::rebuild_projection_with_timing` writes `meta.snapshot` and `meta.projection_version`, followed by the explicit `resolution_hash` insert at `src/indexer.rs:702`–`:707`; only then does `:718`–`:720` call `docs::retrieval::rematerialize_cached_generations`. The order is forced, not stylistic: that function opens with an `ensure!` that `store::current_snapshot(conn)` already equals the snapshot it was handed (`src/docs/retrieval.rs:818`–`:822`). All of it sits inside the outer `BEGIN IMMEDIATE`, so the new marker exists for the docs rebuild but is not yet visible to any reader.
+Publication order is the closest thing to a log, and it is strict. Projection identity is published, component digests are computed, projection/checker reuse is settled against the code digest, and then `Identities::publish` installs all components plus the fold. Provider-free docs rematerialization validates the newly published documentation digest before rebuilding. All of it sits inside the outer `BEGIN IMMEDIATE`, so those markers exist for the internal rebuild but are not visible to another connection until commit.
 
 ## Limits worth knowing
 
@@ -224,4 +228,4 @@ Publication order is the closest thing to a log, and it is strict. Either `curre
 
 Two naming traps: the `store.rs` test at `:2099` builds `vec_doc_embeddings_2` with an extra `snapshot TEXT PARTITION KEY` column that production never creates (the real shape is `src/docs/retrieval.rs:977`–`:981`), and two distinct functions are named `ensure_vector_table` — `src/embed.rs:1151` for code, which adds the `origin` partition key and invalidates sync markers on first creation, and `src/docs/retrieval.rs:973` for docs, which does neither.
 
-Schema behavior is tested against real temporary SQLite files rather than mocks — 19 `#[test]` functions in the `store.rs` test module (`:1347`–`2171`), covering the v14 rejection that leaves the file byte-identical, the v16 floor with its exact survivor tuple, the v20 `ALTER`, all three publication gates in sequence with their error text, the v30 rebuild, the four `files` classification rejections, view-column equality against the base tables, and the documentation reset that ends with everything projection-side gone and the `embeddings` row kept.
+Schema behavior is tested against real temporary SQLite files rather than mocks, covering legacy rejection and rebuild boundaries, read-gate order and error text, file classification constraints, view-column equality against the base tables, and documentation reset behavior.

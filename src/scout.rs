@@ -40,14 +40,12 @@ pub struct ElidedRange {
     pub end_line: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct RenderedSource {
     pub representation: &'static str,
     pub text: String,
-    pub byte_limit: usize,
     pub original_bytes: usize,
     pub rendered_bytes: usize,
-    pub compression_ratio: f64,
     pub elisions: Vec<ElidedRange>,
     pub budget_truncated: bool,
 }
@@ -78,18 +76,11 @@ pub fn render_source(
     };
     let (text, budget_truncated) = fit_text_budget(rendered, byte_limit);
     let rendered_bytes = text.len();
-    let compression_ratio = if original.is_empty() {
-        1.0
-    } else {
-        ((rendered_bytes as f64 / original.len() as f64) * 10_000.0).round() / 10_000.0
-    };
     Ok(RenderedSource {
         representation: view.as_str(),
         text,
-        byte_limit,
         original_bytes: original.len(),
         rendered_bytes,
-        compression_ratio,
         elisions,
         budget_truncated,
     })

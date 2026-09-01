@@ -15,7 +15,8 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::chunk::LineIndex;
-use crate::{heur, parse, structural};
+use crate::publication::{Identities, Plane};
+use crate::{heur, parse, store};
 
 /// One `--arg KEY[=VALUE]` filter. All filters must match top-level
 /// properties of the same object-literal argument.
@@ -85,6 +86,7 @@ pub struct CallSite {
 #[derive(Debug, Clone, Serialize)]
 pub struct CallQueryResult {
     pub snapshot: String,
+    pub publication_snapshot: String,
     pub method: String,
     pub files_scanned: usize,
     pub matches: Vec<CallSite>,
@@ -104,7 +106,18 @@ pub fn query(root: &Path, conn: &Connection, query: &CallQuery) -> Result<CallQu
     if method.is_empty() {
         bail!("a method name is required, e.g. `jscout calls <root> insert`");
     }
-    let snapshot = structural::current_snapshot(conn)?;
+    store::with_read_snapshot(conn, "jscout_calls", || {
+        query_in_snapshot(root, conn, query, method)
+    })
+}
+
+fn query_in_snapshot(
+    root: &Path,
+    conn: &Connection,
+    query: &CallQuery,
+    method: &str,
+) -> Result<CallQueryResult> {
+    let identity = Identities::read(conn)?.response(Plane::Code);
 
     let mut files = candidate_files(root, conn, method, &query.file_origins)?;
     if let Some(keep) = fts_file_ids(conn, &query.args)? {
@@ -165,7 +178,8 @@ pub fn query(root: &Path, conn: &Connection, query: &CallQuery) -> Result<CallQu
     }
 
     Ok(CallQueryResult {
-        snapshot,
+        snapshot: identity.snapshot,
+        publication_snapshot: identity.publication_snapshot,
         method: method.to_string(),
         files_scanned: files.len(),
         matches,
@@ -465,6 +479,9 @@ mod tests {
         let mut query = base_query("insert");
         query.args = vec![ArgFilter::parse("merge=replace")?];
         let result = super::query(repo.path(), &conn, &query)?;
+        let identities = crate::publication::Identities::read(&conn)?;
+        assert_eq!(result.snapshot, identities.code);
+        assert_eq!(result.publication_snapshot, identities.publication);
 
         // The bare `insert(...)` call is not a member call and must not match.
         assert_eq!(result.matches.len(), 1, "{:#?}", result.matches);

@@ -41,7 +41,7 @@ pub(super) fn cmd_scout_workflows(
     if dry_run {
         println!(
             "{}",
-            serde_json::to_string_pretty(&scouting::dry_run_report(&plan, &options)?)?
+            serde_json::to_string(&scouting::dry_run_report(&plan, &options)?)?
         );
         return Ok(());
     }
@@ -79,7 +79,7 @@ pub(super) fn cmd_scout_repository(
         let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
         println!(
             "{}",
-            serde_json::to_string_pretty(&scouting::repository::dry_run_report(
+            serde_json::to_string(&scouting::repository::dry_run_report(
                 &conn,
                 &mut gateway,
                 &plan,
@@ -115,9 +115,7 @@ pub(super) fn cmd_scout_summaries(
     if dry_run {
         println!(
             "{}",
-            serde_json::to_string_pretty(&scouting::summary_dry_run_report(
-                root, &conn, &options
-            )?)?
+            serde_json::to_string(&scouting::summary_dry_run_report(root, &conn, &options)?)?
         );
         return Ok(());
     }
@@ -148,7 +146,7 @@ pub(super) fn cmd_scout_cards(
     if dry_run {
         println!(
             "{}",
-            serde_json::to_string_pretty(&scouting::card_dry_run_report(&plan, &options)?)?
+            serde_json::to_string(&scouting::card_dry_run_report(&plan, &options)?)?
         );
         return Ok(());
     }
@@ -172,7 +170,7 @@ pub(super) fn cmd_scout_concepts(
     if dry_run {
         println!(
             "{}",
-            serde_json::to_string_pretty(&scouting::concept_dry_run_report(&plan, &options)?)?
+            serde_json::to_string(&scouting::concept_dry_run_report(&plan, &options)?)?
         );
         return Ok(());
     }
@@ -198,7 +196,7 @@ pub(super) fn cmd_scout_refresh(
         let plans = scouting::plan_refresh(root, &conn, &selection)?;
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+            serde_json::to_string(&serde_json::json!({
                 "dry_run": true,
                 "max_calls": policy.max_calls,
                 "max_concurrency": policy.max_concurrency,

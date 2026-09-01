@@ -999,6 +999,44 @@ fn repository_changes_between_evidence_and_publication_publish_nothing() -> Resu
 }
 
 #[test]
+fn documentation_change_between_evidence_and_publication_preserves_code_claims() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let conn = fixture(repo.path())?;
+    let anchors = candidate_anchors(&conn, repo.path())?;
+    let before = crate::publication::Identities::read(&conn)?;
+
+    let root = repo.path().to_path_buf();
+    let db_path = store::db_path(repo.path());
+    let mut gateway = FakeGateway::new(vec![Ok(outcome(full_submission(&anchors)))]);
+    gateway.on_complete = Some(Box::new(move || {
+        std::fs::write(
+            root.join("README.md"),
+            "# Flow\n\nThe flow starts and then finishes.\n",
+        )
+        .expect("write documentation fixture");
+        let racing = store::open_path(&db_path).expect("open racing connection");
+        indexer::index_repo(&root, &racing).expect("racing docs-only re-index");
+    }));
+
+    let report = scout_workflows(repo.path(), &conn, &mut gateway, &scout_options())?;
+    assert_eq!(report.status, "completed");
+    assert!(report.artifact_id.is_some());
+    let after = crate::publication::Identities::read(&conn)?;
+    assert_eq!(after.code, before.code);
+    assert_ne!(after.documentation, before.documentation);
+    assert_ne!(after.publication, before.publication);
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_snapshot FROM scout_runs WHERE id=?1",
+            [report.run_id],
+            |row| row.get::<_, String>(0),
+        )?,
+        crate::publication::durable_code_source(&before.code)
+    );
+    Ok(())
+}
+
+#[test]
 fn dry_run_report_marks_budget_and_call_slots() -> Result<()> {
     let repo = tempfile::tempdir()?;
     std::fs::write(
@@ -3120,7 +3158,7 @@ fn summary_reuse_survives_unrelated_changes() -> Result<()> {
     )?;
     let summary_id = first.reports[0].artifact_id.expect("published summary");
 
-    // A new file moves the structural snapshot but leaves this scope's
+    // A new file moves the code snapshot but leaves this scope's
     // children untouched: the summary fingerprint is snapshot-free, so the
     // completed run is reused instead of respent.
     std::fs::write(
@@ -3239,7 +3277,7 @@ fn summary_publication_refuses_a_child_added_mid_flight() -> Result<()> {
 
     // Planning sees only the start card. While the model call is in
     // flight, an agent adds a second current card to the same file. No
-    // source or structural snapshot changes, and the original child is
+    // source or code snapshot changes, and the original child is
     // untouched, so only a complete child-set recheck can catch it.
     let finish_anchor = crate::structural::resolve_current_anchor(&conn, "flow.ts:finish")?;
     let root = repo.path().to_path_buf();

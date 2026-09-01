@@ -583,6 +583,7 @@ fn debug_json_is_unbounded_unless_the_caller_sets_a_budget() {
 
     let neighborhood = structural::Neighborhood {
         snapshot: "snapshot".into(),
+        publication_snapshot: "publication".into(),
         requested_anchor: "sym:src/root.ts#::root@1".into(),
         resolved_anchor: "sym:src/root.ts#::root@1".into(),
         anchor_status: "current".into(),
@@ -594,7 +595,7 @@ fn debug_json_is_unbounded_unless_the_caller_sets_a_budget() {
         .expect("unbounded debug neighborhood renders");
     assert_eq!(
         rendered,
-        serde_json::to_string_pretty(&neighborhood).expect("fixture serializes")
+        serde_json::to_string(&neighborhood).expect("fixture serializes")
     );
 }
 

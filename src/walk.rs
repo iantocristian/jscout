@@ -41,7 +41,7 @@ pub(crate) struct RepositoryInventory<T> {
     pub files: Vec<PathBuf>,
     /// Visible Cargo manifests observed by the same authoritative traversal
     /// that admitted Rust source. Consumers use these paths for parser
-    /// context without acquiring a second repository snapshot.
+    /// context without acquiring a second repository traversal.
     pub cargo_manifests: Vec<PathBuf>,
     pub rejections: Vec<WalkRejection>,
     pub consumer: T,
@@ -242,7 +242,7 @@ pub(crate) fn repository_inventory<C: RepositoryInventoryConsumer>(
 }
 
 /// Read-only diagnostic callers need the file list but do not publish a
-/// structural snapshot. These callers use [`source_inventory`] so traversal
+/// index publication. These callers use [`source_inventory`] so traversal
 /// rejections remain visible instead of being reduced to a bare file list.
 pub fn source_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(source_inventory(root)?.files)

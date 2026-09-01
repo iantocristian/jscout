@@ -1,0 +1,205 @@
+{
+  "schema": "jscout.g27-plane-identities.v1",
+  "generated_at": "2026-08-30T12:33:44Z",
+  "status": "matched_single_host_control_treatment_observation",
+  "provenance": {
+    "control": {
+      "source_commit": "e434a26353d0b51d5a7208328596fc2184e128b1",
+      "source_tree": "a6d068840efe8140e703357c795f7b921d9013ae",
+      "binary_sha256": "d7ae10580cd25907455a3851c250556e95740853726efc894c2e742ea9ae3c7b"
+    },
+    "treatment": {
+      "source_commit": "552c8c690a58954b0761dd534eea9f1894ca9d69",
+      "source_tree": "c526e1936e53165cecceff156efbe8a2e56477bd",
+      "binary_sha256": "846fd8607d5a9abccc89851bf40739c034a57b08ef2ca45bddc5bbb1761acaa9",
+      "binary_source_verification": "release binary rebuilt from a clean committed checkpoint before the run"
+    },
+    "corpus": {
+      "name": "ai-pipe",
+      "commit": "ea13166c59cfc52574e96959413f5c54be20e8c8",
+      "tree": "af5a7b98aace2584d41a34964df7c59e18e4c614",
+      "construction": "git archive",
+      "index_dependencies": false,
+      "source_checkout_status_byte_identical": true
+    }
+  },
+  "host": {
+    "os": "macOS 26.6.1",
+    "os_build": "25G76",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "logical_cpus": 18,
+    "total_memory_bytes": 68719476736,
+    "rustc": "1.97.1",
+    "node": "24.15.0",
+    "sqlite": "3.51.0"
+  },
+  "methodology": {
+    "remote_provider_requests": 0,
+    "checker": "real local TypeScript checker against archived source with an externally linked dependency installation; dependency bytes were not frozen by git archive",
+    "scouting": "deterministic local gateway with a 30000 ms result delay",
+    "timing": "process wall including startup via /usr/bin/time -p",
+    "filesystem_cache": "uncontrolled",
+    "host_load": "uncontrolled",
+    "sample_count_per_arm": 1,
+    "claims": "matched descriptive observations, not CI thresholds or cross-machine estimates",
+    "checked_in_end_to_end_runner": false,
+    "raw_scratch_evidence_committed": false
+  },
+  "real_repository_smoke": [
+    {
+      "corpus": "ai-pipe",
+      "commit": "ea13166c59cfc52574e96959413f5c54be20e8c8",
+      "files": 856,
+      "code_files": 690,
+      "documentation_files": 166,
+      "documentation_rejections": 1,
+      "chunks": 13736,
+      "documentation_chunks": 8253,
+      "references": 28527,
+      "initial_index_wall_ms": 1210,
+      "initial_index_peak_rss_bytes_approx": 111149056,
+      "integrity_check": "ok",
+      "docs_only_code_digest_stable": true,
+      "docs_only_normalized_code_response_byte_identical": true,
+      "code_only_documentation_digest_stable": true,
+      "code_only_normalized_documentation_response_byte_identical": true
+    },
+    {
+      "corpus": "n8n",
+      "commit": "9d9e9bf97e8ae5382a930cd662637a9cf7046ef9",
+      "tree": "7bc76ccc2f9d9b7916be5336be1edd4c6ac8f98f",
+      "files": 19816,
+      "code_files": 19236,
+      "documentation_files": 580,
+      "documentation_rejections": 31,
+      "chunks": 97609,
+      "documentation_chunks": 5380,
+      "references": 404990,
+      "initial_index_wall_ms": 17100,
+      "initial_index_peak_rss_bytes_approx": 417333248,
+      "integrity_check": "ok",
+      "docs_only_code_digest_stable": true,
+      "docs_only_normalized_code_response_byte_identical": true
+    }
+  ],
+  "measurements": [
+    {
+      "id": "checker.docs_only_manual_publication.control",
+      "metrics": {
+        "initial_full_enrichment_wall_ms": 25390,
+        "docs_index_wall_ms": 1340,
+        "recovery_enrichment_wall_ms": 24490
+      },
+      "before": {
+        "active_batches": 1,
+        "checker_enrichments": 387,
+        "projected_checker_edges": 387,
+        "value_flow_edges": 1025
+      },
+      "after_docs_index": {
+        "active_batches": 0,
+        "checker_enrichments": 0,
+        "projected_checker_edges": 0,
+        "value_flow_edges": 1025
+      },
+      "recovery": {
+        "exact_batch_reused": false,
+        "occurrences_queried": 4601,
+        "request_batches": 42,
+        "facts_published": 387
+      }
+    },
+    {
+      "id": "checker.docs_only_manual_publication.treatment",
+      "metrics": {
+        "initial_full_enrichment_wall_ms": 25610,
+        "docs_index_wall_ms": 1380,
+        "reuse_validation_wall_ms": 290
+      },
+      "before": {
+        "code_digest": "caf8a36e14f448c5de2f91ccedf115f8064662c836ac839e1112cd98f2d0ffaf",
+        "documentation_digest": "295730a9a52bb53b997d8a0488edc739584aa05f5c1dde7721df4afea85a1092",
+        "publication_snapshot": "04294d76e405b32e5d553a5039b1d24b29af20ee5fefabc0615f99bf50fe570d",
+        "active_batches": 1,
+        "checker_enrichments": 387,
+        "projected_checker_edges": 387,
+        "value_flow_edges": 1025
+      },
+      "after_docs_index": {
+        "code_digest": "caf8a36e14f448c5de2f91ccedf115f8064662c836ac839e1112cd98f2d0ffaf",
+        "documentation_digest": "da84a9a0a6fe38b61a83c8701a8a7b9059ddf469dcb2a08dcb27b9650a34c59e",
+        "publication_snapshot": "e115168eff410293d8c080e7758684685f43a250aa301fd5dbfaf6ff0a77b004",
+        "active_batches": 1,
+        "checker_enrichments": 387,
+        "projected_checker_edges": 387,
+        "value_flow_edges": 1025
+      },
+      "reuse_validation": {
+        "exact_batch_reused": true,
+        "occurrences_queried": 0,
+        "request_batches": 0,
+        "facts_published": 387
+      }
+    },
+    {
+      "id": "scout.docs_only_inflight_publication.control",
+      "metrics": {
+        "docs_index_start_after_gateway_marker_ms": 20,
+        "docs_index_observed_wall_ms": 1259,
+        "scout_finish_after_gateway_marker_ms": 30014
+      },
+      "outcome": {
+        "exit_status": 1,
+        "run_status": "incomplete",
+        "error_code": "inputs_changed",
+        "gateway_requests": 1,
+        "new_card_artifacts": 0
+      }
+    },
+    {
+      "id": "scout.docs_only_inflight_publication.treatment",
+      "metrics": {
+        "docs_index_start_after_gateway_marker_ms": 23,
+        "docs_index_observed_wall_ms": 1438,
+        "scout_finish_after_gateway_marker_ms": 30035,
+        "scout_process_wall_ms": 30080
+      },
+      "identity": {
+        "code_digest_before_and_after": "caf8a36e14f448c5de2f91ccedf115f8064662c836ac839e1112cd98f2d0ffaf",
+        "documentation_digest_after": "024cf64d80aefc1a8e46806ab4da065af760e8b337026579985817f6dbc4792f",
+        "publication_snapshot_after": "bf3f49f184edc44621d66b5cba39de557ca7d43fdcf6f241701ce613ed43e99c",
+        "durable_source_snapshot": "code-v1:caf8a36e14f448c5de2f91ccedf115f8064662c836ac839e1112cd98f2d0ffaf"
+      },
+      "outcome": {
+        "exit_status": 0,
+        "run_status": "completed",
+        "error_code": null,
+        "gateway_requests": 1,
+        "new_card_artifacts": 1,
+        "active_batches": 1,
+        "checker_enrichments": 387,
+        "projected_checker_edges": 387
+      }
+    }
+  ],
+  "matched_observations": {
+    "docs_only_checker_queries_avoided_in_treatment": 4601,
+    "docs_only_checker_request_batches_avoided_in_treatment": 42,
+    "observed_recovery_command_wall_ms_difference": 24200,
+    "checker_visibility_gap_after_docs_publication": {
+      "control": true,
+      "treatment": false
+    },
+    "discarded_scout_publications": {
+      "control": 1,
+      "treatment": 0
+    }
+  },
+  "validation": {
+    "treatment_final_sqlite_integrity_check": "ok",
+    "code_digest_stable_across_both_treatment_docs_publications": true,
+    "checker_projection_stable_across_both_treatment_docs_publications": true,
+    "source_checkout_status_byte_identical_before_and_after": true
+  }
+}

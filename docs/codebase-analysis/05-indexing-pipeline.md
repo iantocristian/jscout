@@ -1,6 +1,6 @@
 # The indexing pipeline: one run, two planes
 
-One function, `index_repo_impl` (`src/indexer.rs:374`), turns a checkout into published rows. Since the documentation subsystem landed it covers two corpora at once: JS/TS files and Markdown/MDX files are discovered by a single filesystem traversal, written into the same `files` and `chunks` tables inside a single `BEGIN IMMEDIATE`…`COMMIT`, and covered by a single structural snapshot digest. What is *not* shared is ranking: code text goes to `chunks_fts`, documentation text goes to `docs_fts`, and the two vector planes are disjoint tables. What is also not shared is the contract clock: a code-extractor bump re-chunks only code, a Markdown-chunker bump re-chunks only documentation, and both feed one digest. The seam between "shared storage and lifecycle" and "separate ranking and versioning" is the interesting part of this file, and most of the pipeline's added complexity exists to hold that seam in place.
+One function, `index_repo_impl`, turns a checkout into published rows. JavaScript/TypeScript, Rust, and Markdown/MDX files are discovered by one filesystem traversal and written inside one `BEGIN IMMEDIATE`…`COMMIT`, but they do not share one invalidation digest. Code text goes to `chunks_fts`, documentation text goes to `docs_fts`, and the vector planes are disjoint. `src/publication.rs` computes code, documentation, and provenance components, then folds them into `publication_snapshot` (`meta.snapshot`). The fold is not itself a gate.
 
 ## Entry points and the single traversal
 
@@ -8,7 +8,7 @@ Three production functions start an index run — `incremental_refresh_repo_with
 
 The first act is one traversal, entered through the generic API. `corpus::repository_inventory` (`src/indexer.rs:385`) is a thin wrapper (`src/docs/corpus.rs:156-161`) that builds a `DocumentationCollector` and passes it as a consumer to `walk::repository_inventory` (`:177-178`), whose signature is `fn repository_inventory<C: RepositoryInventoryConsumer>(root, consumer) -> Result<RepositoryInventory<C::Output>>` (`src/walk.rs:187-192`). The traversal engine is `src/walk/inventory.rs:28-220`: it descends with two independent per-plane descent bits carried on every `WalkTask` (`src/walk/inventory.rs:11-23`, seeded at `:55-59`), selects code files itself (`:199-201`), and only after the stack drains calls the consumer's `finish` (`:214`), where `acquire_candidates` reads and parses every admitted document (`src/docs/corpus.rs:354-419`). Anyone looking for the code-vs-consumer descent policy will find it in `walk`, not in `corpus`; what `corpus` owns is documentation membership, capture, and parsing.
 
-The walk returns `RepositoryInventory<T> { files, rejections, consumer }` (`src/walk.rs:49-53`), generic over the consumer's output so the walk layer's type surface names no documentation type. `repository_inventory_with_consumer` destructures that and flattens it into the shape the indexer reads, `RepositoryCorpus { files, rejections, documents, decisions }` (`src/docs/corpus.rs:67-72`, built at `:179-188`) — a re-shape, not a re-classification, since `rejections` stays `crate::walk::WalkRejection`. `files` stays code-only by contract (doc comment at `src/walk.rs:46-47`) so that `WorkspaceMap::discover_with_fs` (`src/indexer.rs:400-401`), dependency discovery, and module resolution receive exactly the input they received before documentation existed.
+The walk returns `RepositoryInventory<T> { files, cargo_manifests, rejections, consumer }`, generic over the consumer's output so the walk layer's type surface names no documentation type. The documentation wrapper flattens that into the shape the indexer reads, retaining code files, Cargo manifests, walk rejections, documents, and admission decisions. `files` stays code-only by contract so workspace discovery, dependency discovery, and module resolution do not consume documentation paths.
 
 Admission is decided inside that walk. The consumer's descent bit starts as `consumer.is_active()` (`src/walk/inventory.rs:58`), which the collector answers `!self.options.include.is_empty()` (`src/docs/corpus.rs:281-283`), so an empty `docs_include` costs the traversal nothing beyond one virtual call per surviving entry. Gating is extension-first: `is_document_path` accepts lowercase `.md`/`.mdx` *before* include globs are consulted (`src/docs/corpus.rs:581-585`), so an include glob that matches a `.ts` file yields an `unsupported-extension` decision (`:317-322`) rather than a second admission of a file the code plane already owns. `CorpusOptions` also carries `max_file_bytes`, defaulted to 4 MiB (`src/docs/corpus.rs:16, 34-42`), and the indexer supplies only `include`/`exclude` (`src/indexer.rs:387-391`), inheriting that cap.
 
@@ -22,23 +22,23 @@ The preparation closure (`:441-641`) runs in this order:
 
 | Step | Lines | What it touches |
 |---|---|---|
-| `ensure_extraction_version` | `:442` → `:790` | Code hashes only |
-| `ensure_documentation_chunk_format` | `:443` → `:822` | Returns `documentation_format_changed` |
-| Read `stored` from `files WHERE origin!='dependency'` | `:444-462` | Both corpora |
-| Extraction-reset decision | `:476-490` | Truncates the disposable plane |
-| `replace_documentation_inventory` | `:492` → `:889` | `doc_inventory` wholesale |
-| Code loop | `:495-561` | `files`, `chunks`, `chunks_fts`, structural tables |
-| Documentation loop | `:562-608` | `files`, `chunks`, `doc_chunk_meta`, `docs_fts` |
-| Shared removal diff | `:609-614` | Both corpora |
-| Capture `previous` projection identity | `:616-624` | Read of the three markers |
+| Capture `previous` projection/checker identity | preparation start | Prior code/projection/resolution and checker markers |
+| `ensure_format_contracts` | preparation start | Returns the changed format ids and selectively blanks affected code hashes |
+| Provenance and Rust context checks | preparation start | Provenance format plus per-file Rust edition context |
+| Read `stored` from `files WHERE origin!='dependency'` | before replacement | Both corpora |
+| Full-refresh reset | before loops | Truncates the disposable plane only in `FullRefresh` mode |
+| `replace_documentation_inventory` | before loops | `doc_inventory` wholesale |
+| Code loop | first replacement loop | `files`, `chunks`, `chunks_fts`, format-specific rows |
+| Documentation loop | second replacement loop | `files`, `chunks`, `doc_chunk_meta`, provenance, `docs_fts` |
+| Shared removal diff | after loops | Both corpora |
 | Dependency discover / plan / prepare | `:630-634` | Filesystem reads and parsing |
-| `DELETE FROM meta` for three marker keys | `:636-639` | `snapshot`, `projection_version`, `resolution_hash` |
+| Unpublish identity markers | before publication closure | `snapshot`, `code_digest`, `documentation_digest`, projection/resolution, provenance digest |
 
-Two orderings there are load-bearing and easy to misread. First, dependency *reading and parsing* happens inside the transaction but in the preparation closure, before the markers are deleted; only `synchronize_instances` and `index_dependency_files` are publication work (`:650-651`). Doing the I/O inside the outer transaction is what lets a transient dependency failure restore the previous canonical rows and the previous markers together (comment at `:626-629`). Second, `ProjectionIdentity::read` at `:623` captures `previous` *before* the marker delete at `:636` — if it ran after, the republish check below could never fire.
+Two orderings there are load-bearing and easy to misread. First, dependency *reading and parsing* happens inside the transaction but in the preparation closure, before the markers are deleted; only `synchronize_instances` and `index_dependency_files` are publication work (`:650-651`). Doing the I/O inside the outer transaction is what lets a transient dependency failure restore the previous canonical rows and the previous markers together (comment at `:626-629`). Second, `PreviousPublication::read` captures the prior code digest, documentation digest, and resolution hash *before* the marker delete — if it ran after, neither projection reuse nor documentation-vector lifecycle comparison could work.
 
-The publication closure (`:649-722`) then runs dependency instance sync, dependency file insert, `embed::materialize_cached_embeddings` gated on `outcome.indexed > 0` (`:658-660`), `resolve_module_edges` (which reads through `code_files`, `src/indexer.rs:1596`/`:1647`), the `root` meta row, `compute_resolution_hash`, and `compute_snapshot_with_resolution` (`:668-669`). Checker retention is applied at `:673-678`, returning whether batches changed. The projection is then either republished or rebuilt, and finally — only if the snapshot digest moved — documentation vector generations are rematerialized at `:719`.
+The publication closure then synchronizes dependency instances, inserts dependency files, materializes cached code embeddings when new occurrences were indexed, resolves module edges, publishes projection identity, computes the provenance digest, and calls `publication::Identities::compute`. Checker retention compares and, when safe, rebinds against the code digest. Structural projection reuse also compares the code digest, so a docs-only edit skips the rebuild. The four identity rows are then published together. Documentation generations are rematerialized provider-free when extraction reset, the prior documentation digest differs, or a current docs profile lacks readiness. The digest comparison also purges materialized rows for obsolete text-contract profiles that the current-profile readiness scan cannot see; this remains keyed by the documentation digest rather than by the publication fold.
 
-The republish branch requires `previous == current && !checker_batches_changed` (`:686`). A matching `ProjectionIdentity` alone is not sufficient; dropping or preserving checker batches forces the rebuild path. The two branches also write markers differently: republish calls `current.publish(conn)` and writes all three (`:695`), while the rebuild branch gets `snapshot` and `projection_version` from `rebuild_projection_with_timing` (`src/structural.rs:641, 646`) and writes `resolution_hash` separately at `src/indexer.rs:702-706`.
+Projection is skipped only when extraction did not reset, the active code contract did not change, the previous code digest equals the new one, and checker publication did not change. Otherwise it is rebuilt against the new code digest. `Identities::publish` is the single writer of `code_digest`, `documentation_digest`, `documentation_provenance_digest`, and the folded `snapshot`, avoiding divergent marker-writing branches.
 
 ## Where the planes diverge
 
@@ -50,29 +50,29 @@ flowchart TD
   INV --> WS["WorkspaceMap::discover_with_fs — code paths only"]
   INV --> BEGIN["BEGIN IMMEDIATE :440"]
   WS --> BEGIN
-  BEGIN --> CLOCKS["ensure_extraction_version + ensure_documentation_chunk_format"]
+  BEGIN --> CLOCKS["ensure per-format, provenance, and Rust-context contracts"]
   CLOCKS --> STORED["stored = files WHERE origin != dependency (both corpora)"]
-  STORED --> RESET["extraction reset? truncate disposable plane"]
+  STORED --> RESET["FullRefresh? truncate disposable plane"]
   RESET --> DOCINV["replace_documentation_inventory (doc_inventory)"]
   DOCINV --> CODE["code loop :495-561"]
   DOCINV --> DOCS["docs loop :562-608"]
   CODE --> CFAN["chunks_fts, symbols, imports, exports, refs, events, flow tables"]
-  DOCS --> DFAN["doc_chunk_meta, docs_fts"]
+  DOCS --> DFAN["doc_chunk_meta, doc_file_provenance, docs_fts"]
   CFAN --> REMOVE["shared removal diff :609-614"]
   DFAN --> REMOVE
   REMOVE --> DEP["dependency discover / plan / prepare :630-634"]
-  DEP --> DELM["DELETE meta: snapshot, projection_version, resolution_hash :636"]
+  DEP --> DELM["unpublish component digests, fold, projection and provenance markers"]
   DELM --> PUB["publication closure :649"]
-  PUB --> SNAP["compute_snapshot_with_resolution"]
-  SNAP --> PROJ["republish identical projection OR rebuild"]
-  PROJ --> REMAT["if snapshot changed: rematerialize_cached_generations :719"]
+  PUB --> SNAP["compute code + docs + provenance digests; fold publication snapshot"]
+  SNAP --> PROJ["reuse projection if code digest and checker publication are unchanged; else rebuild"]
+  PROJ --> REMAT["publish identities; restore missing docs readiness from cache"]
   REMAT --> COMMIT["COMMIT :725"]
   COMMIT --> RECON["recon::reconcile_file_policy_after_index :735"]
 ```
 
 `CODE` and `DOCS` are structurally different loops, not one loop with a branch. The code loop reads through `operation.fs`, hashes with blake3, classifies a role, derives a format, and short-circuits when hash *and* `corpus=='code'` *and* format all match (`:518-529`). Its replacement path is ordered defensively: `extract_file` runs first, outside the database (`:533`); only on `Ok` does `delete_file` then `insert_file` run (`:535-548`). On `Err` the old row is still deleted and an `"extract"` rejection recorded (`:554-559`) — the file leaves the corpus with no insert. Two further paths exist that a summary would miss: a retryable read aborts the whole index (`:503-505`), and an inventory race `continue`s *without* inserting into `seen` (`:502`), silently routing that path into the removal loop.
 
-The documentation loop iterates `inventory.documents`, already read and parsed. Its short-circuit takes an extra term — `!documentation_format_changed` (`:569`) — which is the only thing that can force re-chunking of a document whose bytes did not move. Its replacement path is unconditional: delete the old row, then `insert_documentation_file` (`:585-598`). Crucially, it has **no rejection path at all**. Every `ensure!` inside `insert_documentation_file` (`:915-932`, `:976-980`, `:985-990`, `:1010-1015`, `:1021-1026`) propagates out of the preparation closure and rolls back the whole index. One malformed captured document aborts the code refresh too. That is the price of the shared transaction, and the design accepts it deliberately: crash recovery should expose exactly one complete publication, never new docs beside old code.
+The documentation loop iterates `inventory.documents`, already read and parsed. Its short-circuit requires that the document's format is absent from `changed_formats`, so a Markdown or MDX contract change re-chunks unchanged bytes without touching the other formats. Its replacement path is unconditional: delete the old row, then `insert_documentation_file`. Crucially, it has **no rejection path at all**. Every `ensure!` inside insertion propagates out of the preparation closure and rolls back the whole index. One malformed captured document aborts the code refresh too: crash recovery exposes one complete publication, never new docs beside old code.
 
 Both loops write into the same `seen` and `published` sets, and one shared rule at `:609-614` deletes anything in `existing` not in `seen` and computes `outcome.removed` from `previous_paths.difference(&published)`. In `FullRefresh` the removal loop is a no-op — `existing` is `HashMap::new()` from `:467-471` — but `previous_paths` was taken from `stored` before that substitution, so `outcome.removed` stays meaningful on both paths.
 
@@ -81,17 +81,17 @@ The write fan-out differs sharply:
 | Corpus | Function | Tables written |
 |---|---|---|
 | code | `insert_file` (`src/indexer.rs:1070`) | `files`, `chunks`, `chunks_fts`, `symbols`, `imports`, `exports`, `contract_imports`, `contract_exports`, `events`, `member_calls`, `refs`, `entity_sites`, flow tables |
-| docs | `insert_documentation_file` (`:909`) | `files`, `chunks`, `doc_chunk_meta`, `docs_fts` |
+| docs | `insert_documentation_file` | `files`, `chunks`, `doc_chunk_meta`, `doc_file_provenance`, `docs_fts` |
 
 `docs_fts` is a separate FTS5 table (`src/store.rs:38-46`) whose rowids are `chunks.id` values. That separation is not cosmetic: FTS5 term statistics are per-table, so admitting a documentation corpus into `chunks_fts` would move code BM25 scores. The boundary itself lives in three places at once — the `CHECK(corpus IN ('code','docs'))` constraint on `files` (`src/store.rs:337`), four triggers making `doc_chunk_meta` and `files.corpus` mutually consistent (`:382-424`), and the `code_files`/`code_chunks` views (`:429-437`). Seventeen source files read through those views rather than repeating a negative predicate: `embed.rs`, `search.rs`, `query.rs`, `recon.rs`, `mcp.rs`, `semantic.rs`, `semantic_query.rs`, `dependency.rs`, `structural.rs`, `surface.rs`, `checker/enrich.rs`, `checker/package_gate.rs`, `scouting/plan.rs`, `scouting/repository.rs`, `store.rs`, `indexer.rs`, and `embed/tests.rs`. It is the views, not the null `name` column, that keep documentation out of the deterministic exact-identifier tiers: `exact_definition_chunks` joins `code_chunks`/`code_files` (`src/search.rs:598-599, 640-641`) before `name` or `symbols` is ever consulted. Writing documentation chunks with `name=NULL` and `symbols=''` (`src/indexer.rs:958-962`) is defense in depth.
 
-## Two contract clocks, one digest
+## Per-format contract clocks, separate content digests
 
-`ensure_extraction_version` invalidates with `UPDATE files SET hash='' WHERE corpus='code'` (`src/indexer.rs:804`) — an oxc extractor bump never re-chunks Markdown. `ensure_documentation_chunk_format` persists `documentation_chunk_format_version` and returns a bool (`:822-839`) that only gates the documentation short-circuit — a Markdown contract bump never touches code rows.
+`ensure_format_contracts` compares one marker per registered format. When a format contract changes, code rows of that format have their hashes blanked and documentation rows of that format bypass the unchanged short-circuit. The legacy `extraction_version` and `documentation_chunk_format_version` markers remain compatibility diagnostics; the per-format keys are the selective invalidation authority.
 
-Both, however, feed one digest. `compute_snapshot_with_resolution` (`src/structural.rs:429`) hashes the projection version, the binary constant `EXTRACTION_VERSION`, the *persisted* `extraction_version` meta row, the binary constant `docs::CHUNK_FORMAT_VERSION`, and the *persisted* `documentation_chunk_format_version` (`:434-464`), then every `files` row including `corpus` and `format` (`:465-474`). Hashing both the binary constant and the persisted marker is what makes an interrupted or pre-upgrade state fail closed rather than presenting a stale digest as current. And because `files.corpus`/`files.format` are digest inputs, a documentation-only change rotates the shared snapshot — which is exactly what invalidates checker batches and the documentation vector readiness generation.
+`publication::compute_code_digest` hashes the code/projection contracts and their persisted markers, active code format contracts, Rust edition context, code-file and package identity, and module resolution. `compute_documentation_digest` hashes the documentation contract and marker, active docs format contracts, and docs files as `(path, hash, format)`. Hashing producer and published markers still makes interrupted or pre-upgrade state fail closed. A documentation content change leaves the code digest stable while rotating the documentation and provenance components and their fold, so it does not invalidate code-bound checker or cursor state.
 
-This diagram traces the publication half, where the two clocks converge and the docs vector plane is re-derived. Watch the `alt` block: the republish branch and the rebuild branch write the three markers by different routes.
+This diagram traces the publication half. The clocks converge only in the folded publication marker; their invalidation gates remain separate.
 
 ```mermaid
 sequenceDiagram
@@ -100,30 +100,30 @@ sequenceDiagram
   participant ROWS as files and chunks
   participant ST as structural
   participant DV as docs vector plane
-  IDX->>META: ensure_extraction_version clears hash WHERE corpus is code
-  IDX->>META: ensure_documentation_chunk_format returns changed flag
+  IDX->>META: ensure per-format contract markers; collect changed formats
+  IDX->>META: ensure provenance format and Rust edition context
   IDX->>ROWS: replace code rows then doc rows into one seen set
-  IDX->>META: DELETE snapshot, projection_version, resolution_hash
-  IDX->>ST: compute_resolution_hash then compute_snapshot_with_resolution
-  ST-->>IDX: digest over both markers and every files row
-  alt identity matches and checker batches unchanged
-    IDX->>META: current.publish writes all three markers
+  IDX->>META: unpublish component digests, fold, projection, resolution, provenance
+  IDX->>ST: compute resolution hash and publish projection identity
+  IDX->>IDX: compute code, documentation, provenance, and folded publication identities
+  alt code digest and checker publication unchanged
+    IDX->>ST: keep structural projection
   else
-    IDX->>ST: rebuild_projection_with_timing writes snapshot and projection_version
-    IDX->>META: write resolution_hash separately
+    IDX->>ST: rebuild projection against code digest
   end
-  opt snapshot digest moved
+  IDX->>META: publish all four identity rows together
+  opt extraction reset or current docs generation missing
     IDX->>DV: rematerialize_cached_generations from the embeddings cache
     DV-->>IDX: per profile: ready, or silently not ready
   end
   IDX->>IDX: COMMIT
 ```
 
-## How documentation vectors avoid coupling to the snapshot
+## How documentation vectors bind only documentation content
 
-Documentation vectors are stored twice, with two different identities. The durable copy lives in the shared content-addressed `embeddings` table keyed by `embedding_identity`, a hash of the chunk format version, the nearest heading, and the rendered body (`src/indexer.rs:1017-1026` re-derives it). A file rename, or an edit to an ancestor heading that does not change the chunk's own heading or body, reuses the cached vector. Only *readiness* is snapshot-scoped: `doc_vector_generations(snapshot, profile_id, dimensions, chunk_format_version)` (`src/store.rs:776-782`), where the presence of the row is the signal (`generation_is_ready`, `src/docs/retrieval.rs:985-995`).
+Documentation vectors are stored twice, with two different identities. The durable copy lives in the shared content-addressed `embeddings` table keyed by `embedding_identity`, a hash of the chunk format version, nearest heading, and rendered body. A file rename or ancestor-heading edit can therefore reuse the cached vector. Readiness is documentation-digest-scoped: `doc_vector_generations.snapshot` stores `documentation_digest`, and the row's presence signals a complete occurrence materialization for that profile.
 
-So when a code change rotates the snapshot, the vectors themselves are still valid but the readiness marker is not. `rematerialize_cached_generations` (`src/docs/retrieval.rs:815`) rebuilds it inside the same transaction, under its own savepoint. It asserts the passed snapshot equals `store::current_snapshot(conn)` (`:818-821`) — which is the just-published value only because of call ordering — clears every `vec_doc_embeddings_*` table plus both generation tables (`:867-886`), and rebuilds per profile. Profiles are filtered: only those whose `config_json.document_text` equals the current `CHUNK_FORMAT_VERSION` are considered (`:856-858`); others are skipped rather than marked not-ready. Each rebuild is all-or-nothing — if the occurrence count is zero, the cached row count differs, or any blob length differs from `dimensions * 4`, it returns `None` and leaves the profile without a generation row (`:938-945`).
+A code-only change leaves the documentation digest and its ready generation unchanged. A documentation change produces a new documentation digest; after the identities are published inside the transaction, `rematerialize_cached_generations` clears every disposable occurrence generation and rebuilds current profiles provider-free from the durable cache. The prior/new digest comparison makes this happen even when a contract rotation means no old profile passes the current-text-contract filter. Each rebuild is all-or-nothing: an incomplete cache or invalid blob leaves the profile without a generation row and therefore NotReady.
 
 The point of this shape is that indexing never becomes a provider operation. An incomplete cache is a normal NotReady state, not a failure. Provider calls live only in `jscout docs embed`, and the ordinary code embed path selects through `code_chunks`/`code_files` (`src/embed.rs:648, 705, 730`), so it can never request a documentation vector. `src/indexer/tests.rs:357` proves the negative by pointing the provider at `127.0.0.1:1` and asserting zero calls.
 
@@ -135,7 +135,7 @@ The reason the re-derivation is worth its cost is that both hashes are computed 
 
 ## What resets, and what survives
 
-Two reset paths exist. `FullRefresh` calls `store::reset_snapshot_state` (`src/store.rs:1261`); an incremental run whose code hashes were mass-cleared calls `store::reset_extraction_state` (`:1211`). The latter now covers the documentation plane: it clears `doc_vector_generations`, `doc_embedding_index_entries`, `doc_chunk_meta`, `doc_inventory`, and drops and recreates *both* `docs_fts` and `chunks_fts` from the shared `*_FTS_CREATE` constants (`:1219-1250`). It also calls `embed::clear_vector_rows` (`:1212`) — which truncates the `vec_*` and `vec_doc_embeddings_*` tables — and clears the recon plane (`:1217-1218`). The content-addressed `embeddings` cache and semantic memory survive; `src/store.rs:2045` pins that.
+`FullRefresh` is the only index mode that calls `store::reset_snapshot_state`; incremental contract invalidation is selective per format. `reset_snapshot_state` delegates to `reset_extraction_state`, which clears both corpora's disposable rows, FTS indexes, and occurrence vector tables while preserving the content-addressed embedding cache and semantic memory, then also clears package instances and the snapshot/projection markers.
 
 `store::delete_file` (`:1290`) early-returns when the id is absent (`:1291-1299`), calls `embed::delete_vector_rows_for_file` (`:1300`), then deletes from `docs_fts` and `chunks_fts` by chunk rowid — unconditionally, because FTS5 is not foreign-key aware — before dropping the `files` row and letting cascades take `chunks` and `doc_chunk_meta`.
 
@@ -143,18 +143,16 @@ After the commit, `recon::reconcile_file_policy_after_index` runs (`src/indexer.
 
 ## Limits worth naming
 
-**The extraction-reset heuristic is corpus-coupled by its denominator.** `cleared` counts only rows with `corpus == CODE_CORPUS && hash.is_empty()` (`src/indexer.rs:476-479`), but the threshold is `cleared * 2 >= existing.len()` (`:481`) and `existing` holds both corpora. In a repository where documentation is more than about a third of the non-dependency files, an extractor bump that clears every code hash can fail the 50% test and fall back to per-file replacement — the pathological path the reset exists to avoid. This is the one place documentation admission changes code-path behavior, and no test covers it.
-
 **`IndexOutcome` counters are corpus-blind.** `indexed`, `unchanged`, `removed`, and `chunks` mix the two corpora with no attribution; `refs` remains code-only. `rejected`/`rejections` are corpus-blind too, since inventory rejections from the documentation scanner land there. The summary line printed by `jscout index` (`src/commands/core.rs:295-303`) therefore cannot tell a user that Markdown admission changed their numbers.
 
 **Failure visibility differs by corpus.** A code read error becomes an `IndexRejection` in the outcome; a document read error becomes a `doc_inventory` decision row with rule `read-error` (`src/docs/corpus.rs:410-416`), visible only through `jscout docs status`. `outcome.rejected` undercounts documentation problems.
 
-**A `.md` edit alone does not trigger a watch generation.** `EventClassifier::classify` routes source events through `walk::is_indexable` (`src/watch.rs:521`), which accepts only the eight JS/TS extensions (`src/walk.rs:10, 15-22`), so an existing Markdown file that changes emits no signal at all. Documentation is reindexed only when a code change or a boundary event triggers a refresh. This is G24 phase 4, and it is unbuilt; `16-incremental-and-watch.md` traces the classifier ladder.
+**Documentation-aware watch classification is built.** The watcher carries a `DocumentationPathPolicy`, classifies admitted file and directory events as documentation signals, and refreshes that policy when configuration or ignore boundaries change. A docs-only generation can rotate the documentation/provenance identities while leaving code-bound enrichment reusable.
 
-**The snapshot log does not exist.** `snapshot_log` occurs in the tree only in `PLAN.md:3266` and two design notes under `docs/plans/`, never in `src/`; the durable ledger it describes is deferred out of the numbered G24 phases. `08-storage-schema.md` covers what publication writes instead. Relatedly, `PLAN.md:3184` still heads the section "Proposed G24" although phases 1 and 2 are merged.
+[`PLAN.md`](../../PLAN.md) is the normative source for numbered-gate and deferred-ledger status; this chapter records only the implemented indexing path.
 
 **One test fixture does not match production.** `src/store.rs:2099-2103` creates `vec_doc_embeddings_2` with a `snapshot TEXT PARTITION KEY` column that `ensure_vector_table` (`src/docs/retrieval.rs:973-983`) does not create.
 
 ## What the tests pin
 
-There are 36 `#[test]` functions in `src/indexer/tests.rs`, with the documentation-integration block at lines 32-810. The negative-space tests carry the weight. `shared_index_routes_markdown_without_polluting_code_search_or_graphs` (`:33`) asserts zero documentation rows in `chunks_fts` and empty `symbols`/`imports`/`exports`/`refs`/`events`/`module_edges`/`graph_nodes`/`resolved_edges` for the Markdown file. `empty_documentation_policy_removes_the_prior_docs_corpus` (`:409`) asserts `(indexed, unchanged, removed) == (0, 1, 2)` with `main.ts` untouched. `incremental_index_repairs_explicit_corpus_and_format_mismatches` (`:457`) and its MDX sibling (`:496`) corrupt the columns directly in SQL and prove the next run repairs them even at an identical hash. `documentation_contract_change_rechunks_docs_and_rotates_the_shared_snapshot` (`:752`) is the decoupling proof: `indexed=1, unchanged=1`, the code chunk keeps its rowid, the documentation sidecar is rebuilt, and the shared snapshot rotates. `failure_after_canonical_replacement_restores_the_last_good_publication` (`:692`) uses the injection seam at `src/indexer.rs:330` to prove both planes roll back together — old snapshot, old code chunk content, and old `docs_fts` body all survive as a unit.
+Indexer tests pin routing isolation, policy removal, corpus/format repair, atomic rollback, and the new identity matrix: docs-only changes preserve the code digest and checker projection, code-only changes preserve the documentation digest and ready docs vectors, and failures restore every component digest plus the fold together.

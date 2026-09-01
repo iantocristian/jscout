@@ -8,11 +8,13 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use super::{
-    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolProfile,
+    AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolAccess, ToolProfile,
     call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
     exhaustive_telemetry_metrics, expansion_role_metrics, initialize_result, log_request,
-    render_bounded_items, render_tool_result, search_options_from_args, semantic_artifact_metrics,
-    server_instructions, sum_durations, tool_defs,
+    render_bounded_items, render_bounded_object_arrays, render_tool_result,
+    search_options_from_args, semantic_artifact_metrics, server_instructions,
+    settle_unbudgeted_response, settle_value_rendered_bytes, sum_durations, telemetry_snapshot,
+    tool_access, tool_defs,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
 
@@ -47,7 +49,8 @@ fn capture_code_read_surfaces(
     BTreeMap<&'static str, String>,
     BTreeSet<&'static str>,
 )> {
-    let snapshot = structural::current_snapshot(conn)?;
+    let identities = crate::publication::Identities::read(conn)?;
+    let snapshot = identities.code.clone();
     let finish_anchor: String = conn.query_row(
         "SELECT node_key FROM graph_nodes
          WHERE node_kind='symbol' AND display_name='finish'
@@ -62,7 +65,6 @@ fn capture_code_read_surfaces(
         [],
         |row| row.get(0),
     )?;
-    let sentinel = "s".repeat(snapshot.len());
     let mut surfaces = BTreeMap::new();
     let mut covered_tools = BTreeSet::new();
     let mut capture = |label: &'static str,
@@ -83,8 +85,31 @@ fn capture_code_read_surfaces(
             rendered.contains(expected_fragment),
             "MCP differential probe `{label}` did not exercise `{expected_fragment}`: {rendered}"
         );
+        let mut value: serde_json::Value = serde_json::from_str(&rendered)?;
+        assert_eq!(
+            value.get("snapshot"),
+            Some(&json!(snapshot)),
+            "MCP code surface `{label}` returned the wrong plane identity: {rendered}"
+        );
+        assert_eq!(
+            value.get("publication_snapshot"),
+            Some(&json!(identities.publication)),
+            "MCP code surface `{label}` returned the wrong publication identity: {rendered}"
+        );
+        assert_eq!(
+            count_json_key(&value, "snapshot"),
+            1,
+            "MCP code surface `{label}` repeated snapshot: {rendered}"
+        );
+        assert_eq!(
+            count_json_key(&value, "publication_snapshot"),
+            1,
+            "MCP code surface `{label}` repeated publication_snapshot: {rendered}"
+        );
+        value["snapshot"] = json!("<code-digest>");
+        value["publication_snapshot"] = json!("<publication-snapshot>");
         covered_tools.insert(tool);
-        surfaces.insert(label, rendered.replace(&snapshot, &sentinel));
+        surfaces.insert(label, serde_json::to_string(&value)?);
         Ok(())
     };
 
@@ -185,10 +210,75 @@ fn capture_code_read_surfaces(
             "reconnaissance_limit": 0,
             "response_bytes": 100_000
         }),
-        "\"files\": 2",
+        "\"files\":2",
+    )?;
+    capture(
+        "semantic_memory/discovery",
+        "semantic_memory",
+        json!({
+            "query": "differential memory",
+            "vector": false,
+            "response_bytes": 100_000
+        }),
+        "annotation",
+    )?;
+    capture(
+        "semantic_memory/body",
+        "semantic_memory",
+        json!({
+            "artifact": 1,
+            "view": "body",
+            "response_bytes": 100_000
+        }),
+        "differential memory",
     )?;
 
     Ok((snapshot, surfaces, covered_tools))
+}
+
+fn seed_code_surface_memory(root: &Path, conn: &Connection) -> Result<()> {
+    let snapshot = structural::current_snapshot(conn)?;
+    let rendered = call_tool(
+        root,
+        conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "annotate",
+        &json!({
+            "type": "annotation",
+            "body": { "claim": "differential memory" },
+            "supports": [{
+                "claim_path": "/claim",
+                "anchor": "sym:src/service.ts#::finish@1",
+                "evidence_file": "src/service.ts",
+                "evidence_start_line": 1,
+                "evidence_end_line": 1,
+                "confidence": "likely"
+            }],
+            "confidence": "likely",
+            "snapshot": snapshot
+        }),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(value["freshness"], "fresh");
+    Ok(())
+}
+
+fn count_json_key(value: &serde_json::Value, key: &str) -> usize {
+    match value {
+        serde_json::Value::Object(object) => {
+            usize::from(object.contains_key(key))
+                + object
+                    .values()
+                    .map(|value| count_json_key(value, key))
+                    .sum::<usize>()
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().map(|value| count_json_key(value, key)).sum()
+        }
+        _ => 0,
+    }
 }
 
 fn assert_code_read_surfaces_equal(
@@ -240,6 +330,11 @@ fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Resul
         &json!({ "query": "blue release" }),
     )?;
     let value: serde_json::Value = serde_json::from_str(&rendered)?;
+    let identities = crate::publication::Identities::read(&conn)?;
+    assert_eq!(value["snapshot"], identities.documentation);
+    assert_eq!(value["publication_snapshot"], identities.publication);
+    assert_eq!(count_json_key(&value, "snapshot"), 1);
+    assert_eq!(count_json_key(&value, "publication_snapshot"), 1);
     assert_eq!(value["hits"][0]["path"], "README.md");
     assert_eq!(value["hits"][0]["heading"], "Deployment");
     assert_eq!(value["hits"][0]["source_state"], "current");
@@ -250,6 +345,12 @@ fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Resul
     assert_eq!(value["retrieval"]["vector"], "disabled");
     assert_eq!(value["retrieval"]["freshness"], "disabled");
     assert_eq!(value["retrieval"]["max_rank_movement"], 2);
+    for private in ["snapshot", "file_hash", "source_start", "source_end"] {
+        assert!(
+            value["hits"][0].get(private).is_none(),
+            "documentation hit repeated private field `{private}`: {value}"
+        );
+    }
     assert!(
         tool_defs(ToolProfile::Baseline, true)
             .as_array()
@@ -259,7 +360,7 @@ fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Resul
     );
     assert!(
         server_instructions(ToolProfile::Structural, true)
-            .contains("shares the repository snapshot")
+            .contains("has a separate documentation snapshot")
     );
     let outline = call_tool(
         repo.path(),
@@ -391,7 +492,10 @@ fn disabled_documentation_is_absent_and_rejected_at_the_mcp_boundary() -> Result
                 .iter()
                 .all(|tool| tool["name"] != "documentation_search")
         );
-        assert!(!server_instructions(profile, false).contains("documentation_search"));
+        let instructions = server_instructions(profile, false);
+        assert!(!instructions.contains("documentation_search"));
+        assert!(instructions.contains("plane digest as snapshot"));
+        assert!(instructions.contains("publication_snapshot"));
     }
 
     let repo = tempfile::tempdir()?;
@@ -437,8 +541,10 @@ fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()
 
     let incremental = store::open_path(&state.path().join("incremental.db"))?;
     indexer::index_repo(repo.path(), &incremental)?;
+    seed_code_surface_memory(repo.path(), &incremental)?;
     let (code_snapshot, code_surfaces, covered_tools) =
         capture_code_read_surfaces(repo.path(), &incremental)?;
+    let code_publication = crate::publication::current_publication_snapshot(&incremental)?;
 
     fs::write(
         repo.path().join("README.md"),
@@ -458,7 +564,9 @@ fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()
     indexer::index_repo(repo.path(), &incremental)?;
     let (incremental_snapshot, incremental_surfaces, _) =
         capture_code_read_surfaces(repo.path(), &incremental)?;
-    assert_ne!(code_snapshot, incremental_snapshot);
+    let documentation_publication = crate::publication::current_publication_snapshot(&incremental)?;
+    assert_eq!(code_snapshot, incremental_snapshot);
+    assert_ne!(code_publication, documentation_publication);
     assert_code_read_surfaces_equal(
         &code_surfaces,
         &incremental_surfaces,
@@ -467,6 +575,7 @@ fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()
 
     let fresh = store::open_path(&state.path().join("fresh.db"))?;
     indexer::index_repo(repo.path(), &fresh)?;
+    seed_code_surface_memory(repo.path(), &fresh)?;
     let (fresh_snapshot, fresh_surfaces, _) = capture_code_read_surfaces(repo.path(), &fresh)?;
     assert_eq!(incremental_snapshot, fresh_snapshot);
     assert_code_read_surfaces_equal(&code_surfaces, &fresh_surfaces, "fresh docs index");
@@ -478,8 +587,7 @@ fn documentation_admission_is_inert_across_mcp_code_read_surfaces() -> Result<()
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<BTreeSet<_>>();
-    let deliberately_excluded =
-        BTreeSet::from(["annotate", "documentation_search", "semantic_memory"]);
+    let deliberately_excluded = BTreeSet::from(["annotate", "documentation_search"]);
     let accounted_tools = covered_tools
         .union(&deliberately_excluded)
         .copied()
@@ -653,12 +761,7 @@ fn rust_semantic_search_expand_stays_lexical_at_mcp_boundary() -> Result<()> {
         .unwrap_or_else(|| panic!("missing compact Rust hit: {rendered}"));
 
     assert!(hit.get("anchor").is_none());
-    let calls = hit["followups"]["calls"]
-        .as_array()
-        .expect("file-compatible follow-up calls");
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["tool"], "file_outline");
-    assert_eq!(calls[0]["arguments"]["path"], "native.rs");
+    assert!(hit.get("followups").is_none());
 
     assert_eq!(response["graph"]["projection"], "paths");
     assert_eq!(response["graph"]["seeds"], json!([]));
@@ -777,7 +880,7 @@ fn semantic_search_formats_scope_is_enforced_and_echoed_at_mcp_boundary() -> Res
 }
 
 #[test]
-fn scoped_search_followups_preserve_formats_through_definition_and_who_uses() -> Result<()> {
+fn scoped_search_anchors_preserve_formats_through_definition_and_who_uses() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
         repo.path().join("target.ts"),
@@ -825,21 +928,18 @@ fn scoped_search_followups_preserve_formats_through_definition_and_who_uses() ->
             })
         })
         .unwrap_or_else(|| panic!("TypeScript target hit: {search}"));
-    let calls = hit["followups"]["calls"]
-        .as_array()
-        .expect("format-scoped per-tool follow-ups");
     assert_eq!(hit["used_by"], json!(["scopedFormatTarget: 1 sites"]));
-    let arguments_for = |tool: &str| {
-        &calls
-            .iter()
-            .find(|call| call["tool"] == tool)
-            .unwrap_or_else(|| panic!("{tool} follow-up: {calls:?}"))["arguments"]
-    };
-    let definition_arguments = arguments_for("definition");
-    let who_uses_arguments = arguments_for("who_uses");
-    assert_eq!(definition_arguments["formats"], json!(["typescript"]));
-    assert_eq!(who_uses_arguments["formats"], json!(["typescript"]));
-    assert!(arguments_for("neighborhood").get("formats").is_none());
+    assert!(hit.get("followups").is_none());
+    let definition_arguments = json!({
+        "anchor": hit["anchor"],
+        "snapshot": search["snapshot"],
+        "formats": ["typescript"]
+    });
+    let who_uses_arguments = definition_arguments.clone();
+    let neighborhood_arguments = json!({
+        "anchor": hit["anchor"],
+        "snapshot": search["snapshot"]
+    });
 
     let definition = call_tool(
         repo.path(),
@@ -848,7 +948,7 @@ fn scoped_search_followups_preserve_formats_through_definition_and_who_uses() ->
         ToolProfile::Structural,
         SourceView::Full,
         "definition",
-        definition_arguments,
+        &definition_arguments,
     )?;
     let definition: serde_json::Value = serde_json::from_str(&definition)?;
     assert_eq!(definition["definitions"][0]["target"]["at"], "target.ts:1");
@@ -860,7 +960,7 @@ fn scoped_search_followups_preserve_formats_through_definition_and_who_uses() ->
         ToolProfile::Structural,
         SourceView::Full,
         "who_uses",
-        who_uses_arguments,
+        &who_uses_arguments,
     )?;
     assert!(usages.contains("ts_caller.ts"));
     assert!(!usages.contains("js_caller.js"));
@@ -872,7 +972,7 @@ fn scoped_search_followups_preserve_formats_through_definition_and_who_uses() ->
         ToolProfile::Structural,
         SourceView::Full,
         "neighborhood",
-        arguments_for("neighborhood"),
+        &neighborhood_arguments,
     )?;
     let neighborhood: serde_json::Value = serde_json::from_str(&neighborhood)?;
     assert_eq!(neighborhood["anchor"], hit["anchor"]);
@@ -1122,13 +1222,15 @@ fn profile_instructions_encode_g23_workflows_and_capabilities() {
             "response_budget_too_small",
             "minimum_bytes=N",
             "response_bytes=N",
-            "sym: anchor plus its snapshot",
-            "strip only the leading file:",
+            "one returned sym: anchor plus the response snapshot",
+            "For a file hit, pass its path to file_outline",
+            "plane digest as snapshot",
+            "canonical indexed publication identity as publication_snapshot",
             "Human-authored symbol mode",
             "spans all registered code formats by default",
             "original search's explicit origins and formats allowlists",
             "never synthesize it from echoed scope.origins or scope.formats",
-            "corpus, file_roles, origins, formats, and snapshot",
+            "response snapshot and echoed scope fields corpus, file_roles, origins, and formats",
             "convention",
             "safe",
             "localize first",
@@ -2086,13 +2188,21 @@ fn definition_renders_configured_source_view_with_a_shared_byte_ceiling() -> Res
         &json!({ "symbol": "run", "source_bytes": 512, "debug": true }),
     )?;
     let debug: serde_json::Value = serde_json::from_str(&debug)?;
-    assert!(debug.is_array());
-    assert_eq!(debug[0]["source"], debug[0]["source_meta"]["text"]);
+    assert!(debug.is_object());
+    assert!(debug["definitions"][0]["source"].is_string());
+    assert!(debug["definitions"][0]["source_meta"].get("text").is_none());
+    assert!(
+        debug["definitions"][0]["source_meta"]
+            .get("byte_limit")
+            .is_none()
+    );
+    assert_eq!(count_json_key(&debug, "snapshot"), 1);
+    assert_eq!(count_json_key(&debug, "publication_snapshot"), 1);
     Ok(())
 }
 
 #[test]
-fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
+fn search_anchors_round_trip_exact_same_named_methods() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
         repo.path().join("methods.ts"),
@@ -2151,13 +2261,11 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
         .as_array()
         .and_then(|hits| hits.iter().find(|hit| hit["anchor"] == second_class_anchor))
         .unwrap_or_else(|| panic!("search hit for exact second class: {search}"));
-    let followups = &hit["followups"];
-    assert_eq!(
-        followups["tools"],
-        json!(["definition", "who_uses", "neighborhood"])
-    );
-    assert_eq!(followups["arguments"]["anchor"], second_class_anchor);
-    assert_eq!(followups["arguments"]["snapshot"], search["snapshot"]);
+    assert!(hit.get("followups").is_none());
+    let class_arguments = json!({
+        "anchor": hit["anchor"],
+        "snapshot": search["snapshot"]
+    });
 
     let baseline_search = call_tool(
         repo.path(),
@@ -2174,10 +2282,7 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
         }),
     )?;
     let baseline_search: serde_json::Value = serde_json::from_str(&baseline_search)?;
-    assert_eq!(
-        baseline_search["hits"][0]["followups"]["tools"],
-        json!(["definition", "who_uses"])
-    );
+    assert!(baseline_search["hits"][0].get("followups").is_none());
 
     let definition = call_tool(
         repo.path(),
@@ -2186,12 +2291,14 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
         ToolProfile::Structural,
         SourceView::Full,
         "definition",
-        &followups["arguments"],
+        &class_arguments,
     )?;
     let definition_value: serde_json::Value = serde_json::from_str(&definition)?;
+    assert!(definition_value.get("resolution").is_none());
+    assert_eq!(definition_value["snapshot"], search["snapshot"]);
     assert_eq!(
-        definition_value["resolution"]["resolved_anchor"],
-        second_class_anchor
+        definition_value["publication_snapshot"],
+        search["publication_snapshot"]
     );
     assert!(
         definition_value["definitions"][0]["source"]
@@ -2206,6 +2313,36 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
     assert_eq!(
         definition_value["response"]["rendered_bytes"],
         definition.len()
+    );
+
+    let re_resolved_definition = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        &json!({
+            "anchor": second_class_anchor,
+            "snapshot": search["publication_snapshot"]
+        }),
+    )?;
+    let re_resolved_value: serde_json::Value = serde_json::from_str(&re_resolved_definition)?;
+    assert_eq!(
+        re_resolved_value["resolution"]["requested_anchor"],
+        second_class_anchor
+    );
+    assert_eq!(
+        re_resolved_value["resolution"]["resolved_anchor"],
+        second_class_anchor
+    );
+    assert_eq!(
+        re_resolved_value["resolution"]["anchor_status"],
+        "re-resolved"
+    );
+    assert_eq!(
+        re_resolved_value["response"]["rendered_bytes"],
+        re_resolved_definition.len()
     );
 
     let method_arguments = json!({
@@ -2223,10 +2360,7 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
         &method_arguments,
     )?;
     let method_definition: serde_json::Value = serde_json::from_str(&method_definition)?;
-    assert_eq!(
-        method_definition["resolution"]["resolved_anchor"],
-        second_anchor
-    );
+    assert!(method_definition.get("resolution").is_none());
     assert!(
         method_definition["definitions"][0]["source"]
             .as_str()
@@ -2243,7 +2377,7 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
         &method_arguments,
     )?;
     let usages: serde_json::Value = serde_json::from_str(&usages_rendered)?;
-    assert_eq!(usages["resolution"]["resolved_anchor"], second_anchor);
+    assert!(usages.get("resolution").is_none());
     assert_eq!(usages["response"]["matched_usages"], 2);
     assert_eq!(
         usages["targets"][0]["usages"]["likely"]["methods.ts"][0],
@@ -2256,6 +2390,34 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
     assert!(!usages_rendered.contains("targetName"));
     assert!(!usages_rendered.contains("candidateCount"));
 
+    let debug_re_resolved = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "who_uses",
+        &json!({
+            "anchor": second_anchor,
+            "snapshot": search["publication_snapshot"],
+            "origins": ["repository"],
+            "debug": true
+        }),
+    )?;
+    let debug_re_resolved: serde_json::Value = serde_json::from_str(&debug_re_resolved)?;
+    assert_eq!(
+        debug_re_resolved["resolution"]["requested_anchor"],
+        second_anchor
+    );
+    assert_eq!(
+        debug_re_resolved["resolution"]["resolved_anchor"],
+        second_anchor
+    );
+    assert_eq!(
+        debug_re_resolved["resolution"]["anchor_status"],
+        "re-resolved"
+    );
+
     let neighborhood = call_tool(
         repo.path(),
         &conn,
@@ -2263,10 +2425,31 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
         ToolProfile::Structural,
         SourceView::Full,
         "neighborhood",
-        &followups["arguments"],
+        &class_arguments,
     )?;
     let neighborhood: serde_json::Value = serde_json::from_str(&neighborhood)?;
     assert_eq!(neighborhood["anchor"], second_class_anchor);
+    assert!(neighborhood.get("anchor_status").is_none());
+
+    let re_resolved_neighborhood = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "neighborhood",
+        &json!({
+            "anchor": second_class_anchor,
+            "snapshot": search["publication_snapshot"]
+        }),
+    )?;
+    let re_resolved_neighborhood: serde_json::Value =
+        serde_json::from_str(&re_resolved_neighborhood)?;
+    assert_eq!(
+        re_resolved_neighborhood["requested_anchor"],
+        second_class_anchor
+    );
+    assert_eq!(re_resolved_neighborhood["anchor_status"], "re-resolved");
 
     let fuzzy_snapshot = call_tool(
         repo.path(),
@@ -2283,11 +2466,65 @@ fn search_followups_round_trip_exact_same_named_methods() -> Result<()> {
             .to_string()
             .contains("only valid with exact")
     );
+
+    conn.execute(
+        "INSERT INTO symbols(
+           file_id,name,kind,start,end,decl_start,decl_end,scope_chain,line,exported
+         )
+         SELECT symbol.file_id,symbol.name,symbol.kind,symbol.start,symbol.end,
+                symbol.decl_start,symbol.decl_end,symbol.scope_chain,symbol.line,
+                symbol.exported
+         FROM symbols symbol JOIN graph_nodes node ON node.native_id=symbol.id
+         WHERE node.native_table='symbols' AND node.node_key=?1",
+        [&second_anchor],
+    )?;
+    let overload_id = conn.last_insert_rowid();
+    let (anchor_prefix, _) = second_anchor
+        .rsplit_once('@')
+        .expect("canonical symbol anchor has an ordinal");
+    let overload_anchor = format!("{anchor_prefix}@2");
+    conn.execute(
+        "INSERT INTO graph_nodes(
+           node_key,node_kind,native_table,native_id,display_name,file_id,line,meta_json
+         )
+         SELECT ?1,'symbol','symbols',symbol.id,symbol.name,symbol.file_id,
+                symbol.line,'{}'
+         FROM symbols symbol WHERE symbol.id=?2",
+        rusqlite::params![overload_anchor, overload_id],
+    )?;
+
+    call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        &method_arguments,
+    )?;
+    let stale_overload = call_tool(
+        repo.path(),
+        &conn,
+        None,
+        ToolProfile::Structural,
+        SourceView::Full,
+        "definition",
+        &json!({
+            "anchor": second_anchor,
+            "snapshot": search["publication_snapshot"],
+            "origins": ["repository"]
+        }),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(stale_overload.contains("stale anchor"));
+    assert!(stale_overload.contains("ambiguous after re-resolution"));
+    assert!(stale_overload.contains("current response's `snapshot`"));
     Ok(())
 }
 
 #[test]
-fn search_followups_preserve_cross_origin_definitions_and_callers() -> Result<()> {
+fn search_anchors_preserve_cross_origin_definitions_and_callers() -> Result<()> {
     let repo = tempfile::tempdir()?;
     for (file, source) in [
         (
@@ -2348,8 +2585,12 @@ fn search_followups_preserve_cross_origin_definitions_and_callers() -> Result<()
             }),
         )?;
         let search: serde_json::Value = serde_json::from_str(&search)?;
-        let arguments = &search["hits"][0]["followups"]["arguments"];
         assert_eq!(search["hits"][0]["symbol"], query);
+        assert!(search["hits"][0].get("followups").is_none());
+        let arguments = json!({
+            "anchor": search["hits"][0]["anchor"],
+            "snapshot": search["snapshot"]
+        });
         assert!(arguments.get("origins").is_none());
         let usages = call_tool(
             repo.path(),
@@ -2358,7 +2599,7 @@ fn search_followups_preserve_cross_origin_definitions_and_callers() -> Result<()
             ToolProfile::Structural,
             SourceView::Full,
             "who_uses",
-            arguments,
+            &arguments,
         )?;
         assert!(usages.contains(caller), "missing {caller} in {usages}");
     }
@@ -2380,8 +2621,13 @@ fn search_followups_preserve_cross_origin_definitions_and_callers() -> Result<()
         }),
     )?;
     let dependency_search: serde_json::Value = serde_json::from_str(&dependency_search)?;
-    let arguments = &dependency_search["hits"][0]["followups"]["arguments"];
     assert_eq!(dependency_search["hits"][0]["symbol"], "dependencyTarget");
+    assert!(dependency_search["hits"][0].get("followups").is_none());
+    let arguments = json!({
+        "anchor": dependency_search["hits"][0]["anchor"],
+        "snapshot": dependency_search["snapshot"],
+        "origins": ["repository", "workspace", "dependency"]
+    });
     assert_eq!(
         arguments["origins"],
         json!(["repository", "workspace", "dependency"])
@@ -2393,7 +2639,7 @@ fn search_followups_preserve_cross_origin_definitions_and_callers() -> Result<()
         ToolProfile::Structural,
         SourceView::Full,
         "definition",
-        arguments,
+        &arguments,
     )?;
     assert!(definition.contains("dependency-target"));
     let usages = call_tool(
@@ -2403,7 +2649,7 @@ fn search_followups_preserve_cross_origin_definitions_and_callers() -> Result<()
         ToolProfile::Structural,
         SourceView::Full,
         "who_uses",
-        arguments,
+        &arguments,
     )?;
     assert!(usages.contains("dependency-caller.ts"));
     Ok(())
@@ -2414,13 +2660,147 @@ fn bounded_item_envelope_accounts_for_json_overhead() -> Result<()> {
     let items = (0..100)
         .map(|index| json!({ "index": index, "text": "x".repeat(80) }))
         .collect();
-    let rendered = render_bounded_items("outline", items, 1_500)?;
+    let rendered = render_bounded_items(
+        "outline",
+        items,
+        &crate::publication::ResponseIdentity {
+            snapshot: "code".into(),
+            publication_snapshot: "publication".into(),
+        },
+        1_500,
+    )?;
     let value: serde_json::Value = serde_json::from_str(&rendered)?;
     assert!(rendered.len() <= 1_500);
     assert_eq!(value["response_budget"]["rendered_bytes"], rendered.len());
     assert_eq!(value["response_budget"]["truncated"], true);
+    assert_eq!(value["snapshot"], "code");
+    assert_eq!(value["publication_snapshot"], "publication");
+    assert!(value["response_budget"].get("byte_limit").is_none());
     assert!(value["outline"].as_array().unwrap().len() < 100);
+
+    let complete = render_bounded_items(
+        "outline",
+        vec![json!({ "index": 1, "text": "short" })],
+        &crate::publication::ResponseIdentity {
+            snapshot: "code".into(),
+            publication_snapshot: "publication".into(),
+        },
+        usize::MAX,
+    )?;
+    let complete_value: serde_json::Value = serde_json::from_str(&complete)?;
+    assert_eq!(
+        complete_value["response_budget"]["rendered_bytes"],
+        complete.len()
+    );
+    assert_eq!(
+        complete_value["response_budget"]["unbudgeted_bytes"],
+        complete.len()
+    );
     Ok(())
+}
+
+fn linearly_shed_bounded_object_array_states(
+    mut response: serde_json::Value,
+    fields: &[&str],
+) -> Result<Vec<String>> {
+    let original_items: usize = fields
+        .iter()
+        .map(|field| response[*field].as_array().map_or(0, Vec::len))
+        .sum();
+    response["response_budget"] = json!({
+        "rendered_bytes": 0,
+        "unbudgeted_bytes": 0,
+        "truncated": false,
+        "omitted_items": 0,
+    });
+    settle_unbudgeted_response(&mut response)?;
+    let mut states = Vec::with_capacity(original_items + 1);
+    loop {
+        settle_value_rendered_bytes(&mut response)?;
+        states.push(serde_json::to_string(&response)?);
+        let removed = fields.iter().any(|field| {
+            response[*field]
+                .as_array_mut()
+                .is_some_and(|items| items.pop().is_some())
+        });
+        if !removed {
+            break;
+        }
+        response["response_budget"]["truncated"] = json!(true);
+        if response.get("truncated").is_some() {
+            response["truncated"] = json!(true);
+        }
+        let remaining: usize = fields
+            .iter()
+            .map(|field| response[*field].as_array().map_or(0, Vec::len))
+            .sum();
+        response["response_budget"]["omitted_items"] = json!(original_items - remaining);
+    }
+    Ok(states)
+}
+
+#[test]
+fn bounded_array_prefix_search_matches_linear_shedding() -> Result<()> {
+    let response = json!({
+        "snapshot": "code",
+        "publication_snapshot": "publication",
+        "truncated": false,
+        "first": (0..73).map(|index| match index % 3 {
+            0 => json!(index),
+            1 => json!("a".repeat(index % 7)),
+            _ => json!({ "index": index, "text": "b".repeat(index % 5) }),
+        }).collect::<Vec<_>>(),
+        "second": (0..39).map(|index| json!({
+            "index": index,
+            "text": "c".repeat(index % 11),
+        })).collect::<Vec<_>>(),
+    });
+    let full = render_bounded_object_arrays(response.clone(), &["first", "second"], usize::MAX)?;
+    let linear_states =
+        linearly_shed_bounded_object_array_states(response.clone(), &["first", "second"])?;
+    assert_eq!(linear_states.first(), Some(&full));
+    let minimum = linear_states
+        .last()
+        .expect("linear shedding always records the empty envelope")
+        .len();
+    for limit in 1..=full.len() + 1 {
+        let expected = linear_states
+            .iter()
+            .find(|rendered| rendered.len() <= limit)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "response byte limit {limit} is below the minimum response envelope ({minimum} bytes)"
+                )
+            });
+        let actual = render_bounded_object_arrays(response.clone(), &["first", "second"], limit);
+        match (expected, actual) {
+            (Ok(expected), Ok(actual)) => assert_eq!(actual, expected, "limit={limit}"),
+            (Err(expected), Err(actual)) => {
+                assert_eq!(actual.to_string(), expected.to_string(), "limit={limit}");
+            }
+            (expected, actual) => {
+                panic!("budget result differed at {limit}: expected={expected:?} actual={actual:?}")
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn tool_access_classifies_only_structural_annotate_as_a_write() {
+    assert_eq!(
+        tool_access(ToolProfile::Structural, "annotate"),
+        ToolAccess::Write
+    );
+    assert_eq!(
+        tool_access(ToolProfile::Structural, "search"),
+        ToolAccess::Read
+    );
+    assert_eq!(
+        tool_access(ToolProfile::Baseline, "annotate"),
+        ToolAccess::Read
+    );
 }
 
 #[test]
@@ -2458,6 +2838,15 @@ fn telemetry_counts_expansion_file_roles_without_recording_payloads() {
     assert_eq!(compact.file_nodes, 2);
     assert_eq!(compact.role_counts["production"], 1);
     assert_eq!(compact.test_fixture_generated, 1);
+}
+
+#[test]
+fn failed_tool_telemetry_does_not_guess_a_snapshot() {
+    let failed = Err(anyhow::anyhow!("retrieval failed"));
+    let successful = Ok(json!({ "snapshot": "observed" }).to_string());
+
+    assert_eq!(telemetry_snapshot(&failed), None);
+    assert_eq!(telemetry_snapshot(&successful).as_deref(), Some("observed"));
 }
 
 #[test]

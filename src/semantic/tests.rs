@@ -4,8 +4,8 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::{
-    AnnotateInput, SupportInput, WorkflowCandidateOptions, annotate, search, support_relationship,
-    workflow_candidates,
+    AnnotateInput, AnnotateRequest, SupportInput, WorkflowCandidateOptions, annotate,
+    annotate_request_with_provider, search, support_relationship, workflow_candidates,
 };
 use crate::{indexer, store, structural};
 
@@ -823,6 +823,129 @@ fn workflow_candidates_keep_seed_symbols_under_singular_doc_directories() -> Res
 }
 
 #[test]
+fn docs_only_publication_preserves_semantic_code_guards() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("a.ts"),
+        "export function alpha() { return 1; }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let snapshot = structural::current_snapshot(&conn)?;
+    let publication = crate::publication::current_publication_snapshot(&conn)?;
+    let alpha = "sym:a.ts#::alpha@1";
+
+    fs::write(
+        repo.path().join("README.md"),
+        "# Alpha\n\nAlpha is the workflow entry.\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    assert_eq!(structural::current_snapshot(&conn)?, snapshot);
+    assert_ne!(
+        crate::publication::current_publication_snapshot(&conn)?,
+        publication
+    );
+
+    let candidates = workflow_candidates(
+        repo.path(),
+        &conn,
+        &[alpha.into()],
+        &WorkflowCandidateOptions {
+            expected_snapshot: Some(snapshot.clone()),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(candidates.snapshot, snapshot);
+    assert_eq!(
+        candidates.publication_snapshot,
+        crate::publication::Identities::read(&conn)?.publication
+    );
+    assert!(
+        candidates
+            .candidates
+            .iter()
+            .any(|candidate| candidate.anchor == alpha)
+    );
+
+    let artifact = annotate(
+        repo.path(),
+        &conn,
+        &AnnotateInput {
+            artifact_type: "annotation".into(),
+            name: Some("alpha behavior".into()),
+            body: json!({ "claim": "alpha is the workflow entry" }),
+            supports: vec![support("/claim", alpha, "a.ts")],
+            confidence: "likely".into(),
+            snapshot: snapshot.clone(),
+            supersedes: None,
+        },
+    )?;
+    assert_eq!(
+        artifact.source_snapshot,
+        crate::publication::durable_code_source(&snapshot)
+    );
+
+    fs::write(
+        repo.path().join("a.ts"),
+        "export function alpha() { return 2; }\n",
+    )?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let stale = workflow_candidates(
+        repo.path(),
+        &conn,
+        &[alpha.into()],
+        &WorkflowCandidateOptions {
+            expected_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    )
+    .expect_err("a code edit must invalidate the old semantic guard");
+    assert!(stale.to_string().contains("snapshot is stale"));
+    Ok(())
+}
+
+#[test]
+fn annotation_publication_echoes_the_identity_validated_by_its_write() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("a.ts"),
+        "export function alpha() { return 1; }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let identities = crate::publication::Identities::read(&conn)?;
+    let anchor = "sym:a.ts#::alpha@1";
+
+    let publication = annotate_request_with_provider(
+        repo.path(),
+        &conn,
+        None,
+        AnnotateRequest::Annotation {
+            name: Some("alpha behavior".into()),
+            body: json!({ "claim": "alpha is stable" }),
+            supports: vec![support("/claim", anchor, "a.ts")],
+            confidence: "likely".into(),
+            snapshot: identities.code.clone(),
+            supersedes: None,
+        },
+    )?;
+
+    assert_eq!(publication.snapshot, identities.code);
+    assert_eq!(publication.publication_snapshot, identities.publication);
+    assert_eq!(
+        publication.artifact.source_snapshot,
+        crate::publication::durable_code_source(&publication.snapshot)
+    );
+    let rendered = serde_json::to_value(&publication)?;
+    assert_eq!(rendered["snapshot"], publication.snapshot);
+    assert_eq!(
+        rendered["publication_snapshot"],
+        publication.publication_snapshot
+    );
+    Ok(())
+}
+
+#[test]
 fn annotate_rejects_untrusted_confidence_bad_spans_and_stale_snapshots() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
@@ -861,6 +984,19 @@ fn annotate_rejects_untrusted_confidence_bad_spans_and_stale_snapshots() -> Resu
             .unwrap_err()
             .to_string()
             .contains("line count")
+    );
+
+    let publication_snapshot = AnnotateInput {
+        confidence: "likely".into(),
+        snapshot: crate::publication::current_publication_snapshot(&conn)?,
+        supports: vec![support("/claim", alpha, "a.ts")],
+        ..bad_span.clone()
+    };
+    assert_eq!(
+        annotate(repo.path(), &conn, &publication_snapshot)
+            .unwrap_err()
+            .to_string(),
+        "annotation snapshot is the current `publication_snapshot`; pass the code digest from the response's `snapshot` field"
     );
 
     let stale_snapshot = AnnotateInput {

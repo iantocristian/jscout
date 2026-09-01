@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-26.
+> Status: authoritative plan as of 2026-08-30.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -27,14 +27,14 @@
 > available as an opt-in, while its pre-registered evaluation rejected every
 > tested movement bound as the default. The G25 multi-format registry was
 > implemented by G26 phase 0; its further format admissions remain
-> unscheduled. G26 Rust code indexing is the current implementation goal and
-> the first additional code-corpus format, motivated by self-indexing this
-> repository. G27 is proposed to give code and documentation content their own
-> invalidation identities inside the one publication, so documentation edits
-> stop invalidating code-bound state. G28 is proposed to shrink the
-> agent-facing surface — a taught-core skill, slim tool contract, response
-> economy, and per-project tool registration — with its envelope work
-> sequenced before the G27 implementation.
+> unscheduled. G26 Rust code indexing is the first additional code-corpus
+> format, motivated by self-indexing this repository. G27 per-plane content
+> identities are implemented: code and documentation now have independent
+> invalidation digests inside one atomic publication, while
+> `publication_snapshot` identifies the canonical indexed code,
+> documentation, and documentation-provenance tuple. G28 remains incremental;
+> its phase-1 response economy shipped with G27, while the tiered registration
+> and overview phases remain proposed.
 
 ## Document policy
 
@@ -3751,7 +3751,7 @@ reframe the all-role v4 result. The complete v4 result and immutable artifact
 hashes are recorded in
 [eval/results/g26-format-scope-v4-failed-2026-08-26.md](eval/results/g26-format-scope-v4-failed-2026-08-26.md).
 
-## Proposed G27 — per-plane content identities in one publication
+## G27 — per-plane content identities in one publication (implemented)
 
 G24 accepted that documentation edits rotate the shared `meta.snapshot`, and
 instrumentation then priced the coupling: after any docs-only publication,
@@ -3761,7 +3761,8 @@ publication hard-fail on their snapshot guard and discard the model work
 already spent, and an in-flight exhaustive-search cursor dies mid-traversal;
 in the opposite direction, a code-only edit invalidates the documentation
 vector generation. The G24 provenance digest (PR #113) removed the
-attribution half of that churn; content churn remains. The consumer inventory
+attribution half of that churn; content churn remained before G27. The
+consumer inventory
 behind that split also established the general fact: every rotation gate in
 the system is plane-scoped — checker batches, the semantic and scouting
 publication guards, and exhaustive cursors bind code-only claims, while
@@ -3785,11 +3786,16 @@ identity.
    hash, and format only — role, origin, and package fields are excluded
    because code-side dependency synchronization may rewrite them on
    documentation rows without changing documentation content. The existing
-   `documentation_provenance_digest` is unchanged. `meta.snapshot` remains
-   the stored publication marker and open-validation key, redefined as a
-   domain-tagged fold of all three digests, and stops being compared by any
-   consumer gate. All publish in the one existing transaction; cross-plane
-   consistency comes from that transaction, not from a shared value.
+   `documentation_provenance_digest` is unchanged. The canonical indexed state
+   for this gate is exactly the tuple (`code_digest`, `documentation_digest`,
+   `documentation_provenance_digest`) atomically published by `jscout index`.
+   `publication_snapshot` (stored as `meta.snapshot`) is a domain-tagged fold
+   of that tuple. It excludes later mutable checker, vector, semantic-memory,
+   scouting, and reconnaissance overlays; equality means only that the three
+   covered components are equal. Read-only open requires all four values and
+   verifies the fold, but `publication_snapshot` is not itself a freshness,
+   write, or invalidation gate. Cross-plane consistency comes from the one
+   existing transaction, not from a shared invalidation value.
 2. Re-keyed gates and engine. Checker enrichment batches record and compare
    the code digest; the annotate, workflow-candidate, and scouting
    publication guards validate the code digest; the exhaustive-search cursor
@@ -3804,31 +3810,37 @@ identity.
    code digest and checker inputs are unchanged instead of unconditionally
    dropping it — so checker edges survive docs-only publications on every
    path, not only under watch.
-3. Public contract. Each surface reports two fields: its plane digest in the
-   existing `snapshot` response field — the code digest on code and semantic
-   surfaces; the documentation digest on `documentation_search`,
-   `docs status`, and `docs embed` — and a global `publication_snapshot`
-   carrying the fold, which lets a caller detect that two responses observed
-   different published states. No server gate compares
-   `publication_snapshot`. Both MCP server instruction strings are updated in
-   the same pull request to describe the two fields; behavioral guidance
-   stays minimal. `annotate` echoes back the code digest it was served, now
-   plane-correct by construction.
+3. Public contract. Successful atomic query/read responses report the response
+   plane digest in `snapshot` — code for code and semantic reads,
+   documentation for documentation reads — plus `publication_snapshot`.
+   `annotate` validates and echoes the code digest and returns the same
+   two-field identity block from its atomic write. Enabled `docs status` is
+   included. Disabled `docs status` is the explicit exception: it short-circuits
+   before opening a database and returns policy only, with neither identity.
+   G27 does not standardize operational command reports: index, ordinary
+   embed, enrich, checker, and scouting reports retain their command-specific
+   plane-local shapes; `docs embed` currently exposes both identities without
+   widening that guarantee. Both MCP instruction strings describe the two
+   fields. No consumer compares `publication_snapshot`.
 4. Boundaries. No new database, schema lifecycle, or second publication
    transaction. Watch classification is untouched: a docs-only publication
    that leaves the code digest byte-identical makes the scheduled enrichment
    pass an exact reuse, while provenance-scoped refresh signals remain the
    separate watcher optimization. Documentation-vector rematerialization
-   triggers whenever extraction was reset or the current generation is absent
-   — never on a documentation-digest comparison — preserving the PR #113
-   invariant that a full refresh restores complete cached generations
-   provider-free. If the deferred observation ledger is ever built, it orders
+   triggers whenever extraction was reset, the documentation digest changed,
+   or a current generation is absent. Comparing the prior digest is required
+   to purge occurrence rows from obsolete embedding-text contracts, whose
+   profiles are intentionally excluded from current-profile readiness checks;
+   complete current generations are rebuilt provider-free from the durable
+   cache. If the deferred observation ledger is ever built, it orders
    against the documentation digest rather than the global marker; that
-   decision lands with the ledger. Implementation starts on the slimmed
-   response envelope from Proposed G28: one snapshot location per response and
+   decision lands with the ledger. Implementation uses the slimmed
+   response envelope from G28 phase 1: one snapshot location per response and
    no per-hit identity stamping, so this contract change edits one field and
-   adds one, rather than re-keying identity copies throughout the response;
-   the G27 before/after measurement reuses the G28 replay harness.
+   adds one, rather than re-keying identity copies throughout the response.
+   The G27 before/after result uses the narrow matched command sequence and
+   limitations recorded with its evaluation rather than claiming a reusable
+   G28 replay harness.
 5. Transition. Existing checker batches, publication inputs, and cursors
    keyed to the old global value invalidate once on the first index under the
    split — the same one-time contract-transition class as the PR #113
@@ -3845,18 +3857,35 @@ checker enrichment edges remain projected in the same publication, a
 publication validated against the pre-edit code digest succeeds, and an
 in-flight exhaustive cursor survives; after a code-only incremental
 publication, documentation vector readiness is untouched, and any publication
-that reset extraction rematerializes complete cached documentation
-generations provider-free in the same publication; a code edit still rotates
+that reset extraction or changed the documentation digest rematerializes
+complete cached documentation generations provider-free in the same
+publication; a documentation text-contract transition also purges obsolete
+materialized occurrence rows even when no current-format profile exists; a code edit still rotates
 the code digest and invalidates every code-bound gate; the foreign plane's
-digest is byte-identical after any cross-plane operation; every surface
-reports its plane digest plus `publication_snapshot`, and equal
-`publication_snapshot` values imply identical published state; both MCP
+digest is byte-identical after any cross-plane operation; every successful
+atomic query/read response and `annotate` reports its plane digest plus
+`publication_snapshot`, and equal `publication_snapshot` values identify the
+same canonical indexed state defined above; both MCP
 instruction strings ship in the same change; and a before/after measurement
 records the checker-stall and discarded-publication deltas against pre-split
-behavior. No implementation milestone is assigned and no current goal is
-displaced.
+behavior.
 
-## Proposed G28 — agent surface economy
+Implementation outcome (2026-08-30): the full unit suite and real-repository
+smokes on ai-pipe and n8n passed. Cross-plane differential checks preserved the
+foreign digest and normalized response bytes in both directions. In the
+matched ai-pipe control/treatment observation, a documentation-only manual
+index preserved one active batch, 387 checker facts and projected edges, and
+1,025 value-flow edges. It changed the following enrichment from 4,601 checker
+queries in 42 batches and a 24.49-second recovery to exact zero-query batch
+reuse in 0.29 seconds. An in-flight scouting publication that failed
+`inputs_changed` before the split published successfully when only
+documentation rotated. These are matched descriptive observations on one
+uncontrolled host, not performance thresholds; the paired runner and raw
+scratch artifacts are not checked in. The implementation, corpus counts,
+integrity checks, artifact hashes, and full measurement limits are recorded in
+[eval/results/g27-plane-identities-2026-08-30.md](eval/results/g27-plane-identities-2026-08-30.md).
+
+## G28 — agent surface economy (phase 1 code implemented; replay pending)
 
 The surface costs more than the work. An out-of-box MCP session pays the
 structural profile's 13 tool definitions plus instructions — roughly 27 KB,
@@ -3918,14 +3947,20 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    descriptions shrink to one line; duplicated property prose and repeated
    enum glosses are removed. Availability of an untaught tool costs
    registration bytes only.
-3. Response economy, correctness untouched. The snapshot appears exactly
-   once per response envelope; per-hit `followups` objects are removed — the
+3. Response economy, correctness untouched. For successful atomic query/read
+   responses and `annotate`, the plane `snapshot` and `publication_snapshot`
+   each appear exactly once at the top level; disabled `docs status` remains
+   the no-database/no-identity exception defined by G27. Per-hit `followups`
+   objects are removed — the
    anchor field already carries everything a follow-up needs; documentation
    hits drop the per-hit snapshot, file hash, and byte offsets; every
    surface prints compact JSON; `neighborhood` stops repeating the file path
    twice per node; `paths` and `entities` route through the compaction layer
-   or remain full-tier only; resolution blocks appear only when the
-   requested and resolved anchors differ; the caller's own `byte_limit` is
+   or remain full-tier only; resolution blocks appear only when anchor
+   handling is not exact-current, so stale re-resolution remains visible even
+   when the requested and resolved anchor strings are equal; an ambiguous
+   stale re-resolution fails closed with a relocalization diagnostic rather
+   than presenting the ambiguity as current exact-anchor failure; the caller's own `byte_limit` is
    not echoed back. Complete-response budget accounting (invariant 9) is
    retained.
 4. `repository_overview` stops being a catalog. The default response is
@@ -3941,25 +3976,27 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    `eval/` before they are lost. The replay rig is the three-arm cardHistory
    comparison, the links-iteration session, and the still-pending G23
    acceptance replay; every phase closes with a replay against the recorded
-   baselines. Phase 0: tiered skill, installer destinations, and
-   registration config — no response changes. Phase 1: response economy and
-   surface slimming; this phase is the G27 prerequisite. Phase 2: the
-   overview redesign. The goal is revisited when documentation and Rust
-   reach production; their first telemetry window is the acceptance data for
-   their guidance.
+   baselines. Phase 0 — tiered skill, installer destinations, and registration
+   config — remains pending. Phase 1 response economy is implemented with G27
+   and pinned by response-shape and differential tests, but its byte/quality
+   replay acceptance has not run. Phase 2, the overview redesign, remains
+   pending. The G27 isolation measurement is evidence for G27, not a substitute
+   for G28's surface-cost and answer-quality thresholds. Documentation and Rust
+   guidance remains subject to its first production telemetry window.
 
 Acceptance: the default registered surface, instructions included, costs
 less than a third of today's structural surface, and the core skill stays
 under a quarter of the current guide; a ranked search hit is majority
-content by bytes; the snapshot value appears exactly once per response; the
+content by bytes; the G27 identity fields each appear exactly once on the
+covered response set; the
 overview default response at 150 workspace areas stays within a few
 kilobytes with no reconnaissance prose; replayed against the recorded
 baselines, the skill-guided arm's call count and answer quality do not
 regress and the use-every-endpoint arm's bytes drop by at least half; and
 every routing rule exists in exactly one surface — the skill — with the
 instruction strings reduced to identity, pointer, and mechanical contracts.
-No implementation milestone is assigned and no current goal is displaced,
-and the G27 implementation consumes phase 1's envelope and the replay rig.
+Phase 1 code is complete, but G28 remains open until phases 0 and 2 land and
+the recorded byte/quality replay gates pass.
 
 ## Evaluation decisions already made
 

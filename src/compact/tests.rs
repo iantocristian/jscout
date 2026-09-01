@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use super::{
-    compact_hit, compact_receiver_types, definition_string, neighborhood_value,
+    compact_hit, compact_receiver_types, definition_string, graph_value, neighborhood_value,
     prune_unreferenced_nodes, render_neighborhood, search_string, semantic_preview,
     settle_neighborhood_bytes, who_uses_string,
 };
@@ -46,6 +46,49 @@ fn edge(source: &str, target: &str, line: i64) -> GraphEdge {
     }
 }
 
+#[test]
+fn compact_graph_reuses_source_locators_already_carried_by_anchors() {
+    let file = GraphNode {
+        key: "file:src/workflow.ts".into(),
+        kind: "file".into(),
+        display_name: "src/workflow.ts".into(),
+        file: Some("src/workflow.ts".into()),
+        file_role: Some("production".into()),
+        file_origin: Some("repository".into()),
+        line: None,
+        meta: json!({}),
+        relevance: 1.0,
+    };
+    let hub = GraphNode {
+        key: "event:ready".into(),
+        kind: "event".into(),
+        display_name: "ready".into(),
+        file: Some("src/workflow.ts".into()),
+        file_role: Some("production".into()),
+        file_origin: Some("repository".into()),
+        line: Some(4),
+        meta: json!({}),
+        relevance: 1.0,
+    };
+    let symbol = GraphNode {
+        key: "sym:src/workflow.ts#::run@1".into(),
+        kind: "symbol".into(),
+        display_name: "run".into(),
+        file: Some("src/workflow.ts".into()),
+        file_role: Some("production".into()),
+        file_origin: Some("repository".into()),
+        line: Some(7),
+        meta: json!({}),
+        relevance: 1.0,
+    };
+
+    let graph = graph_value(&[file, hub, symbol], &[], &[]);
+    assert!(graph["nodes"]["n1"].get("at").is_none());
+    assert_eq!(graph["nodes"]["n2"]["at"], "src/workflow.ts:4");
+    assert!(graph["nodes"]["n3"].get("at").is_none());
+    assert_eq!(graph["nodes"]["n3"]["line"], 7);
+}
+
 fn symbol_target() -> SymbolTarget {
     SymbolTarget {
         file: "src/adapter.ts".into(),
@@ -58,13 +101,20 @@ fn symbol_target() -> SymbolTarget {
     }
 }
 
+fn response_identity() -> crate::publication::ResponseIdentity {
+    crate::publication::ResponseIdentity {
+        snapshot: "s".repeat(64),
+        publication_snapshot: "p".repeat(64),
+    }
+}
+
 #[test]
 fn compact_search_keeps_localization_and_relation_evidence() -> anyhow::Result<()> {
     let root = "sym:src/workflow.ts#::start@1";
     let target = "sym:src/workflow.ts#::finish@20";
     let result = SearchResult {
         snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
+        publication_snapshot: "p".repeat(64),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
@@ -87,8 +137,6 @@ fn compact_search_keeps_localization_and_relation_evidence() -> anyhow::Result<(
             file_anchor: Some("file:src/workflow.ts".into()),
             uses: Vec::new(),
             used_by: Vec::new(),
-            include_followups: true,
-            include_neighborhood_followup: true,
         }],
         semantic_artifacts: Vec::new(),
         semantic_retrieval: None,
@@ -114,7 +162,6 @@ fn compact_search_keeps_localization_and_relation_evidence() -> anyhow::Result<(
             )]],
             node_limit: 40,
             edge_limit: 120,
-            byte_limit: 24_000,
             file_roles: vec!["production".into(), "unknown".into()],
             file_origins: origin::defaults(),
             payload_bytes: 0,
@@ -128,28 +175,26 @@ fn compact_search_keeps_localization_and_relation_evidence() -> anyhow::Result<(
 
     let compact = search_string(&result)?;
     let diagnostic = serde_json::to_string_pretty(&result)?;
+    let diagnostic_value = serde_json::to_value(&result)?;
+    assert!(
+        diagnostic_value["response_budget"]
+            .get("byte_limit")
+            .is_none()
+    );
+    assert!(diagnostic_value["expansion"].get("byte_limit").is_none());
     assert!(compact.len() * 2 < diagnostic.len());
     let value: serde_json::Value = serde_json::from_str(&compact)?;
     assert!(value.get("retrieval").is_none());
     assert_eq!(value["hits"][0]["at"], "src/workflow.ts:1-8");
     assert_eq!(value["hits"][0]["symbol"], "start");
     assert_eq!(value["hits"][0]["anchor"], root);
-    assert_eq!(
-        value["hits"][0]["followups"]["tools"],
-        json!(["definition", "who_uses", "neighborhood"])
-    );
-    assert_eq!(value["hits"][0]["followups"]["arguments"]["anchor"], root);
-    assert_eq!(
-        value["hits"][0]["followups"]["arguments"]["snapshot"],
-        "s".repeat(64)
-    );
-    assert!(
-        value["hits"][0]["followups"]["arguments"]
-            .get("origins")
-            .is_none()
-    );
+    assert_eq!(value["snapshot"], "s".repeat(64));
+    assert_eq!(value["publication_snapshot"], "p".repeat(64));
+    assert!(value["hits"][0].get("followups").is_none());
     assert!(value["hits"][0].get("chunk_id").is_none());
     assert_eq!(value["graph"]["projection"], "paths");
+    assert!(value["graph"]["nodes"]["n1"].get("at").is_none());
+    assert!(value["graph"]["nodes"]["n2"].get("at").is_none());
     assert_eq!(value["graph"]["edges"][0][3], "likely");
     assert_eq!(value["graph"]["edges"][0][4], "typescript-checker");
     assert_eq!(
@@ -169,122 +214,6 @@ fn compact_search_keeps_localization_and_relation_evidence() -> anyhow::Result<(
 }
 
 #[test]
-fn file_only_search_hits_offer_only_file_compatible_followups() {
-    let hit = Hit {
-        chunk_id: 1,
-        file: "src/config.ts".into(),
-        file_role: "production".into(),
-        repository_role: None,
-        file_origin: "repository".into(),
-        kind: "module".into(),
-        name: None,
-        start_line: 1,
-        end_line: 20,
-        score: 1.0,
-        match_reason: MatchReason::Hybrid,
-        matched_identifiers: Vec::new(),
-        match_lines: None,
-        snippet: "export const config = {};".into(),
-        snippet_truncated: false,
-        anchors: Vec::new(),
-        file_anchor: Some("file:src/config.ts".into()),
-        uses: Vec::new(),
-        used_by: Vec::new(),
-        include_followups: true,
-        include_neighborhood_followup: true,
-    };
-    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid, &[]);
-    assert_eq!(value["anchor"], "file:src/config.ts");
-    assert_eq!(value["followups"]["calls"][0]["tool"], "file_outline");
-    assert_eq!(value["followups"]["calls"][1]["tool"], "neighborhood");
-    assert!(
-        value["followups"]["calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|call| call["tool"] != "definition" && call["tool"] != "who_uses")
-    );
-    assert!(
-        value["followups"]["calls"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|call| call["arguments"].get("origins").is_none())
-    );
-}
-
-#[test]
-fn dependency_followups_include_dependency_and_first_party_origins() {
-    let hit = Hit {
-        chunk_id: 1,
-        file: "node_modules/pkg/index.ts".into(),
-        file_role: "production".into(),
-        repository_role: None,
-        file_origin: "dependency".into(),
-        kind: "function".into(),
-        name: Some("runDependency".into()),
-        start_line: 1,
-        end_line: 2,
-        score: 1.0,
-        match_reason: MatchReason::ExactDefinition,
-        matched_identifiers: vec!["runDependency".into()],
-        match_lines: None,
-        snippet: "export function runDependency() {}".into(),
-        snippet_truncated: false,
-        anchors: vec!["sym:node_modules/pkg/index.ts#::runDependency@1".into()],
-        file_anchor: Some("file:node_modules/pkg/index.ts".into()),
-        uses: Vec::new(),
-        used_by: Vec::new(),
-        include_followups: true,
-        include_neighborhood_followup: true,
-    };
-    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid, &[]);
-    assert_eq!(
-        value["followups"]["arguments"]["origins"],
-        json!(["repository", "workspace", "dependency"])
-    );
-}
-
-#[test]
-fn symbol_followups_preserve_explicit_formats_per_compatible_tool() {
-    let hit = Hit {
-        chunk_id: 1,
-        file: "src/config.ts".into(),
-        file_role: "production".into(),
-        repository_role: None,
-        file_origin: "repository".into(),
-        kind: "function".into(),
-        name: Some("configure".into()),
-        start_line: 1,
-        end_line: 2,
-        score: 1.0,
-        match_reason: MatchReason::ExactDefinition,
-        matched_identifiers: vec!["configure".into()],
-        match_lines: None,
-        snippet: "export function configure() {}".into(),
-        snippet_truncated: false,
-        anchors: vec!["sym:src/config.ts#::configure@1".into()],
-        file_anchor: Some("file:src/config.ts".into()),
-        uses: Vec::new(),
-        used_by: Vec::new(),
-        include_followups: true,
-        include_neighborhood_followup: true,
-    };
-    let formats = vec!["typescript".to_string(), "javascript".to_string()];
-    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid, &formats);
-    let calls = value["followups"]["calls"].as_array().unwrap();
-
-    assert_eq!(calls.len(), 3);
-    for call in &calls[..2] {
-        assert_eq!(call["arguments"]["formats"], json!(formats));
-    }
-    assert_eq!(calls[0]["tool"], "definition");
-    assert_eq!(calls[1]["tool"], "who_uses");
-    assert_eq!(calls[2]["tool"], "neighborhood");
-    assert!(calls[2]["arguments"].get("formats").is_none());
-}
-
-#[test]
 fn compact_receiver_types_keep_bounded_heads_and_mark_truncation() {
     let receiver_types = vec![
         json!(format!("Errors<{}>", "Nested<".repeat(200))),
@@ -301,7 +230,7 @@ fn compact_receiver_types_keep_bounded_heads_and_mark_truncation() {
 }
 
 #[test]
-fn ambiguous_search_hits_do_not_emit_copy_unsafe_followups() {
+fn compact_search_emits_anchors_without_followup_scaffolding() {
     let hit = Hit {
         chunk_id: 1,
         file: "src/overlap.ts".into(),
@@ -325,10 +254,8 @@ fn ambiguous_search_hits_do_not_emit_copy_unsafe_followups() {
         file_anchor: Some("file:src/overlap.ts".into()),
         uses: Vec::new(),
         used_by: Vec::new(),
-        include_followups: true,
-        include_neighborhood_followup: true,
     };
-    let value = compact_hit(&hit, "snapshot", MatchReason::Hybrid, &[]);
+    let value = compact_hit(&hit, MatchReason::Hybrid);
     assert_eq!(value["anchors"].as_array().map(Vec::len), Some(2));
     assert!(value.get("followups").is_none());
     assert!(value.get("followup_candidates").is_none());
@@ -360,13 +287,11 @@ fn ordinary_eight_hit_search_fits_under_four_kibibytes() -> anyhow::Result<()> {
             file_anchor: Some(format!("file:src/services/service-{index}.ts")),
             uses: vec!["next (call)".into()],
             used_by: Vec::new(),
-            include_followups: true,
-            include_neighborhood_followup: true,
         })
         .collect();
     let result = SearchResult {
         snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
+        publication_snapshot: "p".repeat(64),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits,
@@ -391,7 +316,7 @@ fn ordinary_eight_hit_search_fits_under_four_kibibytes() -> anyhow::Result<()> {
 fn search_memory_is_a_small_actionable_preview() -> anyhow::Result<()> {
     let result = SearchResult {
         snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
+        publication_snapshot: "p".repeat(64),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -486,7 +411,7 @@ fn annotation_claim_is_visible_in_memory_preview() {
 fn degraded_vector_status_is_visible_without_query_candidates() -> anyhow::Result<()> {
     let result = SearchResult {
         snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
+        publication_snapshot: "p".repeat(64),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -528,7 +453,7 @@ fn degraded_vector_status_is_visible_without_query_candidates() -> anyhow::Resul
 fn omitted_memory_keeps_the_follow_up_envelope() -> anyhow::Result<()> {
     let result = SearchResult {
         snapshot: "s".repeat(64),
-        requested_formats: Vec::new(),
+        publication_snapshot: "p".repeat(64),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -578,9 +503,10 @@ fn ten_checker_edges_fit_under_eight_kibibytes() -> anyhow::Result<()> {
     }
     let neighborhood = Neighborhood {
         snapshot: "s".repeat(64),
+        publication_snapshot: "p".repeat(64),
         requested_anchor: root.into(),
         resolved_anchor: root.into(),
-        anchor_status: "current".into(),
+        anchor_status: "exact".into(),
         nodes,
         edges,
         truncated: false,
@@ -591,6 +517,28 @@ fn ten_checker_edges_fit_under_eight_kibibytes() -> anyhow::Result<()> {
     assert!(compact.len() < 8_000);
     let value: serde_json::Value = serde_json::from_str(&compact)?;
     assert_eq!(value["graph"]["edges"].as_array().map(Vec::len), Some(10));
+    Ok(())
+}
+
+#[test]
+fn compact_neighborhood_exposes_same_anchor_reresolution() -> anyhow::Result<()> {
+    let root = "sym:src/workflow.ts#::start@1";
+    let neighborhood = Neighborhood {
+        snapshot: "s".repeat(64),
+        publication_snapshot: "p".repeat(64),
+        requested_anchor: root.into(),
+        resolved_anchor: root.into(),
+        anchor_status: "re-resolved".into(),
+        nodes: vec![node(root, 1)],
+        edges: Vec::new(),
+        truncated: false,
+    };
+
+    let rendered = render_neighborhood(&neighborhood, 4_000)?;
+    let value: serde_json::Value = serde_json::from_str(&rendered)?;
+    assert_eq!(value["anchor"], root);
+    assert_eq!(value["requested_anchor"], root);
+    assert_eq!(value["anchor_status"], "re-resolved");
     Ok(())
 }
 
@@ -612,7 +560,6 @@ fn render_neighborhood_linearly(
             neighborhood,
             &nodes,
             &edges,
-            byte_limit,
             unbudgeted_bytes,
             original_nodes,
             original_edges,
@@ -625,11 +572,14 @@ fn render_neighborhood_linearly(
     }
 
     loop {
+        // Each candidate has its own byte-count fixed point. Reusing a wider
+        // prior count can select the conservative side of a decimal-boundary
+        // fixed point and incorrectly reject an exactly fitting prefix.
+        rendered_bytes = 0;
         let rendered = settle_neighborhood_bytes(
             neighborhood,
             &nodes,
             &edges,
-            byte_limit,
             unbudgeted_bytes,
             original_nodes,
             original_edges,
@@ -640,7 +590,6 @@ fn render_neighborhood_linearly(
                 neighborhood,
                 &nodes,
                 &edges,
-                byte_limit,
                 unbudgeted_bytes,
                 rendered_bytes,
                 original_nodes,
@@ -681,6 +630,12 @@ fn assert_budget_renderers_match(
                 value["response"]["rendered_bytes"].as_u64(),
                 Some(rendered.len() as u64)
             );
+            assert_eq!(value["snapshot"], neighborhood.snapshot);
+            assert_eq!(
+                value["publication_snapshot"],
+                neighborhood.publication_snapshot
+            );
+            assert!(value["response"].get("byte_limit").is_none());
         }
     }
     Ok(())
@@ -698,9 +653,10 @@ fn neighborhood_prefix_search_matches_linear_budget_shedding() -> anyhow::Result
     }
     let neighborhood = Neighborhood {
         snapshot: "s".repeat(64),
+        publication_snapshot: "p".repeat(64),
         requested_anchor: root.into(),
         resolved_anchor: root.into(),
-        anchor_status: "current".into(),
+        anchor_status: "exact".into(),
         nodes,
         edges,
         truncated: false,
@@ -742,9 +698,10 @@ fn neighborhood_prefix_search_matches_linear_isolated_node_shedding() -> anyhow:
     }
     let neighborhood = Neighborhood {
         snapshot: "s".repeat(64),
+        publication_snapshot: "p".repeat(64),
         requested_anchor: root.into(),
         resolved_anchor: root.into(),
-        anchor_status: "current".into(),
+        anchor_status: "exact".into(),
         nodes,
         edges: Vec::new(),
         truncated: false,
@@ -782,7 +739,8 @@ fn compact_who_uses_groups_sites_without_losing_candidate_evidence() -> anyhow::
         ],
     )];
 
-    let rendered = who_uses_string(&results, 4_000)?;
+    let identity = response_identity();
+    let rendered = who_uses_string(&results, &identity, None, 4_000)?;
     let value: serde_json::Value = serde_json::from_str(&rendered)?;
 
     assert!(rendered.len() < 1_000);
@@ -798,6 +756,8 @@ fn compact_who_uses_groups_sites_without_losing_candidate_evidence() -> anyhow::
     );
     assert_eq!(value["response"]["matched_usages"], 2);
     assert_eq!(value["response"]["returned_usages"], 2);
+    assert_eq!(value["snapshot"], identity.snapshot);
+    assert_eq!(value["publication_snapshot"], identity.publication_snapshot);
     Ok(())
 }
 
@@ -817,11 +777,14 @@ fn compact_who_uses_truncates_to_the_complete_response_budget() -> anyhow::Resul
         .collect();
     let results = vec![(&target, usages)];
 
-    let rendered = who_uses_string(&results, 1_200)?;
+    let identity = response_identity();
+    let unbudgeted = who_uses_string(&results, &identity, None, usize::MAX)?.len();
+    let rendered = who_uses_string(&results, &identity, None, 1_200)?;
     let value: serde_json::Value = serde_json::from_str(&rendered)?;
 
     assert!(rendered.len() <= 1_200);
     assert_eq!(value["response"]["rendered_bytes"], rendered.len());
+    assert_eq!(value["response"]["unbudgeted_bytes"], unbudgeted);
     assert_eq!(value["response"]["truncated"], true);
     assert!(value["response"]["returned_usages"].as_u64().unwrap() < 100);
     assert!(value["targets"][0]["usages"].get("certain").is_some());
@@ -835,15 +798,16 @@ fn compact_definition_serializes_source_once_and_obeys_the_whole_budget() -> any
     let source = RenderedSource {
         representation: "full",
         text: format!("UNIQUE_SOURCE_MARKER\n{}", "const value = 1;\n".repeat(200)),
-        byte_limit: 8_000,
         original_bytes: 3_500,
         rendered_bytes: 3_500,
-        compression_ratio: 1.0,
         elisions: Vec::new(),
         budget_truncated: false,
     };
 
-    let rendered = definition_string(&[(target, Some(source))], 1, 1_000)?;
+    let identity = response_identity();
+    let results = [(target, Some(source))];
+    let unbudgeted = definition_string(&results, 1, &identity, None, usize::MAX)?.len();
+    let rendered = definition_string(&results, 1, &identity, None, 1_000)?;
     let value: serde_json::Value = serde_json::from_str(&rendered)?;
 
     assert!(rendered.len() <= 1_000);
@@ -855,5 +819,6 @@ fn compact_definition_serializes_source_once_and_obeys_the_whole_budget() -> any
         true
     );
     assert_eq!(value["response"]["rendered_bytes"], rendered.len());
+    assert_eq!(value["response"]["unbudgeted_bytes"], unbudgeted);
     Ok(())
 }

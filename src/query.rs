@@ -372,10 +372,15 @@ pub struct SymbolTarget {
 
 #[derive(Debug, serde::Serialize)]
 pub struct SymbolAnchorResolution {
-    pub snapshot: String,
     pub requested_anchor: String,
     pub resolved_anchor: String,
     pub anchor_status: String,
+}
+
+impl SymbolAnchorResolution {
+    pub(crate) fn is_exact_current(&self) -> bool {
+        self.requested_anchor == self.resolved_anchor && self.anchor_status == "exact"
+    }
 }
 
 /// Resolve one name-mode CLI target back to its canonical structural anchor.
@@ -427,7 +432,6 @@ pub fn find_symbol_by_anchor_in_scope(
         crate::formats::Capability::ExactDefinition,
         requested_formats,
     );
-    let snapshot = crate::structural::current_snapshot(conn)?;
     let (resolved_anchor, anchor_status) = crate::structural::resolve_anchor_in_origins(
         conn,
         anchor,
@@ -468,7 +472,6 @@ pub fn find_symbol_by_anchor_in_scope(
     Ok((
         target,
         SymbolAnchorResolution {
-            snapshot,
             requested_anchor: anchor.to_string(),
             resolved_anchor,
             anchor_status,
@@ -897,6 +900,18 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+
+    #[test]
+    fn anchor_resolution_does_not_repeat_response_identity() -> Result<()> {
+        let value = serde_json::to_value(SymbolAnchorResolution {
+            requested_anchor: "sym:old.ts#::run@1".into(),
+            resolved_anchor: "sym:new.ts#::run@1".into(),
+            anchor_status: "moved".into(),
+        })?;
+        assert!(value.get("snapshot").is_none());
+        assert_eq!(value["anchor_status"], "moved");
+        Ok(())
+    }
 
     #[test]
     fn poisoned_rust_facts_stay_out_of_exact_and_event_queries() -> Result<()> {

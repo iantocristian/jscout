@@ -31,6 +31,9 @@ fn entity_lookup_filters_evidence_and_overview_is_bounded() -> Result<()> {
             ..Default::default()
         },
     )?;
+    let identities = crate::publication::Identities::read(&conn)?;
+    assert_eq!(result.snapshot, identities.code);
+    assert_eq!(result.publication_snapshot, identities.publication);
     assert_eq!(result.entities.len(), 1);
     assert_eq!(result.entities[0].occurrence_count, 1);
     assert_eq!(result.entities[0].occurrences[0].file_role, "production");
@@ -47,15 +50,32 @@ fn entity_lookup_filters_evidence_and_overview_is_bounded() -> Result<()> {
     assert_eq!(bounded.matched_entities, 2);
     assert!(bounded.truncated);
 
-    let overview = overview_response(
+    let response = overview_response(
         &conn,
         &OverviewOptions {
             area_limit: 1,
             relation_limit: 2,
             ..Default::default()
         },
-    )?
-    .overview;
+    )?;
+    assert_eq!(response.snapshot, identities.code);
+    assert_eq!(response.publication_snapshot, identities.publication);
+    let rendered = serde_json::to_value(&response)?;
+    assert!(rendered["response_budget"].get("byte_limit").is_none());
+    assert_eq!(
+        response.response_budget.rendered_bytes,
+        serde_json::to_string(&response)?.len()
+    );
+    assert_eq!(
+        rendered
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| *key == "snapshot")
+            .count(),
+        1
+    );
+    let overview = response.overview;
     assert_eq!(overview.areas.len(), 1);
     assert_eq!(overview.areas[0].path, "packages/api");
     assert!(overview.relations.len() <= 2);
@@ -590,6 +610,10 @@ fn semantic_overview_includes_only_current_fresh_memory() -> Result<()> {
     assert_eq!(
         fresh.response_budget.unbudgeted_bytes,
         fresh.response_budget.rendered_bytes
+    );
+    assert_eq!(
+        fresh.response_budget.rendered_bytes,
+        serde_json::to_string(&fresh)?.len()
     );
 
     let deterministic = overview_response(

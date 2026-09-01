@@ -22,12 +22,12 @@ flowchart TD
     ENTRY["corpus::repository_inventory - what the indexer calls"]
     WALK["walk::repository_inventory - generic over the consumer trait"]
     ENGINE["walk::inventory - the traversal engine"]
-    CODE["Code corpus - js, ts, jsx, tsx, mjs, cjs"]
+    CODE["Code corpus - JavaScript, TypeScript, Rust"]
     DOCS["Documentation corpus - md, mdx"]
-    OXC["oxc parse and chunk"]
+    OXC["format-specific extraction and chunking"]
     PROSE["pulldown-cmark parse and chunk"]
     GRAPH["graph_nodes and resolved_edges"]
-    DB[("SQLite - 47 tables, two FTS5, two vec0 families")]
+    DB[("SQLite - 49 regular tables, two FTS5, three vec0 families")]
     CQ["Code retrieval - exact tier then hybrid"]
     DQ["Documentation retrieval"]
 
@@ -38,21 +38,21 @@ flowchart TD
     DB --> DQ
 ```
 
-Read the top of that diagram for the layering. `walk::repository_inventory` (`src/walk.rs:187`) is generic over a `RepositoryInventoryConsumer` trait (`src/walk.rs:58`), and the traversal engine lives in `src/walk/inventory.rs` — an explicit `WalkTask` stack that reproduces sorted depth-first order without recursion and without a depth cap. `walk` owns traversal and ignore handling and knows nothing about Markdown: its only reference to `docs` sits inside `#[cfg(test)]`. Each plane owns its own membership, hidden-path policy, capture and extraction, so `DocumentationCollector` (`src/docs/corpus.rs:422`) is simply one consumer. One naming residue is worth knowing before you go looking: there are two functions called `repository_inventory`. The indexer calls `corpus::repository_inventory` (`src/docs/corpus.rs:156`, `src/indexer.rs:385`), which builds the documentation consumer and hands it to the generic `walk::repository_inventory` (`src/walk.rs:187`). The constraint driving the shared walk is unchanged — Markdown membership and capture must happen inside the same deterministic traversal that selects code, so documentation cannot acquire an independent snapshot or a second filesystem scan.
+Read the top of that diagram for the layering. `walk::repository_inventory` is generic over a `RepositoryInventoryConsumer` trait, and the traversal engine lives in `src/walk/inventory.rs` — an explicit `WalkTask` stack that reproduces sorted depth-first order without recursion and without a depth cap. `walk` owns traversal and ignore handling and knows nothing about Markdown. Each plane owns its membership, hidden-path policy, capture, and extraction, so `DocumentationCollector` is simply one consumer. Markdown membership and capture happen inside the same deterministic traversal that selects code, preventing two filesystem views inside one publication. That capture constraint is distinct from invalidation identity: the resulting code and documentation corpora now have independent digests.
 
 ## Two corpora, one database
 
-The `files` table carries a `corpus` column, and `code_files` / `code_chunks` are **views** over it filtered to `corpus='code'` (`src/store.rs:429-437`). Structural projection reads the views; documentation gets its own tables — `doc_inventory`, `doc_chunk_meta`, `doc_embedding_index_entries`, `doc_vector_generations`, a `docs_fts` index, and dimension-named `vec_doc_embeddings_N` vector tables alongside the code plane's `vec_embeddings_N`.
+The `files` table carries a `corpus` column, and `code_files` / `code_chunks` are **views** over it filtered to `corpus='code'`. Structural projection reads the views; documentation gets its own tables — including `doc_inventory`, `doc_chunk_meta`, `doc_file_provenance`, `doc_blame_cache`, `doc_embedding_index_entries`, and `doc_vector_generations` — plus a `docs_fts` index and dimension-named `vec_doc_embeddings_N` vector tables.
 
 Prose chunking could not reuse the code chunker. A chunk boundary is a section change — a heading or a thematic break — or a size threshold, never a heading crossing. Blocks merge while they share a section and stay under a byte budget; an oversized block is split at format-native boundaries (code-fence newlines, table rows, list items) with synthetic context re-prepended. A document's address is its byte span plus line span plus a heading breadcrumb; there are no slugs or HTML anchors anywhere in `src/docs/`.
 
 Documentation embedding identity is deliberately path-independent: a BLAKE3 over a version tag, the nearest heading, and the rendered body, excluding path and byte offsets, so renames and edits to ancestor headings reuse cached vectors.
 
-## Where the two planes are not actually separate
+## One publication, separate invalidation identities
 
-The design intent recorded in `PLAN.md` is that prose changes must not couple to structural snapshots. The implementation does not yet achieve that. `compute_snapshot_with_resolution` (`src/structural.rs:429`) hashes `SELECT f.path, f.hash, f.role, f.origin, f.corpus, f.format … FROM files f … ORDER BY f.path` — **with no corpus filter**. Documentation rows are inside the structural snapshot digest, so editing a `.md` file moves the structural snapshot. [06-structural-extraction.md](06-structural-extraction.md) traces the consequences; [21-sharp-edges.md](21-sharp-edges.md) ranks it.
+`src/publication.rs` computes three domain-separated digests. `code_digest` covers code contracts, code files and package identity, Rust edition context, and module resolution. `documentation_digest` covers documentation contracts and docs files as path/hash/format. The provenance digest covers Git-basis freshness state. `publication_snapshot` (`meta.snapshot`) is the fold of those three components, published with them in one transaction.
 
-The reverse coupling also exists: a documentation read validates `extraction_version`, the code plane's producer contract (`src/store.rs:134-139`), so the two planes are not independently readable.
+Atomic query/read responses return the code digest as `snapshot` on code and semantic surfaces and the documentation digest on documentation surfaces; `annotate` uses the code digest as its write guard. Those responses also carry `publication_snapshot`. The fold is not itself a freshness, write, or invalidation gate, and it does not cover later checker, semantic, reconnaissance, or vector writes. Open-time schema and producer-contract validation remains global, so separate rotation gates do not make the two planes independently readable from an incompatible database.
 
 ## Resolving `obj.method()` without a type checker
 
@@ -74,11 +74,9 @@ Code retrieval has two modes. Ranked runs a deterministic exact-identifier tier 
 
 Scouting executes in waves bounded by a `max_concurrency` setting that **defaults to 1**. Model execution may overlap; validation and database publication do not. A wave that fails mid-flight produces a `wave_aborted` outcome, and the interrupt contract needed two follow-up commits to settle. Because the default is 1, the concurrent path is the less-exercised one. See [11-scouting.md](11-scouting.md).
 
-## Gate status, stated accurately
+## Roadmap status
 
-`PLAN.md`'s own headings are not all current. G24 is headed "Proposed" but phases 1 and 2 — named-sections admission and documentation vectors — are built and merged; phases 3 (git-basis freshness) and 4 (documentation-aware watch classification) are not. The heading was never updated when the code landed. G25 is genuinely proposed. G23 shipped as agent guidance with its acceptance replay still pending. See [20-history-and-roadmap.md](20-history-and-roadmap.md).
-
-Phase 4's absence has a concrete consequence: **a `.md` edit alone does not trigger a watch generation.** The watcher filters events through `walk::is_indexable`, which accepts only JS/TS extensions. Documentation is reindexed only when a code change happens to trigger a generation. See [16-incremental-and-watch.md](16-incremental-and-watch.md).
+[`PLAN.md`](../../PLAN.md) is the normative source for numbered-gate status. This analysis describes the implementation and does not duplicate that status ledger.
 
 ## Where to go next
 
