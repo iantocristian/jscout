@@ -4008,7 +4008,15 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    sessions used jscout with it, 0/8 without it on the same server), that the
    taught flow is followed, and that on a 690-file repository plain shell
    search is cheaper for the same correctness; the value claim moves to
-   larger repositories.
+   larger repositories. The same surface replayed on the 23,488-file Next.js
+   task with `gpt-5.6-terra` —
+   [eval/results/next-stale-development-cache-g28-2026-09-02.md](eval/results/next-stale-development-cache-g28-2026-09-02.md)
+   — adds the other half of that picture: no naturalistic session (0/3)
+   opened the skill on a repository whose own `AGENTS.md` prescribes grep
+   first and lists eighteen native skills, while the forced arm used the
+   taught flow at 20 calls and 70 KB against 45 calls and 328 KB on the
+   pre-G28 surface, with the same pass. Adoption on such repositories is an
+   open question that G28 does not settle.
 
 Acceptance: the default registered surface, instructions included, costs
 less than a third of today's structural surface, and the core skill stays
