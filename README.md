@@ -130,8 +130,10 @@ jscout entities <root> [query] # runtime, contract, route, config, data, flag, h
 jscout paths <root> A B        # bounded ranked paths between exact boundaries
 jscout overview <root>         # deterministic cold-start inventory
   --semantic                   #   optional current/fresh untrusted memory overlay
-jscout mcp <root>              # MCP stdio server: code, graph, entity, overview,
-                               #   semantic_memory, exact evidence, and annotate tools
+jscout mcp <root>              # MCP stdio server; the core profile (default) serves
+                               #   search, definition, who_uses, calls, file_outline, events,
+                               #   documentation_search; --profile full adds graph, entity,
+                               #   overview, semantic_memory, and annotate tools
                                #   --result-transport auto|text|structured overrides config
 jscout memory <root> [query]   # compact semantic handles and freshness
   --anchor EXACT_ANCHOR        #   hard direct-support join; also --file/--reconnaissance-subject
@@ -1460,7 +1462,7 @@ agent learns the flows without reading the schema:
 
 ```bash
 jscout agent-guide --install /path/to/repo                     # core tier, .agents/skills
-jscout agent-guide --install /path/to/repo --tier full --dest claude
+jscout agent-guide --install /path/to/repo --tier full --dest claude   # pair with mcp.profile = "full"
 ```
 
 `--tier core` (the default) teaches the production-selected surface —
@@ -1472,14 +1474,22 @@ with the inquiry and write-back flows. `--dest` selects
 `.agents/skills/jscout/SKILL.md` (default), `.claude/skills/jscout/SKILL.md`,
 or `.codex/skills/jscout/SKILL.md`. The install refuses to overwrite an
 existing guide; `jscout agent-guide --update` replaces one exact destination
-in a single rename and creates it when missing. `jscout agent-guide` alone
-prints the text for clients that consume `AGENTS.md`.
+in a single rename and creates it when missing, and requires explicit
+`--tier` and `--dest` so it can never silently target another destination or
+downgrade an installed tier. `jscout agent-guide` alone prints the text for
+clients that consume `AGENTS.md`.
 
-The registered tool surface matches the tier. `jscout mcp` serves the `core`
-profile by default (alias `baseline`): the seven tools above. `--profile full`
-(alias `structural`) registers the remaining six; a `[mcp].tools` allowlist in
-`.jscout.toml` narrows either profile per project, and a call to a tool that
-is not registered fails at the boundary. `--database PATH` separates the index
+The skill tier and the MCP profile are independent settings that should be
+paired: `jscout mcp` serves the `core` profile by default (alias `baseline`),
+the seven tools the core skill teaches; `--profile full` (alias `structural`,
+or `mcp.profile = "full"` in `.jscout.toml`) registers the six additional
+tools the full skill teaches. Installing the full skill without the full
+profile teaches tools the server does not expose. A `[mcp].tools` allowlist
+narrows either profile per project — it must name at least one tool; omit it
+to register everything the profile allows — and a call to a tool that is not
+registered is refused at the boundary before any connection or lock is taken.
+The server instructions advertise `documentation_search` only when it is
+actually registered. `--database PATH` separates the index
 and semantic-memory state from the source root for isolated warm/cold runs.
 See [eval/README.md](eval/README.md) for the paired-run protocol and grader.
 

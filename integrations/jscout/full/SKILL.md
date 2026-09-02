@@ -13,7 +13,7 @@ carries a top-level `snapshot` (that surface's invalidation key) and
 
 | Tool | Required | Optional | Use for |
 |---|---|---|---|
-| `semantic_search` | `query` | `exhaustive`, `cursor`, `limit`, `formats`, `file_roles`, `vector`, `rerank`, `expand`, `include_memory`, `response_bytes` | every occurrence of a known identifier (`exhaustive: true`) or a ranked first look |
+| `semantic_search` | `query` | `exhaustive`, `cursor`, `limit`, `origins`, `formats`, `file_roles`, `vector`, `rerank`, `expand`, `include_memory`, `response_bytes` | every occurrence of a known identifier (`exhaustive: true`) or a ranked first look |
 | `definition` | `anchor`+`snapshot` or `symbol` | `origins`, `formats`, `source_bytes` | the source of one symbol |
 | `who_uses` | `anchor`+`snapshot` or `symbol` | `origins`, `formats` | callers and blast radius |
 | `calls` | `method` | `receiver`, `args`, `arg_position` | member-call sites and option arguments |
@@ -45,6 +45,12 @@ carries a top-level `snapshot` (that surface's invalidation key) and
 3. Drill down with `definition`: one returned `sym:` anchor plus the response
    `snapshot`, both copied verbatim. Then `who_uses` for callers, `calls` for
    member methods, `file_outline` for one file.
+
+Scope transfer: while paging, keep the original `query` and any explicit
+`origins`, `formats`, and `file_roles` unchanged, or the cursor is rejected.
+Carry explicitly supplied `origins` and `formats` into `definition` and
+`who_uses`; if the search omitted them, keep them omitted, and never build
+them from the echoed `scope`.
 
 ## Flow 2: localize a fuzzy description
 

@@ -940,6 +940,11 @@ impl RuntimeConfig {
         if !matches!(result_transport.as_str(), "auto" | "text" | "structured") {
             bail!("mcp.result_transport must be auto, text, or structured");
         }
+        if raw.mcp.tools.as_ref().is_some_and(Vec::is_empty) {
+            bail!(
+                "mcp.tools must list at least one tool; omit it to register every tool the profile allows"
+            );
+        }
         let tools = resolver.configured_or("mcp.tools", raw.mcp.tools, Vec::<String>::new());
         crate::mcp::validate_tool_names(&tools)?;
         let mcp = McpSettings {

@@ -700,3 +700,40 @@ fn semantic_overview_includes_only_current_fresh_memory() -> Result<()> {
     assert_eq!(overlay.excluded_non_fresh, 1);
     Ok(())
 }
+
+#[test]
+fn default_overview_stays_within_a_few_kilobytes_at_150_workspace_areas() -> Result<()> {
+    // G28 phase 2 acceptance: 150 workspace areas, default options, no
+    // reconnaissance prose, a bounded area table, and a few-kilobyte response.
+    let repo = tempfile::tempdir()?;
+    for index in 0..150 {
+        let package = repo.path().join(format!("packages/area-{index:03}/src"));
+        fs::create_dir_all(&package)?;
+        fs::write(
+            package.join("index.ts"),
+            format!("export function area{index}() {{ return {index}; }}\n"),
+        )?;
+    }
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let response = overview_response(&conn, &OverviewOptions::default())?;
+    assert_eq!(response.overview.areas_matched, 150);
+    assert_eq!(response.overview.areas.len(), 20);
+    assert!(response.overview.areas_truncated);
+    assert!(response.reconnaissance.is_none());
+    assert_eq!(
+        response
+            .response_budget
+            .omitted_reconnaissance_classifications,
+        0
+    );
+    let rendered = serde_json::to_string(&response)?;
+    assert!(!rendered.contains("\"reconnaissance\""));
+    assert!(
+        rendered.len() < 5_000,
+        "default overview at 150 areas rendered {} bytes",
+        rendered.len()
+    );
+    Ok(())
+}

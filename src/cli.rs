@@ -503,12 +503,12 @@ pub(super) enum Command {
         /// Replace the skill under ROOT at --dest with the shipped guide
         #[arg(long, conflicts_with = "install")]
         update: Option<PathBuf>,
-        /// Skill tier: core (baseline tool surface) or full (structural)
-        #[arg(long, default_value = "core")]
-        tier: String,
-        /// Skill location: agents (.agents/skills), claude (.claude/skills), or codex (.codex/skills)
-        #[arg(long, default_value = "agents")]
-        dest: String,
+        /// Skill tier: core (baseline tool surface) or full (structural); install/print default to core, update requires it
+        #[arg(long)]
+        tier: Option<String>,
+        /// Skill location: agents (.agents/skills), claude (.claude/skills), or codex (.codex/skills); install/print default to agents, update requires it
+        #[arg(long)]
+        dest: Option<String>,
     },
     /// Enrich exact member-call occurrences with bounded TypeScript checker facts
     Enrich {

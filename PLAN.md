@@ -3992,11 +3992,16 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    [eval/results/production-windows-2026-08-22-24.md](eval/results/production-windows-2026-08-22-24.md)
    from the measured telemetry and request-log rows; the raw rows and
    transcripts stay out of the repository and are identified by hash. The
-   byte/quality replay is retired by decision on 2026-09-02: it required
-   re-running agents against the production monorepo, and the recorded
-   windows already settle the direction. The recorded numbers remain the
-   comparison point for any future production window, and documentation and
-   Rust guidance remains subject to their first such window. A live
+   byte/quality replay is retired by maintainer decision (Cristian,
+   2026-09-02): it required re-running agents against the production
+   monorepo, and the recorded windows already settle the direction. This is
+   a scope decision, not a result established by the implementation: the
+   live ai-pipe validation confirms adoption and flow compliance but shows
+   no outcome advantage on that 690-file repository, and the favourable
+   7,000-file evidence predates G28 with its raw artifacts held privately.
+   The recorded numbers remain the comparison point for any future
+   production window, and documentation and Rust guidance remains subject to
+   their first such window. A live
    validation of the shipped surface on ai-pipe with Codex —
    [eval/results/g28-live-ai-pipe-2026-09-02.md](eval/results/g28-live-ai-pipe-2026-09-02.md)
    — confirmed that the installed skill is the adoption mechanism (8/8

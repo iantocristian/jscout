@@ -65,6 +65,25 @@ impl Destination {
     }
 }
 
+/// Resolve `--tier`/`--dest`. Install and print default to `core` and
+/// `agents`; `--update` requires both so an update can never silently target
+/// the wrong destination or downgrade an installed tier.
+pub fn resolve_selectors(
+    updating: bool,
+    tier: Option<&str>,
+    destination: Option<&str>,
+) -> Result<(Tier, Destination)> {
+    if updating && (tier.is_none() || destination.is_none()) {
+        bail!(
+            "agent guide --update requires explicit --tier core|full and --dest agents|claude|codex so it replaces exactly the installed guide"
+        );
+    }
+    Ok((
+        Tier::parse(tier.unwrap_or("core"))?,
+        Destination::parse(destination.unwrap_or("agents"))?,
+    ))
+}
+
 fn target(root: &Path, destination: Destination) -> Result<PathBuf> {
     let root = root
         .canonicalize()
@@ -161,7 +180,7 @@ fn create_update_temp(parent: &Path) -> Result<(PathBuf, File)> {
 mod tests {
     use anyhow::Result;
 
-    use super::{CORE_GUIDE, Destination, FULL_GUIDE, Tier, install, update};
+    use super::{CORE_GUIDE, Destination, FULL_GUIDE, Tier, install, resolve_selectors, update};
 
     /// The pre-G28 guide was 12,234 bytes; the core tier must stay under a
     /// quarter of it (G28 acceptance).
@@ -189,6 +208,10 @@ mod tests {
         "restart that surface's traversal",
         "prose is never runtime proof",
         "## On instruction",
+        "Scope transfer",
+        "or the cursor is rejected",
+        "Carry explicitly supplied `origins` and `formats` into `definition` and",
+        "from the echoed `scope`",
     ];
 
     #[test]
@@ -251,6 +274,27 @@ mod tests {
                 "missing full contract: {marker}"
             );
         }
+    }
+
+    #[test]
+    fn update_requires_explicit_tier_and_destination() -> Result<()> {
+        assert_eq!(
+            resolve_selectors(false, None, None)?,
+            (Tier::Core, Destination::Agents)
+        );
+        assert_eq!(
+            resolve_selectors(true, Some("full"), Some("claude"))?,
+            (Tier::Full, Destination::Claude)
+        );
+        for (tier, dest) in [(None, None), (Some("full"), None), (None, Some("claude"))] {
+            assert!(
+                resolve_selectors(true, tier, dest)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--update requires explicit --tier")
+            );
+        }
+        Ok(())
     }
 
     #[test]

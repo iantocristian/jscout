@@ -9,12 +9,12 @@ use serde_json::json;
 
 use super::{
     AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolAccess, ToolProfile,
-    allowed_tool_defs, call_documentation_tool, call_tool, definition_source_metrics, duration_ms,
-    exhaustive_telemetry_metrics, expansion_role_metrics, initialize_result, log_request,
-    render_bounded_items, render_bounded_object_arrays, render_tool_result,
-    search_options_from_args, semantic_artifact_metrics, server_instructions,
+    allowed_tool_defs, call_documentation_tool, call_tool, call_tool_with_allowlist,
+    definition_source_metrics, duration_ms, exhaustive_telemetry_metrics, expansion_role_metrics,
+    initialize_result, log_request, render_bounded_items, render_bounded_object_arrays,
+    render_tool_result, search_options_from_args, semantic_artifact_metrics, server_instructions,
     settle_unbudgeted_response, settle_value_rendered_bytes, sum_durations, telemetry_snapshot,
-    tool_access, tool_defs, validate_tool_names,
+    tool_access, tool_defs, tool_registered, validate_tool_names,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
 
@@ -34,6 +34,7 @@ fn initialize_exposes_effective_documentation_freshness_defaults() -> Result<()>
         ResultTransportPolicy::Text,
         &McpClientInfo::default(),
         &runtime,
+        &[],
     );
     let defaults = &result["serverInfo"]["documentationRetrievalDefaults"];
     assert_eq!(defaults["freshness"], json!(true));
@@ -1321,6 +1322,55 @@ fn default_surface_costs_under_a_third_of_the_pre_g28_structural_surface() {
         full < 20_000,
         "full surface is {full} bytes; the schema-only full profile should stay under 20 KB"
     );
+}
+
+#[test]
+fn trimmed_tools_are_refused_at_the_boundary_before_any_access_decision() -> Result<()> {
+    let allow = ["definition".to_string()];
+    assert!(tool_registered(&allow, "definition"));
+    assert!(!tool_registered(&allow, "annotate"));
+    assert!(tool_registered(&[], "annotate"));
+    // The write-capable tool is refused by registration alone; an in-memory
+    // connection with no schema proves no tool logic (or writer) was reached.
+    let conn = Connection::open_in_memory().expect("in-memory database");
+    for (profile, name, args) in [
+        (
+            ToolProfile::Structural,
+            "annotate",
+            json!({ "type": "workflow" }),
+        ),
+        (
+            ToolProfile::Structural,
+            "semantic_memory",
+            json!({ "query": "x" }),
+        ),
+        (
+            ToolProfile::Baseline,
+            "file_outline",
+            json!({ "path": "x.ts" }),
+        ),
+    ] {
+        let error = call_tool_with_allowlist(
+            Path::new("."),
+            &conn,
+            None,
+            profile,
+            SourceView::Full,
+            &allow,
+            name,
+            &args,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(&format!("tool `{name}` is not enabled by [mcp].tools")),
+            "{name}: {error}"
+        );
+    }
+    // Instructions follow the effective registration, not the docs flag.
+    assert!(!server_instructions(ToolProfile::Baseline, false).contains("documentation_search"));
+    assert!(server_instructions(ToolProfile::Baseline, true).contains("documentation_search"));
+    Ok(())
 }
 
 #[test]

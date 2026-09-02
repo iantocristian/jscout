@@ -704,8 +704,8 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             tier,
             dest,
         } => {
-            let tier = agent::Tier::parse(&tier)?;
-            let destination = agent::Destination::parse(&dest)?;
+            let (tier, destination) =
+                agent::resolve_selectors(update.is_some(), tier.as_deref(), dest.as_deref())?;
             if let Some(root) = install {
                 let target = agent::install(&root, tier, destination)?;
                 println!("installed {}", target.display());

@@ -190,6 +190,10 @@ fn version_at_least(version: &str, minimum: [u64; 3]) -> bool {
     [major, minor, patch] >= minimum
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "initialize carries every server identity input; bundling them hides which one advertised a tool"
+)]
 fn initialize_result(
     requested_protocol: &str,
     binary_fingerprint: &str,
@@ -198,6 +202,7 @@ fn initialize_result(
     result_transport: ResultTransportPolicy,
     client_info: &McpClientInfo,
     runtime: &config::RuntimeConfig,
+    tools: &[String],
 ) -> Value {
     json!({
         "protocolVersion": requested_protocol,
@@ -237,7 +242,10 @@ fn initialize_result(
                 "textFallback": true,
             },
         },
-        "instructions": server_instructions(profile, runtime.effective.docs.enabled)
+        "instructions": server_instructions(
+            profile,
+            runtime.effective.docs.enabled && tool_registered(tools, "documentation_search"),
+        )
     })
 }
 
@@ -336,6 +344,7 @@ pub fn serve(
                         result_transport,
                         &client_info,
                         runtime,
+                        &tools,
                     ),
                 )
             }
@@ -349,7 +358,13 @@ pub fn serve(
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let started = Instant::now();
                 let retrieval_timings = RefCell::new(RetrievalStageMetrics::default());
-                let result = if tool_access(profile, name) == ToolAccess::Write {
+                let result = if !tool_registered(&tools, name) {
+                    // Registration is decided before access: a tool trimmed by
+                    // `[mcp].tools` must not open a writer or take a lock.
+                    Err(anyhow::anyhow!(
+                        "tool `{name}` is not enabled by [mcp].tools"
+                    ))
+                } else if tool_access(profile, name) == ToolAccess::Write {
                     // The server is read-only until the one write-capable tool
                     // is actually selected. Keep schema writes and writer locks
                     // out of every retrieval-only MCP session.
@@ -579,12 +594,15 @@ const STRUCTURAL_SERVER_INSTRUCTIONS: &str = concat!(
     "Mechanical contracts: continue an exhaustive search only by copying the returned next_cursor unchanged until truncated=false, and retry a response_budget_too_small error with minimum_bytes=N on the same page and cursor with response_bytes=N."
 );
 
-fn server_instructions(profile: ToolProfile, docs_enabled: bool) -> String {
+/// `docs_registered` is the effective registration of `documentation_search`
+/// (documentation enabled and not trimmed by `[mcp].tools`), not the raw
+/// `[docs].enabled` flag.
+fn server_instructions(profile: ToolProfile, docs_registered: bool) -> String {
     let instructions = match profile {
         ToolProfile::Baseline => BASELINE_SERVER_INSTRUCTIONS,
         ToolProfile::Structural => STRUCTURAL_SERVER_INSTRUCTIONS,
     };
-    if docs_enabled {
+    if docs_registered {
         instructions.to_owned()
     } else {
         instructions.replace(
@@ -964,6 +982,13 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
     tools
 }
 
+/// Whether `[mcp].tools` leaves a tool registered; an empty allowlist keeps
+/// everything the profile allows. Evaluated before any access decision so a
+/// forbidden tool never selects a writer connection.
+pub(crate) fn tool_registered(allowlist: &[String], name: &str) -> bool {
+    allowlist.is_empty() || allowlist.iter().any(|tool| tool == name)
+}
+
 /// `tool_defs` narrowed by the `[mcp].tools` allowlist; an empty allowlist
 /// registers everything the profile allows.
 fn allowed_tool_defs(profile: ToolProfile, docs_enabled: bool, allowlist: &[String]) -> Value {
@@ -1152,7 +1177,9 @@ struct RetrievalStageMetrics {
 }
 
 fn call_tool_with_config(context: &ToolContext<'_>, name: &str, args: &Value) -> Result<String> {
-    if !context.tools.is_empty() && !context.tools.iter().any(|tool| tool == name) {
+    // Defense in depth: `serve` already refuses unregistered tools before
+    // choosing a connection; direct callers get the same boundary.
+    if !tool_registered(context.tools, name) {
         anyhow::bail!("tool `{name}` is not enabled by [mcp].tools");
     }
     if tool_access(context.profile, name) == ToolAccess::Write {
@@ -2399,6 +2426,24 @@ fn call_tool(
     name: &str,
     args: &Value,
 ) -> Result<String> {
+    call_tool_with_allowlist(root, conn, provider, profile, source_view, &[], name, args)
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors ToolContext construction"
+)]
+fn call_tool_with_allowlist(
+    root: &Path,
+    conn: &Connection,
+    provider: Option<&embed::Provider>,
+    profile: ToolProfile,
+    source_view: scout::SourceView,
+    tools: &[String],
+    name: &str,
+    args: &Value,
+) -> Result<String> {
     let retrieval_timings = RefCell::new(RetrievalStageMetrics::default());
     call_tool_with_config(
         &ToolContext {
@@ -2410,7 +2455,7 @@ fn call_tool(
             source_view,
             search_defaults: &config::SearchSettings::default(),
             docs_defaults: None,
-            tools: &[],
+            tools,
             timing: false,
             collect_telemetry: false,
             retrieval_timings: &retrieval_timings,
