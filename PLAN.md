@@ -3996,7 +3996,14 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    re-running agents against the production monorepo, and the recorded
    windows already settle the direction. The recorded numbers remain the
    comparison point for any future production window, and documentation and
-   Rust guidance remains subject to their first such window.
+   Rust guidance remains subject to their first such window. A live
+   validation of the shipped surface on ai-pipe with Codex —
+   [eval/results/g28-live-ai-pipe-2026-09-02.md](eval/results/g28-live-ai-pipe-2026-09-02.md)
+   — confirmed that the installed skill is the adoption mechanism (8/8
+   sessions used jscout with it, 0/8 without it on the same server), that the
+   taught flow is followed, and that on a 690-file repository plain shell
+   search is cheaper for the same correctness; the value claim moves to
+   larger repositories.
 
 Acceptance: the default registered surface, instructions included, costs
 less than a third of today's structural surface, and the core skill stays
