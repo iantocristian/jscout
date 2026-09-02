@@ -3885,7 +3885,7 @@ scratch artifacts are not checked in. The implementation, corpus counts,
 integrity checks, artifact hashes, and full measurement limits are recorded in
 [eval/results/g27-plane-identities-2026-08-30.md](eval/results/g27-plane-identities-2026-08-30.md).
 
-## G28 — agent surface economy (phases 0–2 implemented; replay pending)
+## G28 — agent surface economy (implemented; replay retired)
 
 The surface costs more than the work. An out-of-box MCP session pays the
 structural profile's 13 tool definitions plus instructions — roughly 27 KB,
@@ -3988,11 +3988,15 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    response-shape and differential tests. Phase 2 is implemented: the overview
    defaults `reconnaissance_limit` to zero, a subject implies one, and budget
    eviction sheds reconnaissance prose before structural counts. The
-   byte/quality replay acceptance has not run, and the 2026-08-22/24 telemetry
-   write-up into `eval/` remains owed. The G27 isolation measurement is
-   evidence for G27, not a substitute for G28's surface-cost and
-   answer-quality thresholds. Documentation and Rust guidance remains subject
-   to its first production telemetry window.
+   2026-08-22 and 2026-08-24 production windows are written up in
+   [eval/results/production-windows-2026-08-22-24.md](eval/results/production-windows-2026-08-22-24.md)
+   from the measured telemetry and request-log rows; the raw rows and
+   transcripts stay out of the repository and are identified by hash. The
+   byte/quality replay is retired by decision on 2026-09-02: it required
+   re-running agents against the production monorepo, and the recorded
+   windows already settle the direction. The recorded numbers remain the
+   comparison point for any future production window, and documentation and
+   Rust guidance remains subject to their first such window.
 
 Acceptance: the default registered surface, instructions included, costs
 less than a third of today's structural surface, and the core skill stays
@@ -4000,14 +4004,13 @@ under a quarter of the current guide; a ranked search hit is majority
 content by bytes; the G27 identity fields each appear exactly once on the
 covered response set; the
 overview default response at 150 workspace areas stays within a few
-kilobytes with no reconnaissance prose; replayed against the recorded
-baselines, the skill-guided arm's call count and answer quality do not
-regress and the use-every-endpoint arm's bytes drop by at least half; and
-every routing rule exists in exactly one surface — the skill — with the
-instruction strings reduced to identity, pointer, and mechanical contracts.
-Phases 0–2 are implemented; G28 remains open until the recorded
-byte/quality replay gates pass and the production telemetry windows are
-written up.
+kilobytes with no reconnaissance prose; and every routing rule exists in
+exactly one surface — the skill — with the instruction strings reduced to
+identity, pointer, and mechanical contracts. Each of these is pinned by a
+test. The replay gates that were to compare the skill-guided and
+use-every-endpoint arms against the recorded baselines are retired with the
+replay; the baselines are recorded in the production-windows report for any
+later production comparison. G28 is closed.
 
 ## Evaluation decisions already made
 
