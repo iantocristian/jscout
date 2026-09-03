@@ -17,7 +17,7 @@
   frontmatter description swapped in), `forced` (jscout mandated, shell search
   forbidden, one trial), `grep` control (one trial).
 - Artifacts (outside the repository):
-  `~/git/jscout-replay-runs/next-stale-dev-cache-g28-2026-09-02/trial-g28{a,b,c,d-olddesc}/`.
+  `~/git/jscout-replay-runs/next-stale-dev-cache-g28-2026-09-02/trial-g28{a,b,c,d-olddesc,e-1,e-2}/`.
 
 ## Preparation (once; the profile database was reused byte-identically by trials b and c)
 
@@ -148,6 +148,25 @@ surface is a coin flip on this repository. V1 reads the skill first every time;
 the one V1 session without MCP calls read the skill, tried `jscout` as a shell
 command, and fell back to `rg` within the cap, which the new opening line
 addresses.
+
+## Confirmation: full replay arms on the fixed surface
+
+Two naturalistic `checker-embed / skill` arms with the 3b5ae8f binary, same
+rig, same reused database, terra/high, graded end to end:
+
+| Trial | Grade | jscout calls | Tool bytes | Skill reads | Shell cmds | Fresh in | Agent time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| e-1 | pass | 11 | 60,556 | 3 | 46 | 241,225 | 851.5 s |
+| e-2 | pass | 8 | 33,129 | 7 | 36 | 326,865 | 1,462.2 s |
+
+Both sessions read the skill and worked through jscout (`semantic_search`,
+`file_outline`, `definition`, `who_uses`) before editing; both passed the
+hidden tests. Adoption on this repository went from 0/3 (shipped surface)
+to 2/2 (fixed surface) in full replay, matching the short-session
+measurement. The local inference sidecar was not running during these two
+arms, so their ranked searches report `retrieval_vector: degraded` and were
+served lexically; adoption and grade are unaffected, but their ranked-search
+quality is not the hybrid path measured in the forced arm.
 
 This is one task and one model. It records adoption and surface cost on a
 repository with strong native agent instructions; it does not estimate the

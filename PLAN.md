@@ -4021,7 +4021,9 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    pointer, the trigger-form descriptions, and the "MCP tools, not shell
    commands" opening line; five-seed short-session measurement moved
    first-command skill reads from 2/5 to 5/5 and sessions using jscout from
-   3/5 to 4/5 on that repository.
+   3/5 to 4/5 on that repository, and two full replay arms on the fixed
+   surface both read the skill, worked through jscout, and passed (2/2
+   against 0/3 before).
 
 Acceptance: the default registered surface, instructions included, costs
 less than a third of today's structural surface, and the core skill stays
