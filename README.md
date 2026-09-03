@@ -161,7 +161,7 @@ jscout agent-guide             # print the core skill (--tier full for the full 
 jscout agent-guide --install R # install a project-local jscout skill
   --tier core|full             #   core teaches the default tool surface; full adds memory/graph
   --dest agents|claude|codex   #   .agents/, .claude/, or .codex/skills/jscout/SKILL.md
-jscout agent-guide --update R  # replace it with the current shipped skill
+jscout agent-guide --update R --tier core --dest agents  # replace exactly that installed skill
 ```
 
 ### Markdown and MDX documentation retrieval
@@ -1485,11 +1485,15 @@ the seven tools the core skill teaches; `--profile full` (alias `structural`,
 or `mcp.profile = "full"` in `.jscout.toml`) registers the six additional
 tools the full skill teaches. Installing the full skill without the full
 profile teaches tools the server does not expose. A `[mcp].tools` allowlist
-narrows either profile per project — it must name at least one tool; omit it
-to register everything the profile allows — and a call to a tool that is not
-registered is refused at the boundary before any connection or lock is taken.
-The server instructions advertise `documentation_search` only when it is
-actually registered. `--database PATH` separates the index
+narrows either profile per project — it must name at least one tool, and an
+allowlist that leaves nothing registered under the effective profile
+(documentation included) is refused at server start; omit it to register
+everything the profile allows — and a call to a tool that is not registered
+is refused at the boundary before any connection or lock is taken. The
+server instructions name the repository, tell the agent to read the
+installed skill before its first repository search, and carry the two
+mechanical contracts; every routing rule, documentation included, lives in
+the skill. `--database PATH` separates the index
 and semantic-memory state from the source root for isolated warm/cold runs.
 See [eval/README.md](eval/README.md) for the paired-run protocol and grader.
 

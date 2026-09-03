@@ -242,10 +242,7 @@ fn initialize_result(
                 "textFallback": true,
             },
         },
-        "instructions": server_instructions(
-            profile,
-            runtime.effective.docs.enabled && tool_registered(tools, "documentation_search"),
-        )
+        "instructions": server_instructions(profile)
     })
 }
 
@@ -264,6 +261,7 @@ pub fn serve(
         tools,
     } = options;
     validate_tool_names(&tools)?;
+    ensure_effective_surface(profile, runtime.effective.docs.enabled, &tools)?;
     let root = root.canonicalize()?;
     let binary_fingerprint = crate::runtime_identity::current_binary_fingerprint();
     let conn = store::open_path_read_only(database_path)?;
@@ -358,44 +356,40 @@ pub fn serve(
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let started = Instant::now();
                 let retrieval_timings = RefCell::new(RetrievalStageMetrics::default());
-                let result = if !tool_registered(&tools, name) {
-                    // Registration is decided before access: a tool trimmed by
-                    // `[mcp].tools` must not open a writer or take a lock.
-                    Err(anyhow::anyhow!(
-                        "tool `{name}` is not enabled by [mcp].tools"
-                    ))
-                } else if tool_access(profile, name) == ToolAccess::Write {
-                    // The server is read-only until the one write-capable tool
-                    // is actually selected. Keep schema writes and writer locks
-                    // out of every retrieval-only MCP session.
-                    let write_conn = store::open_path(database_path);
-                    match write_conn {
-                        Ok(write_conn) => call_tool_with_config(
-                            &ToolContext {
-                                root: &root,
-                                conn: &write_conn,
-                                provider: provider.as_ref(),
-                                reranker: reranker.as_ref(),
-                                profile,
-                                source_view,
-                                search_defaults: &runtime.effective.search,
-                                docs_defaults: runtime
-                                    .effective
-                                    .docs
-                                    .enabled
-                                    .then_some(&runtime.effective.docs),
-                                tools: &tools,
-                                timing: runtime.effective.diagnostics.timing,
-                                collect_telemetry,
-                                retrieval_timings: &retrieval_timings,
-                            },
-                            name,
-                            &args,
-                        ),
-                        Err(error) => Err(error),
+                let result = match plan_tool_call(&tools, profile, name) {
+                    Err(error) => Err(error),
+                    Ok(ToolAccess::Write) => {
+                        // The server is read-only until the one write-capable tool
+                        // is actually selected. Keep schema writes and writer locks
+                        // out of every retrieval-only MCP session.
+                        let write_conn = store::open_path(database_path);
+                        match write_conn {
+                            Ok(write_conn) => call_tool_with_config(
+                                &ToolContext {
+                                    root: &root,
+                                    conn: &write_conn,
+                                    provider: provider.as_ref(),
+                                    reranker: reranker.as_ref(),
+                                    profile,
+                                    source_view,
+                                    search_defaults: &runtime.effective.search,
+                                    docs_defaults: runtime
+                                        .effective
+                                        .docs
+                                        .enabled
+                                        .then_some(&runtime.effective.docs),
+                                    tools: &tools,
+                                    timing: runtime.effective.diagnostics.timing,
+                                    collect_telemetry,
+                                    retrieval_timings: &retrieval_timings,
+                                },
+                                name,
+                                &args,
+                            ),
+                            Err(error) => Err(error),
+                        }
                     }
-                } else {
-                    call_tool_with_config(
+                    Ok(ToolAccess::Read) => call_tool_with_config(
                         &ToolContext {
                             root: &root,
                             conn: &conn,
@@ -416,7 +410,7 @@ pub fn serve(
                         },
                         name,
                         &args,
-                    )
+                    ),
                 };
                 let (tool_result, mut result_metrics) =
                     render_tool_result(&result, result_transport, &client_info);
@@ -581,42 +575,32 @@ fn render_tool_result(
 /// mechanical contracts only; every routing rule lives in the installed skill
 /// (G28). Tool descriptions are one line each for the same reason.
 const BASELINE_SERVER_INSTRUCTIONS: &str = concat!(
-    "jscout serves a code and documentation index for one repository; usage guidance lives in the installed jscout skill (`jscout agent-guide --tier core`). ",
-    "Use documentation_search for repository Markdown, MDX, and authored guidance; it has a separate documentation snapshot, and authored prose is not runtime proof. ",
+    "jscout indexes this repository's code and documentation. Before the first repository search, read the installed jscout skill at .agents/skills/jscout/SKILL.md (or the .claude or .codex equivalent; `jscout agent-guide --tier core` installs it) and follow its flows; it is the usage contract for these tools. ",
     "Every successful response that observes one atomic index publication reports its plane digest as snapshot and the canonical indexed publication identity as publication_snapshot; only snapshot is an invalidation key. ",
     "Mechanical contracts: continue an exhaustive search only by copying the returned next_cursor unchanged until truncated=false, and retry a response_budget_too_small error with minimum_bytes=N on the same page and cursor with response_bytes=N."
 );
 
 const STRUCTURAL_SERVER_INSTRUCTIONS: &str = concat!(
-    "jscout serves a code and documentation index with evidence-backed semantic memory for one repository; usage guidance lives in the installed jscout skill (`jscout agent-guide --tier full`). ",
-    "Use documentation_search for repository Markdown, MDX, and authored guidance; it has a separate documentation snapshot, and authored prose is not runtime proof. ",
+    "jscout indexes this repository's code and documentation and keeps evidence-backed semantic memory for it. Before the first repository search, read the installed jscout skill at .agents/skills/jscout/SKILL.md (or the .claude or .codex equivalent; `jscout agent-guide --tier full` installs it) and follow its flows; it is the usage contract for these tools. ",
     "Every successful response that observes one atomic index publication reports its plane digest as snapshot and the canonical indexed publication identity as publication_snapshot; only snapshot is an invalidation key. ",
     "Mechanical contracts: continue an exhaustive search only by copying the returned next_cursor unchanged until truncated=false, and retry a response_budget_too_small error with minimum_bytes=N on the same page and cursor with response_bytes=N."
 );
 
-/// `docs_registered` is the effective registration of `documentation_search`
-/// (documentation enabled and not trimmed by `[mcp].tools`), not the raw
-/// `[docs].enabled` flag.
-fn server_instructions(profile: ToolProfile, docs_registered: bool) -> String {
-    let instructions = match profile {
+/// Identity, a directive pointer to the installed skill, and the mechanical
+/// contracts. Every routing rule, documentation included, lives in the skill.
+fn server_instructions(profile: ToolProfile) -> String {
+    match profile {
         ToolProfile::Baseline => BASELINE_SERVER_INSTRUCTIONS,
         ToolProfile::Structural => STRUCTURAL_SERVER_INSTRUCTIONS,
-    };
-    if docs_registered {
-        instructions.to_owned()
-    } else {
-        instructions.replace(
-            "Use documentation_search for repository Markdown, MDX, and authored guidance; it has a separate documentation snapshot, and authored prose is not runtime proof. ",
-            "",
-        )
     }
+    .to_owned()
 }
 
 fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
     let mut tools = json!([
         {
             "name": "semantic_search",
-            "description": "Search indexed code: ranked hits with copy-safe anchors, or exhaustive=true for the complete deterministic match set in cursor pages.",
+            "description": "Repository code search; use it before grep or rg for code discovery, symbol lookup, and reference tracing (the jscout skill has the flows). exhaustive=true pages the complete match set.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -985,6 +969,38 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
 /// Whether `[mcp].tools` leaves a tool registered; an empty allowlist keeps
 /// everything the profile allows. Evaluated before any access decision so a
 /// forbidden tool never selects a writer connection.
+/// Registration is decided before access: a tool trimmed by `[mcp].tools`
+/// must not open a writer or take a lock. `serve` and the boundary test share
+/// this plan, so the regression cannot be bypassed by entering deeper.
+fn plan_tool_call(tools: &[String], profile: ToolProfile, name: &str) -> Result<ToolAccess> {
+    if !tool_registered(tools, name) {
+        anyhow::bail!("tool `{name}` is not enabled by [mcp].tools");
+    }
+    Ok(tool_access(profile, name))
+}
+
+/// An allowlist may only narrow the profile; one that leaves nothing
+/// registered is refused at server start rather than serving an empty surface.
+fn ensure_effective_surface(
+    profile: ToolProfile,
+    docs_enabled: bool,
+    tools: &[String],
+) -> Result<()> {
+    let registered = allowed_tool_defs(profile, docs_enabled, tools);
+    if registered.as_array().is_some_and(Vec::is_empty) {
+        anyhow::bail!(
+            "[mcp].tools registers no tool under profile `{}`{}; list a tool the profile exposes or omit [mcp].tools",
+            profile.as_str(),
+            if docs_enabled {
+                ""
+            } else {
+                " with documentation disabled"
+            }
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn tool_registered(allowlist: &[String], name: &str) -> bool {
     allowlist.is_empty() || allowlist.iter().any(|tool| tool == name)
 }

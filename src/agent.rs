@@ -244,6 +244,38 @@ mod tests {
         );
     }
 
+    /// Codex and similar clients select a skill only when "the task clearly
+    /// matches an available skill's description". The 2026-09-02 Next.js replay
+    /// showed that a jargon description ("Localize and prove code…") was never
+    /// selected (0/3 sessions) while the pre-G28 "Use the jscout repository
+    /// index to…" form was; both tiers keep that proven trigger form.
+    #[test]
+    fn guide_descriptions_state_when_to_use_the_skill() {
+        for (tier, guide) in [("core", CORE_GUIDE), ("full", FULL_GUIDE)] {
+            let description = guide
+                .lines()
+                .find_map(|line| line.strip_prefix("description: "))
+                .unwrap_or_else(|| panic!("{tier} guide has no frontmatter description"));
+            assert!(
+                description.starts_with("Use the jscout repository index to search"),
+                "{tier} guide description must open with the trigger form: {description}"
+            );
+            for marker in [
+                "before grep or rg",
+                "fix a bug, implement a change, or answer a question",
+                "investigate known identifiers completely",
+                "cross-file questions",
+                "source-backed evidence",
+                "JavaScript or TypeScript project",
+            ] {
+                assert!(
+                    description.contains(marker),
+                    "{tier} guide description lacks `{marker}`: {description}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn full_guide_adds_inquiry_and_write_back_without_losing_the_core() {
         for marker in SHARED_MARKERS {

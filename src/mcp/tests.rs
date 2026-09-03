@@ -10,11 +10,12 @@ use serde_json::json;
 use super::{
     AppliedResultTransport, McpClientInfo, ResultTransportPolicy, ToolAccess, ToolProfile,
     allowed_tool_defs, call_documentation_tool, call_tool, call_tool_with_allowlist,
-    definition_source_metrics, duration_ms, exhaustive_telemetry_metrics, expansion_role_metrics,
-    initialize_result, log_request, render_bounded_items, render_bounded_object_arrays,
-    render_tool_result, search_options_from_args, semantic_artifact_metrics, server_instructions,
-    settle_unbudgeted_response, settle_value_rendered_bytes, sum_durations, telemetry_snapshot,
-    tool_access, tool_defs, tool_registered, validate_tool_names,
+    definition_source_metrics, duration_ms, ensure_effective_surface, exhaustive_telemetry_metrics,
+    expansion_role_metrics, initialize_result, log_request, plan_tool_call, render_bounded_items,
+    render_bounded_object_arrays, render_tool_result, search_options_from_args,
+    semantic_artifact_metrics, server_instructions, settle_unbudgeted_response,
+    settle_value_rendered_bytes, sum_durations, telemetry_snapshot, tool_access, tool_defs,
+    tool_registered, validate_tool_names,
 };
 use crate::{config, embed, indexer, scout::SourceView, search, store, structural};
 
@@ -359,10 +360,11 @@ fn documentation_search_tool_is_separate_and_works_without_a_provider() -> Resul
             .iter()
             .any(|tool| tool["name"] == "documentation_search")
     );
-    assert!(
-        server_instructions(ToolProfile::Structural, true)
-            .contains("has a separate documentation snapshot")
-    );
+    // Documentation routing lives in the skill; the instructions only point
+    // at the skill file.
+    let instructions = server_instructions(ToolProfile::Structural);
+    assert!(instructions.contains(".agents/skills/jscout/SKILL.md"));
+    assert!(!instructions.contains("documentation_search"));
     let outline = call_tool(
         repo.path(),
         &conn,
@@ -493,7 +495,7 @@ fn disabled_documentation_is_absent_and_rejected_at_the_mcp_boundary() -> Result
                 .iter()
                 .all(|tool| tool["name"] != "documentation_search")
         );
-        let instructions = server_instructions(profile, false);
+        let instructions = server_instructions(profile);
         assert!(!instructions.contains("documentation_search"));
         assert!(instructions.contains("plane digest as snapshot"));
         assert!(instructions.contains("publication_snapshot"));
@@ -1204,8 +1206,8 @@ fn baseline_ranked_search_forces_unavailable_configured_stages_off() -> Result<(
 
 #[test]
 fn profile_instructions_are_identity_pointer_and_mechanical_contracts() {
-    let baseline = server_instructions(ToolProfile::Baseline, true);
-    let structural = server_instructions(ToolProfile::Structural, true);
+    let baseline = server_instructions(ToolProfile::Baseline);
+    let structural = server_instructions(ToolProfile::Structural);
 
     for instructions in [&baseline, &structural] {
         for marker in [
@@ -1223,7 +1225,9 @@ fn profile_instructions_are_identity_pointer_and_mechanical_contracts() {
                 "missing server-instruction contract: {marker}"
             );
         }
-        // G28: routing rules live in the skill, not here.
+        // G28: routing rules, documentation routing included, live in the
+        // skill; the instructions point at the skill file instead.
+        assert!(instructions.contains(".agents/skills/jscout/SKILL.md"));
         for routing in [
             "Investigation loop",
             "Inquiry loop",
@@ -1231,6 +1235,7 @@ fn profile_instructions_are_identity_pointer_and_mechanical_contracts() {
             "broad_or_query",
             "repository_overview",
             "semantic_memory",
+            "documentation_search",
             "convention",
         ] {
             assert!(
@@ -1307,7 +1312,7 @@ fn default_surface_costs_under_a_third_of_the_pre_g28_structural_surface() {
         serde_json::to_string(&tool_defs(profile, true))
             .expect("serialize tool definitions")
             .len()
-            + server_instructions(profile, true).len()
+            + server_instructions(profile).len()
     };
     let core = surface(ToolProfile::Baseline);
     assert!(
@@ -1367,10 +1372,41 @@ fn trimmed_tools_are_refused_at_the_boundary_before_any_access_decision() -> Res
             "{name}: {error}"
         );
     }
-    // Instructions follow the effective registration, not the docs flag.
-    assert!(!server_instructions(ToolProfile::Baseline, false).contains("documentation_search"));
-    assert!(server_instructions(ToolProfile::Baseline, true).contains("documentation_search"));
+    // The production preflight is the same plan: trimmed tools are refused
+    // before any access decision, registered ones classify normally.
+    let error = plan_tool_call(&allow, ToolProfile::Structural, "annotate")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("tool `annotate` is not enabled by [mcp].tools"));
+    assert_eq!(
+        plan_tool_call(&[], ToolProfile::Structural, "annotate")?,
+        ToolAccess::Write
+    );
+    assert_eq!(
+        plan_tool_call(&allow, ToolProfile::Baseline, "definition")?,
+        ToolAccess::Read
+    );
     Ok(())
+}
+
+#[test]
+fn allowlists_that_register_nothing_are_refused_at_server_start() {
+    let only_annotate = ["annotate".to_string()];
+    let error = ensure_effective_surface(ToolProfile::Baseline, true, &only_annotate)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("registers no tool under profile"), "{error}");
+    ensure_effective_surface(ToolProfile::Structural, true, &only_annotate)
+        .expect("annotate is registered by the full profile");
+    let only_docs = ["documentation_search".to_string()];
+    let error = ensure_effective_surface(ToolProfile::Baseline, false, &only_docs)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("with documentation disabled"), "{error}");
+    ensure_effective_surface(ToolProfile::Baseline, true, &only_docs)
+        .expect("documentation_search is registered when documentation is enabled");
+    ensure_effective_surface(ToolProfile::Baseline, false, &[])
+        .expect("an omitted allowlist registers the whole profile");
 }
 
 #[test]

@@ -4011,12 +4011,17 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    larger repositories. The same surface replayed on the 23,488-file Next.js
    task with `gpt-5.6-terra` —
    [eval/results/next-stale-development-cache-g28-2026-09-02.md](eval/results/next-stale-development-cache-g28-2026-09-02.md)
-   — adds the other half of that picture: no naturalistic session (0/3)
-   opened the skill on a repository whose own `AGENTS.md` prescribes grep
-   first and lists eighteen native skills, while the forced arm used the
-   taught flow at 20 calls and 70 KB against 45 calls and 328 KB on the
-   pre-G28 surface, with the same pass. Adoption on such repositories is an
-   open question that G28 does not settle.
+   — adds the other half of that picture: on a repository whose own
+   `AGENTS.md` prescribes grep first and lists eighteen native skills, no
+   naturalistic replay session (0/3) opened the skill, while the forced arm
+   used the taught flow at 20 calls and 70 KB against 45 calls and 328 KB on
+   the pre-G28 surface, with the same pass. The diagnosis (skill listed in
+   the catalog, tools present at the first turn, nothing in the surface
+   saying "read this file before you search") produced the directive
+   pointer, the trigger-form descriptions, and the "MCP tools, not shell
+   commands" opening line; five-seed short-session measurement moved
+   first-command skill reads from 2/5 to 5/5 and sessions using jscout from
+   3/5 to 4/5 on that repository.
 
 Acceptance: the default registered surface, instructions included, costs
 less than a third of today's structural surface, and the core skill stays
@@ -4027,7 +4032,15 @@ overview default response at 150 workspace areas stays within a few
 kilobytes with no reconnaissance prose; and every routing rule exists in
 exactly one surface — the skill — with the instruction strings reduced to
 identity, pointer, and mechanical contracts. Each of these is pinned by a
-test. The replay gates that were to compare the skill-guided and
+test except the ranked-hit content ratio, which is measured from the
+`hits_bytes` and `envelope_bytes` telemetry fields in the production-windows
+report rather than by a fixture. The pointer is a directive: the
+instructions tell the agent to read the installed skill file before its
+first repository search, and the `semantic_search` description says to use
+it before grep or rg, because the 2026-09-02 Next.js replay showed that a
+bare pointer plus a one-line catalog description was never selected by a
+naturalistic Codex session on a repository with strong native agent
+instructions. The replay gates that were to compare the skill-guided and
 use-every-endpoint arms against the recorded baselines are retired with the
 replay; the baselines are recorded in the production-windows report for any
 later production comparison. G28 is closed.

@@ -1,10 +1,11 @@
 ---
 name: jscout
-description: Localize and prove code in a jscout-indexed repository, answer causal questions with evidence-backed memory, and consult authored documentation when asked.
+description: Use the jscout repository index to search code before grep or rg whenever you fix a bug, implement a change, or answer a question in this JavaScript or TypeScript project: investigate known identifiers completely, answer causal and cross-file questions with source-backed evidence, and search authored Markdown and MDX.
 ---
 
 # jscout full
 
+Tools here are MCP tools on the jscout server, not shell commands.
 Localize first, then verify decisive claims in current source. Every response
 carries a top-level `snapshot` (that surface's invalidation key) and
 `publication_snapshot` (the index publication it observed).
