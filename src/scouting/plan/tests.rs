@@ -371,6 +371,50 @@ fn automatic_plans_are_deterministic_and_dedupe_equal_boundaries() -> Result<()>
     let conn = store::open(repo.path())?;
     indexer::index_repo(repo.path(), &conn)?;
 
+    let first_seed = "sym:index.ts#::first@1".to_owned();
+    let second_seed = "sym:index.ts#::second@1".to_owned();
+    let explicit_first =
+        super::workflows(repo.path(), &conn, std::slice::from_ref(&first_seed), 2, 31)?;
+    let explicit_second = super::workflows(
+        repo.path(),
+        &conn,
+        std::slice::from_ref(&second_seed),
+        2,
+        31,
+    )?;
+    let original = &explicit_first.items[0].candidate_set;
+    let alternate_seed = &explicit_second.items[0].candidate_set;
+    assert_eq!(original.candidates.len(), 3);
+    assert_eq!(alternate_seed.candidates.len(), 3);
+    assert_eq!(original.candidates[0].anchor, first_seed);
+    assert_eq!(alternate_seed.candidates[0].anchor, second_seed);
+    assert_ne!(
+        original.fingerprint, alternate_seed.fingerprint,
+        "execution reuse must remain seed-aware",
+    );
+    let boundary = super::candidate_boundary_fingerprint(original);
+    assert_eq!(
+        boundary,
+        super::candidate_boundary_fingerprint(alternate_seed),
+        "automatic dedupe must ignore the seed-first presentation order",
+    );
+
+    // Every permutation of these three members describes the same boundary.
+    let mut permuted = original.clone();
+    for _ in 0..3 {
+        permuted.candidates.rotate_left(1);
+        assert_eq!(boundary, super::candidate_boundary_fingerprint(&permuted));
+        permuted.candidates.reverse();
+        assert_eq!(boundary, super::candidate_boundary_fingerprint(&permuted));
+        permuted.candidates.reverse();
+    }
+    let mut changed = original.clone();
+    changed.candidates.pop();
+    assert_ne!(boundary, super::candidate_boundary_fingerprint(&changed));
+    let mut changed = original.clone();
+    changed.snapshot.push_str("-changed");
+    assert_ne!(boundary, super::candidate_boundary_fingerprint(&changed));
+
     let first = super::workflows(repo.path(), &conn, &[], 2, 31)?;
     let second = super::workflows(repo.path(), &conn, &[], 2, 31)?;
     assert_eq!(
@@ -378,23 +422,15 @@ fn automatic_plans_are_deterministic_and_dedupe_equal_boundaries() -> Result<()>
         serde_json::to_value(&second)?
     );
     assert_eq!(first.mode, "automatic");
-    assert!(!first.items.is_empty());
-    assert!(
-        first
-            .items
-            .iter()
-            .all(|item| item.sources == ["exported-entry-point"])
-    );
-    let original = &first.items[0].candidate_set;
-    let mut alternate_seed = original.clone();
-    alternate_seed.seeds = vec!["sym:index.ts#::alternate@1".into()];
-    for candidate in &mut alternate_seed.candidates {
-        candidate.seed = !candidate.seed;
-    }
+    assert_eq!(first.auto_seeds_discovered, Some(2));
+    assert_eq!(first.items.len(), 1, "equal boundaries plan only one call");
+    assert_eq!(first.duplicate_candidate_sets_skipped, 1);
+    assert!(first.skipped.is_empty());
+    assert_eq!(first.items[0].sources, ["exported-entry-point"]);
+    assert_eq!(first.items[0].seeds, [first_seed]);
     assert_eq!(
-        super::candidate_boundary_fingerprint(original),
-        super::candidate_boundary_fingerprint(&alternate_seed),
-        "automatic dedupe must use the closed member set, not seed identity",
+        first.items[0].candidate_fingerprint, original.fingerprint,
+        "dedupe must not change the selected call's execution identity",
     );
     Ok(())
 }
