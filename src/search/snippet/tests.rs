@@ -56,7 +56,10 @@ fn ties_choose_the_first_matching_window_deterministically() -> Result<()> {
     let source = "before\nneedle\nafter\nend\nspacer\nbefore2\nneedle\nafter2\nend2";
     for _ in 0..3 {
         let snippet = select_source(source, "needle", &[])?;
-        assert_eq!(snippet.text, "before\nneedle\nafter\nend");
+        assert_eq!(
+            snippet.text,
+            "before\nneedle\nafter\nend\nspacer\nbefore2\nneedle\nafter2"
+        );
         assert_eq!(snippet.line_offset, 0);
     }
     Ok(())
@@ -64,12 +67,12 @@ fn ties_choose_the_first_matching_window_deterministically() -> Result<()> {
 
 #[test]
 fn vector_only_path_only_and_empty_queries_keep_the_header_fallback() -> Result<()> {
-    let source = "function useful() {\n  first();\n  second();\n  third();\n  fourth();\n}\n";
+    let source = "function useful() {\n  first();\n  second();\n  third();\n  fourth();\n  fifth();\n  sixth();\n  seventh();\n  eighth();\n}\n";
     for query in ["semantic paraphrase", "pathOnlyNeedle", "", "\" OR *"] {
         let snippet = select_source(source, query, &[])?;
         assert_eq!(
             snippet.text,
-            "function useful() {\n  first();\n  second();\n  third();"
+            "function useful() {\n  first();\n  second();\n  third();\n  fourth();\n  fifth();\n  sixth();\n  seventh();"
         );
         assert_eq!(snippet.line_offset, 0);
     }
@@ -106,6 +109,19 @@ fn source_sentinels_nul_and_crlf_preserve_the_original_excerpt_and_location() ->
 }
 
 #[test]
+fn excerpts_use_the_larger_byte_budget_without_padding_short_chunks() -> Result<()> {
+    let source = format!("needle {}", "x".repeat(1017));
+    assert_eq!(source.len(), 1024);
+    for query in ["needle", "pathOnlyNeedle"] {
+        let snippet = select_source(&source, query, &[])?;
+        assert_eq!(snippet.text, source);
+        assert_eq!(snippet.line_offset, 0);
+    }
+    assert_eq!(select_source("needle", "needle", &[])?.text, "needle");
+    Ok(())
+}
+
+#[test]
 fn long_lines_are_byte_bounded_around_the_match_without_splitting_utf8() -> Result<()> {
     let source = format!("{} targetNeedle {}", "é".repeat(500), "界".repeat(500));
     let snippet = select_source(&source, "targetNeedle", &[])?;
@@ -125,8 +141,8 @@ fn long_lines_are_byte_bounded_around_the_match_without_splitting_utf8() -> Resu
 fn byte_clipping_updates_the_start_line_when_it_removes_context_lines() -> Result<()> {
     let source = format!(
         "header\n{}\n{} needle\nnext\nlast",
-        "a".repeat(600),
-        "b".repeat(600)
+        "a".repeat(MAX_BYTES * 2),
+        "b".repeat(MAX_BYTES * 2)
     );
     let snippet = select_source(&source, "needle", &[])?;
     assert!(snippet.text.len() <= MAX_BYTES);

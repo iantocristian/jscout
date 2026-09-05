@@ -569,6 +569,15 @@ fn compact_and_debug_json_modes_parse_without_ambiguity() {
 
 #[test]
 fn debug_json_is_unbounded_unless_the_caller_sets_a_budget() {
+    let configured = crate::config::SearchSettings::default().response_bytes;
+    assert_eq!(
+        effective_search_response_byte_limit(None, configured, false),
+        30_000
+    );
+    assert_eq!(
+        effective_search_response_byte_limit(Some(24_000), configured, false),
+        24_000
+    );
     assert_eq!(
         effective_search_response_byte_limit(None, 24_000, true),
         usize::MAX

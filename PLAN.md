@@ -3966,16 +3966,20 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    retained.
    Ranked code snippets now select query-relevant source after ranking, using
    the indexed FTS tokenizer and preferring matched identifiers for exact-tier
-   hits. The excerpt is at most four lines and 512 UTF-8 bytes (including any
+   hits. The excerpt is at most eight lines and 1,024 UTF-8 bytes (including any
    clipping ellipses); these bounds are rendering choices, not a content-ratio
    target. No literal source match means a bounded header fallback, including
    vector-only and path-only matches. `at` and anchors remain chunk locators;
    optional `snippet_line` identifies a moved excerpt's first source line,
    with a leading ellipsis when byte clipping starts mid-line. Complete JSON
-   budget enforcement still runs afterwards. Ranking, embedding text,
-   exhaustive match-line output, and `uses` / `used_by` previews are unchanged.
-   The paired output measurement is recorded in
-   [eval/results/query-aware-snippets-2026-09-05.md](eval/results/query-aware-snippets-2026-09-05.md).
+   budget enforcement still runs afterwards, with a 30,000-byte code-search
+   default; explicit repository and per-call limits take precedence. Ranking,
+   embedding text, exhaustive hit shape, and `uses` / `used_by` previews
+   are unchanged.
+   The initial paired output measurement is recorded in
+   [eval/results/query-aware-snippets-2026-09-05.md](eval/results/query-aware-snippets-2026-09-05.md);
+   the approved larger bounds and budget are measured in
+   [eval/results/eight-line-snippets-2026-09-05.md](eval/results/eight-line-snippets-2026-09-05.md).
 4. `repository_overview` stops being a catalog. The default response is
    totals plus a bounded area table — no reconnaissance prose; per-project
    reconnaissance text is reachable only through the existing subject

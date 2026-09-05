@@ -1186,8 +1186,9 @@ diagnostic metadata, empty fields, and repeated defaults. Search
 `--debug-json`, neighborhood `--debug-json`, and MCP `debug: true` retain the
 full diagnostic representation.
 
-Ranked code-search snippets are query-aware source excerpts: at most four
-source lines and 512 UTF-8 bytes, with ellipses when byte clipping is needed.
+Ranked code-search snippets are query-aware source excerpts: at most eight
+source lines and 1 KiB (1,024 UTF-8 bytes), with ellipses when byte clipping is
+needed.
 Exact-tier hits prioritize their matched identifiers; other hits select a
 window of literal query matches using the index's FTS tokenizer. A hit with
 no literal source match keeps a bounded header excerpt. `at` still locates
@@ -1203,6 +1204,12 @@ CLI `--debug-json` is not outer-response-budgeted when `--response-bytes` is
 omitted, so inspecting diagnostics cannot silently remove graph nodes or edges.
 Pass `--response-bytes` explicitly to test diagnostic truncation. Compact CLI
 and MCP responses retain their configured complete-response budgets.
+
+Code search defaults to a 30,000-byte complete JSON response ceiling, covering
+hits, attached context, metadata, and JSON overhead. Override it in
+`[search].response_bytes`, with CLI `--response-bytes`, or per MCP
+`semantic_search` call with `response_bytes`; explicit limits still win.
+Documentation search and other tools keep their existing response budgets.
 
 For exact drill-down, construct arguments from a hit's `anchor` and the
 response's top-level `snapshot`. Preserve any explicit `origins` and `formats`

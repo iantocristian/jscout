@@ -1338,10 +1338,7 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
         }
         "who_uses" => {
             let debug = args["debug"].as_bool().unwrap_or(false);
-            let response_bytes = args["response_bytes"]
-                .as_u64()
-                .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
-                as usize;
+            let response_bytes = args["response_bytes"].as_u64().unwrap_or(24_000) as usize;
             let identity = crate::publication::Identities::read(conn)?
                 .response(crate::publication::Plane::Code);
             let origins = configured_origins(args, search_defaults);
@@ -1397,10 +1394,7 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
         }
         "definition" => {
             let debug = args["debug"].as_bool().unwrap_or(false);
-            let response_bytes = args["response_bytes"]
-                .as_u64()
-                .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
-                as usize;
+            let response_bytes = args["response_bytes"].as_u64().unwrap_or(24_000) as usize;
             let identity = crate::publication::Identities::read(conn)?
                 .response(crate::publication::Plane::Code);
             let source_view = args["view"]
@@ -1494,10 +1488,7 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
             let repository = origins.iter().any(|origin| origin == "repository");
             let workspace = origins.iter().any(|origin| origin == "workspace");
             let dependency = origins.iter().any(|origin| origin == "dependency");
-            let response_bytes = args["response_bytes"]
-                .as_u64()
-                .unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT as u64)
-                as usize;
+            let response_bytes = args["response_bytes"].as_u64().unwrap_or(24_000) as usize;
             let identity = crate::publication::Identities::read(conn)?
                 .response(crate::publication::Plane::Code);
             let mut stmt = conn.prepare(

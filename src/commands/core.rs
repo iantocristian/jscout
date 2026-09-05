@@ -59,10 +59,7 @@ pub(super) fn render_cli_neighborhood(
             response_bytes.expect("checked above"),
         )?
     } else {
-        compact::render_neighborhood(
-            neighborhood,
-            response_bytes.unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT),
-        )?
+        compact::render_neighborhood(neighborhood, response_bytes.unwrap_or(24_000))?
     })
 }
 

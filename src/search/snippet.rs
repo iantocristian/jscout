@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 
-const MAX_LINES: usize = 4;
-const MAX_BYTES: usize = 512;
+const MAX_LINES: usize = 8;
+const MAX_BYTES: usize = 1024;
 const ELLIPSIS: &str = "…";
 
 pub(super) struct Snippet {

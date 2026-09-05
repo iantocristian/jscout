@@ -14,7 +14,7 @@ mod snippet;
 
 pub(crate) type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
-pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
+pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 30_000;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
 pub const MAX_EXHAUSTIVE_PAGE_SIZE: usize = 200;
 pub const DEFAULT_MEMORY_GRAPH_DEPTH: usize = 2;

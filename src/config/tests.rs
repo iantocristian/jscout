@@ -30,6 +30,7 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     assert!(config.effective.search.vector);
     assert!(config.effective.search.rerank);
     assert!(!config.effective.search.attach_memory);
+    assert_eq!(config.effective.search.response_bytes, 30_000);
     assert_eq!(config.effective.llm.max_concurrency, 1);
     assert_eq!(config.effective.search.expansion.mode, "paths");
     assert_eq!(config.effective.search.expansion.paths, 8);
@@ -60,6 +61,7 @@ response_bytes = 12000
 [search]
 rerank = false
 attach_memory = false
+response_bytes = 12000
 [telemetry]
 file = "logs/mcp.jsonl"
 "#,
@@ -84,6 +86,8 @@ file = "logs/mcp.jsonl"
     );
     assert!(!config.effective.search.rerank);
     assert!(!config.effective.search.attach_memory);
+    assert_eq!(config.effective.search.response_bytes, 12_000);
+    assert_eq!(config.sources["search.response_bytes"], ValueSource::Config);
     assert_eq!(config.sources["search.rerank"], ValueSource::Config);
     assert_eq!(config.sources["docs.include"], ValueSource::Config);
     assert_eq!(config.sources["docs.search.limit"], ValueSource::Config);

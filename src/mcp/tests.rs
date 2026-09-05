@@ -1052,6 +1052,7 @@ fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() ->
             "rerank": true,
             "include_memory": true,
             "limit": 8,
+            "response_bytes": 24_000,
             "expand": false,
             "expand_mode": "neighborhood",
             "expand_paths": 2
@@ -1062,6 +1063,7 @@ fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() ->
     assert!(options.rerank);
     assert!(options.include_memory);
     assert_eq!(options.limit, 8);
+    assert_eq!(options.response_byte_limit, 24_000);
     assert!(!options.expand);
     assert_eq!(
         options.expansion.projection,
@@ -2310,9 +2312,54 @@ fn definition_renders_configured_source_view_with_a_shared_byte_ceiling() -> Res
 }
 
 #[test]
+fn ranked_search_default_and_explicit_budgets_bound_the_complete_response() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = (0..50)
+        .map(|index| {
+            format!(
+                "export function entry{index}() {{\n  // needle {}\n  return {index};\n}}\n",
+                "context ".repeat(140),
+            )
+        })
+        .collect::<String>();
+    fs::write(repo.path().join("budget.ts"), source)?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let invoke = |budget: Option<usize>| -> Result<String> {
+        let mut arguments = json!({
+            "query": "needle", "vector": false, "rerank": false, "limit": 50,
+        });
+        if let Some(budget) = budget {
+            arguments["response_bytes"] = json!(budget);
+        }
+        call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            SourceView::Full,
+            "semantic_search",
+            &arguments,
+        )
+    };
+    let default = invoke(None)?;
+    assert_eq!(default, invoke(Some(30_000))?);
+    assert!(default.len() > 24_000 && default.len() <= 30_000);
+    let smaller = invoke(Some(24_000))?;
+    assert!(smaller.len() <= 24_000);
+    let default: serde_json::Value = serde_json::from_str(&default)?;
+    let smaller: serde_json::Value = serde_json::from_str(&smaller)?;
+    let default_hits = default["hits"].as_array().unwrap();
+    let smaller_hits = smaller["hits"].as_array().unwrap();
+    assert!(default_hits.len() > smaller_hits.len());
+    assert!(default_hits.starts_with(smaller_hits));
+    Ok(())
+}
+
+#[test]
 fn ranked_snippet_locations_preserve_chunk_anchors_and_exhaustive_shape() -> Result<()> {
     let repo = tempfile::tempdir()?;
-    let source = "export function targetNeedle() {}\n\nexport function wrapper() {\n  // first\n  // second\n  // third\n  prepare();\n  targetNeedle();\n  finish();\n}\n";
+    let source = "export function targetNeedle() {}\n\nexport function wrapper() {\n  // first\n  // second\n  // third\n  prepare();\n  targetNeedle();\n  finish();\n  persist();\n  notify();\n  record();\n  cleanup();\n}\n";
     fs::write(repo.path().join("snippet.ts"), source)?;
     let conn = store::open(repo.path())?;
     indexer::index_repo(repo.path(), &conn)?;
@@ -2342,11 +2389,11 @@ fn ranked_snippet_locations_preserve_chunk_anchors_and_exhaustive_shape() -> Res
         .iter()
         .find(|hit| hit["symbol"] == "wrapper")
         .expect("wrapper hit");
-    assert_eq!(hit["at"], "snippet.ts:3-10");
+    assert_eq!(hit["at"], "snippet.ts:3-14");
     assert_eq!(hit["snippet_line"], 7);
     assert_eq!(
         hit["snippet"],
-        "  prepare();\n  targetNeedle();\n  finish();\n}"
+        "  prepare();\n  targetNeedle();\n  finish();\n  persist();\n  notify();\n  record();\n  cleanup();\n}"
     );
     assert!(source.contains(hit["snippet"].as_str().unwrap()));
     let definition = invoke(
