@@ -12,6 +12,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{publication::ResponseIdentity, query, scout, search, structural};
 
+/// Complete JSON response default for non-search tools. Search budgets are
+/// configured separately for each corpus.
+pub(crate) const DEFAULT_TOOL_RESPONSE_BYTES: usize = 24_000;
+
 pub(crate) fn search_string(result: &search::SearchResult) -> Result<String> {
     Ok(serde_json::to_string(&search_value(result))?)
 }
@@ -254,6 +258,9 @@ fn compact_hit(hit: &search::Hit, default_match: search::MatchReason) -> Value {
     }
     value.insert("kind".into(), json!(hit.kind));
     value.insert("snippet".into(), json!(hit.snippet));
+    if let Some(line) = hit.snippet_line.filter(|_| !hit.snippet.is_empty()) {
+        value.insert("snippet_line".into(), json!(line));
+    }
     if hit.snippet_truncated {
         value.insert("snippet_truncated".into(), json!(true));
     }

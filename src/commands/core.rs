@@ -61,7 +61,7 @@ pub(super) fn render_cli_neighborhood(
     } else {
         compact::render_neighborhood(
             neighborhood,
-            response_bytes.unwrap_or(search::DEFAULT_RESPONSE_BYTE_LIMIT),
+            response_bytes.unwrap_or(compact::DEFAULT_TOOL_RESPONSE_BYTES),
         )?
     })
 }

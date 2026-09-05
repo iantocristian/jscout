@@ -1052,6 +1052,7 @@ fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() ->
             "rerank": true,
             "include_memory": true,
             "limit": 8,
+            "response_bytes": 24_000,
             "expand": false,
             "expand_mode": "neighborhood",
             "expand_paths": 2
@@ -1062,6 +1063,7 @@ fn omitted_search_arguments_use_repository_defaults_and_explicit_values_win() ->
     assert!(options.rerank);
     assert!(options.include_memory);
     assert_eq!(options.limit, 8);
+    assert_eq!(options.response_byte_limit, 24_000);
     assert!(!options.expand);
     assert_eq!(
         options.expansion.projection,
@@ -1574,6 +1576,30 @@ fn paths_schema_caps_graph_scope() {
     let properties = &paths["inputSchema"]["properties"];
     assert_eq!(properties["node_limit"]["maximum"], 200);
     assert_eq!(properties["edge_limit"]["maximum"], 800);
+}
+
+#[test]
+fn non_search_tool_schemas_share_a_default_separate_from_search() {
+    assert_eq!(crate::compact::DEFAULT_TOOL_RESPONSE_BYTES, 24_000);
+    let definitions = tool_defs(ToolProfile::Structural, true);
+    let mut budgeted_tools = 0;
+    for tool in definitions.as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let Some(budget) = tool["inputSchema"]["properties"].get("response_bytes") else {
+            continue;
+        };
+        if matches!(name, "semantic_search" | "documentation_search") {
+            assert!(budget.get("default").is_none(), "{name} uses configuration");
+        } else {
+            assert_eq!(
+                budget["default"],
+                crate::compact::DEFAULT_TOOL_RESPONSE_BYTES,
+                "{name}"
+            );
+            budgeted_tools += 1;
+        }
+    }
+    assert_eq!(budgeted_tools, 10);
 }
 
 #[test]
@@ -2306,6 +2332,118 @@ fn definition_renders_configured_source_view_with_a_shared_byte_ceiling() -> Res
     );
     assert_eq!(count_json_key(&debug, "snapshot"), 1);
     assert_eq!(count_json_key(&debug, "publication_snapshot"), 1);
+    Ok(())
+}
+
+#[test]
+fn ranked_search_default_and_explicit_budgets_bound_the_complete_response() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = (0..50)
+        .map(|index| {
+            format!(
+                "export function entry{index}() {{\n  // needle {}\n  return {index};\n}}\n",
+                "context ".repeat(140),
+            )
+        })
+        .collect::<String>();
+    fs::write(repo.path().join("budget.ts"), source)?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let invoke = |budget: Option<usize>| -> Result<String> {
+        let mut arguments = json!({
+            "query": "needle", "vector": false, "rerank": false, "limit": 50,
+        });
+        if let Some(budget) = budget {
+            arguments["response_bytes"] = json!(budget);
+        }
+        call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            SourceView::Full,
+            "semantic_search",
+            &arguments,
+        )
+    };
+    let default = invoke(None)?;
+    assert_eq!(default, invoke(Some(30_000))?);
+    assert!(default.len() > 24_000 && default.len() <= 30_000);
+    let smaller = invoke(Some(24_000))?;
+    assert!(smaller.len() <= 24_000);
+    let default: serde_json::Value = serde_json::from_str(&default)?;
+    let smaller: serde_json::Value = serde_json::from_str(&smaller)?;
+    let default_hits = default["hits"].as_array().unwrap();
+    let smaller_hits = smaller["hits"].as_array().unwrap();
+    assert!(default_hits.len() > smaller_hits.len());
+    assert!(default_hits.starts_with(smaller_hits));
+    Ok(())
+}
+
+#[test]
+fn ranked_snippet_locations_preserve_chunk_anchors_and_exhaustive_shape() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export function targetNeedle() {}\n\nexport function wrapper() {\n  // first\n  // second\n  // third\n  prepare();\n  targetNeedle();\n  finish();\n  persist();\n  notify();\n  record();\n  cleanup();\n}\n";
+    fs::write(repo.path().join("snippet.ts"), source)?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let invoke = |tool, arguments: serde_json::Value| -> Result<serde_json::Value> {
+        let output = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            SourceView::Full,
+            tool,
+            &arguments,
+        )?;
+        Ok(serde_json::from_str(&output)?)
+    };
+    let result = invoke(
+        "semantic_search",
+        json!({
+            "query": "targetNeedle", "vector": false, "rerank": false,
+            "limit": 10, "response_bytes": 2000,
+        }),
+    )?;
+    assert!(serde_json::to_vec(&result)?.len() <= 2000);
+    let hit = result["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["symbol"] == "wrapper")
+        .expect("wrapper hit");
+    assert_eq!(hit["at"], "snippet.ts:3-14");
+    assert_eq!(hit["snippet_line"], 7);
+    assert_eq!(
+        hit["snippet"],
+        "  prepare();\n  targetNeedle();\n  finish();\n  persist();\n  notify();\n  record();\n  cleanup();\n}"
+    );
+    assert!(source.contains(hit["snippet"].as_str().unwrap()));
+    let definition = invoke(
+        "definition",
+        json!({
+            "anchor": hit["anchor"], "snapshot": result["snapshot"],
+        }),
+    )?;
+    assert!(
+        definition["definitions"][0]["source"]
+            .as_str()
+            .unwrap()
+            .contains("function wrapper()")
+    );
+    assert_eq!(definition["snapshot"], result["snapshot"]);
+    let exhaustive = invoke(
+        "semantic_search",
+        json!({
+            "query": "targetNeedle", "exhaustive": true,
+        }),
+    )?;
+    for hit in exhaustive["hits"].as_array().unwrap() {
+        assert!(hit.get("snippet").is_none());
+        assert!(hit.get("snippet_line").is_none());
+        assert!(hit["match_lines"].is_array());
+    }
     Ok(())
 }
 

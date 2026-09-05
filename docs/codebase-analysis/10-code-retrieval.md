@@ -88,7 +88,7 @@ A consequence: `Hit.score` stops being the ranking key. An exact-tier candidate 
 | FTS fallback candidate window | `limit * 32` clamped to `[32, 4096]` | `src/search.rs:780` |
 | Default result limit | 10 | `src/search.rs:12` |
 | Max exhaustive page size | 200 | `src/search.rs:13` |
-| Default response byte limit | 24,000 | `src/search.rs:11` |
+| Default response byte limit | 30,000 | `src/search.rs:17` (`DEFAULT_RESPONSE_BYTE_LIMIT`); explicit config/call limits override |
 | Memory candidate pool | `memory_limit * 8` clamped to `[1, 100]` | `src/search.rs:1674` |
 | Memory graph depth / nodes | default 2 / 2,000; max 8 / 20,000 | `src/search.rs:14-17` |
 | Rendered support cap (diagnostic only) | 8 | `src/search.rs:18` |

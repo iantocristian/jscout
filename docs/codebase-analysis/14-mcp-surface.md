@@ -156,7 +156,7 @@ There is no single budgeter. Three families coexist because they budget differen
 
 All public machine-readable surfaces now serialize with `serde_json::to_string`, including debug output. The budget envelope is still not uniformly present — compact `semantic_search` inserts its `response` block only when truncation occurred, and `annotate` returns a publication with no budget field. Caller-supplied `byte_limit`/`response_bytes` values are inputs and are not echoed back; `rendered_bytes`, `unbudgeted_bytes`, truncation, and omission counts remain where the surface has a budget block. Truncation is never silent.
 
-Defaults are inconsistent by history: seven call sites hardcode the literal `24_000` (`:1370, :1394, :1424, :1467, :1492, :1560, :1619`), `who_uses`/`definition`/`file_outline` read `search::DEFAULT_RESPONSE_BYTE_LIMIT`, and `semantic_search`/`documentation_search` fall through to configuration.
+Non-search tools now share `compact::DEFAULT_TOOL_RESPONSE_BYTES` (24,000) across MCP schema defaults, runtime fallbacks, and the corresponding CLI/module defaults. This replaces the formerly scattered literals and non-search reuse of the search constant. `semantic_search` and `documentation_search` still resolve their independent configured budgets, whose built-in defaults are 30,000 and 24,000 bytes respectively.
 
 ## Result transport
 

@@ -10,9 +10,11 @@ use crate::{
     query, semantic, store, structural,
 };
 
+mod snippet;
+
 pub(crate) type EdgeIdentity = (String, String, String, Option<String>, Option<i64>);
 
-pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
+pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 30_000;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
 pub const MAX_EXHAUSTIVE_PAGE_SIZE: usize = 200;
 pub const DEFAULT_MEMORY_GRAPH_DEPTH: usize = 2;
@@ -434,6 +436,9 @@ pub struct Hit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_lines: Option<Vec<i64>>,
     pub snippet: String,
+    /// First excerpt line when it differs from the retrieval chunk's start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet_line: Option<i64>,
     pub snippet_truncated: bool,
     /// Snapshot-scoped structural handles projected from this retrieval chunk.
     pub anchors: Vec<String>,
@@ -1668,6 +1673,7 @@ fn exhaustive_hits(
             matched_identifiers: Vec::new(),
             match_lines: Some(match_lines),
             snippet: String::new(),
+            snippet_line: None,
             snippet_truncated: false,
             anchors: projected_anchors,
             file_anchor,
@@ -2327,15 +2333,7 @@ fn ranked_hits(
     let mut hits = Vec::new();
     let allowed_roles: HashSet<&str> = options.file_roles.iter().map(String::as_str).collect();
     for candidate in ranked {
-        if let Some(hit) = load_hit(
-            conn,
-            candidate.chunk_id,
-            candidate.score,
-            candidate.match_reason,
-            candidate.matched_identifiers,
-            &options.file_origins,
-            &options.formats,
-        )? {
+        if let Some(hit) = load_hit(conn, candidate, q, &options.file_origins, &options.formats)? {
             if !allowed_roles.is_empty() && !allowed_roles.contains(hit.file_role.as_str()) {
                 continue;
             }
@@ -2516,13 +2514,17 @@ fn record_vector_ranking(
 
 fn load_hit(
     conn: &Connection,
-    chunk_id: i64,
-    score: f64,
-    match_reason: MatchReason,
-    matched_identifiers: Vec<String>,
+    candidate: RankedHitCandidate,
+    query: &str,
     file_origins: &[String],
     file_formats: &[String],
 ) -> Result<Option<Hit>> {
+    let RankedHitCandidate {
+        chunk_id,
+        score,
+        match_reason,
+        matched_identifiers,
+    } = candidate;
     let row = conn
         .query_row(
             "SELECT f.path, f.role, f.origin, c.kind, c.name, c.start_line, c.end_line,
@@ -2608,7 +2610,7 @@ fn load_hit(
         _ => Vec::new(),
     };
 
-    let snippet: String = content.lines().take(4).collect::<Vec<_>>().join("\n");
+    let excerpt = snippet::select(conn, chunk_id, &content, query, &matched_identifiers)?;
     Ok(Some(Hit {
         chunk_id,
         file,
@@ -2623,7 +2625,8 @@ fn load_hit(
         match_reason,
         matched_identifiers,
         match_lines: None,
-        snippet,
+        snippet: excerpt.text,
+        snippet_line: (excerpt.line_offset > 0).then_some(start_line + excerpt.line_offset as i64),
         snippet_truncated: false,
         anchors,
         file_anchor,

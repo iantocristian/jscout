@@ -15,9 +15,8 @@ use serde::ser::{SerializeMap, Serializer};
 use serde_json::Value;
 
 use crate::publication::{Identities, Plane};
-use crate::{embed, origin, recon, semantic, store, structural};
+use crate::{compact, embed, origin, recon, semantic, store, structural};
 
-pub const DEFAULT_RESPONSE_BYTE_LIMIT: usize = 24_000;
 pub const DEFAULT_SOURCE_BYTE_LIMIT: usize = 2_000;
 pub const MAX_ARTIFACT_LIMIT: usize = 100;
 pub const MAX_RELATION_LIMIT: usize = 200;
@@ -99,7 +98,7 @@ impl Default for QueryOptions {
             source_limit: 12,
             source_byte_limit: DEFAULT_SOURCE_BYTE_LIMIT,
             file_origins: origin::defaults(),
-            response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
+            response_byte_limit: compact::DEFAULT_TOOL_RESPONSE_BYTES,
             evidence_relation_depth: EVIDENCE_RELATION_DEPTH,
             // Library callers retain the historical diagnostic projection.
             // Agent-facing CLI/MCP surfaces explicitly select compact by
