@@ -101,8 +101,7 @@ pub fn extract(ret: &ParserReturn<'_>, semantic: &Semantic<'_>) -> FileGraph {
             ExportExportName::Null => continue,
         };
         let local_name = match &entry.local_name {
-            ExportLocalName::Name(n) => Some(n.name.to_string()),
-            ExportLocalName::Default(_) => None,
+            ExportLocalName::Name(n) | ExportLocalName::Default(n) => Some(n.name.to_string()),
             ExportLocalName::Null => None,
         };
         if let Some(l) = &local_name {
@@ -376,3 +375,6 @@ fn classify_reference<'a>(
     }
     ("use", member_prop)
 }
+
+#[cfg(test)]
+mod tests;

@@ -55,6 +55,99 @@ fn projects_resolved_calls_and_returns_snapshot() -> Result<()> {
 }
 
 #[test]
+fn default_identifier_exports_reach_external_usages_and_workflow_candidates() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let exports = [
+        (
+            "constant.tsx",
+            "LocalConst",
+            "const LocalConst = () => null; export default LocalConst;\n",
+        ),
+        (
+            "function.tsx",
+            "LocalFunction",
+            "function LocalFunction() { return null; } export default LocalFunction;\n",
+        ),
+        (
+            "direct.tsx",
+            "DirectDefault",
+            "export default function DirectDefault() { return null; }\n",
+        ),
+        (
+            "named.tsx",
+            "NamedExport",
+            "export function NamedExport() { return null; }\n",
+        ),
+    ];
+    for (path, _, source) in exports {
+        write(repo.path(), path, source)?;
+    }
+    write(
+        repo.path(),
+        "consumer.tsx",
+        "import LocalConst from './constant';\n\
+         import LocalFunction from './function';\n\
+         import DirectDefault from './direct';\n\
+         import { NamedExport } from './named';\n\
+         export function RenderConsumer() { return <><LocalConst/><LocalFunction/><DirectDefault/><NamedExport/></>; }\n\
+         export function CallConsumer() { return [LocalConst(), LocalFunction(), DirectDefault(), NamedExport()]; }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+
+    let module_graph = crate::query::ModuleGraph::load(&conn)?;
+    for (path, name, _) in exports {
+        let anchor = format!("sym:{path}#::{name}@1");
+        let file_id = conn.query_row("SELECT id FROM files WHERE path=?1", [path], |row| {
+            row.get(0)
+        })?;
+        for usages in [
+            crate::query::who_uses_anchor_in_origins(&conn, &anchor, &origin::defaults())?,
+            crate::query::who_uses_in_origins(
+                &conn,
+                &module_graph,
+                file_id,
+                name,
+                &origin::defaults(),
+            )?,
+        ] {
+            let external = usages
+                .iter()
+                .filter(|usage| usage.file == "consumer.tsx")
+                .map(|usage| (usage.line, usage.kind.as_str(), usage.confidence.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                external,
+                [(5, "render", "certain"), (6, "call", "certain")],
+                "{name}"
+            );
+        }
+    }
+
+    for name in ["RenderConsumer", "CallConsumer"] {
+        let candidates = crate::semantic::workflow_candidates(
+            repo.path(),
+            &conn,
+            &[format!("consumer.tsx:{name}")],
+            &crate::semantic::WorkflowCandidateOptions::default(),
+        )?;
+        assert!(!candidates.traversal_truncated);
+        assert!(!candidates.candidate_truncated);
+        for (path, name, _) in exports {
+            assert!(
+                candidates
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.file == path && candidate.display_name == name),
+                "{name} missing from {} candidates",
+                candidates.seeds[0]
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn snapshot_hashes_file_corpus_and_parser_format() -> Result<()> {
     let repo = tempfile::tempdir()?;
     write(repo.path(), "main.ts", "export const value = 1;\n")?;

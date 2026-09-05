@@ -1591,6 +1591,90 @@ fn indexes_js_files_containing_jsx() -> Result<()> {
 }
 
 #[test]
+fn default_export_contract_refresh_repairs_unchanged_ecmascript_only() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("component.tsx"),
+        "const Component = () => <span />; export default Component;\n",
+    )?;
+    fs::write(
+        repo.path().join("main.js"),
+        "import Component from './component'; export function render() { return <Component />; }\n",
+    )?;
+    fs::write(repo.path().join("README.md"), "# Guide\n\nStable prose.\n")?;
+    fs::write(repo.path().join("lib.rs"), "pub fn stable() {}\n")?;
+    let conn = store::open(repo.path())?;
+    assert_eq!(index_repo(repo.path(), &conn)?.indexed, 4);
+    let before = crate::publication::Identities::read(&conn)?;
+    let other_files = || -> Result<Vec<(String, i64, i64, String)>> {
+        Ok(conn
+            .prepare(
+                "SELECT file.path, file.id, chunk.id, file.hash
+                 FROM files file JOIN chunks chunk ON chunk.file_id=file.id
+                 WHERE file.format IN ('markdown', 'rust') ORDER BY file.path, chunk.id",
+            )?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    };
+    let retained = other_files()?;
+    assert_eq!(retained.len(), 2);
+
+    // Version 7 discarded identifier-form default bindings. Keep the file
+    // hashes intact so only the extraction-contract bump can repair them.
+    conn.execute(
+        "UPDATE exports SET local_name=NULL WHERE export_name='default'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE contract_exports SET local_name=NULL WHERE export_name='default'",
+        [],
+    )?;
+    conn.execute("UPDATE symbols SET exported=0 WHERE name='Component'", [])?;
+    conn.execute("DELETE FROM resolved_edges WHERE kind='render'", [])?;
+    conn.execute(
+        "UPDATE meta SET value='7'
+         WHERE key IN ('extraction_version', 'format_contract_version:javascript',
+                       'format_contract_version:typescript')",
+        [],
+    )?;
+    let outcome = index_repo(repo.path(), &conn)?;
+    assert_eq!((outcome.indexed, outcome.unchanged), (2, 2));
+    assert!(!outcome.extraction_reset);
+    assert!(outcome.projection_rebuilt);
+    let export: (String, bool) = conn.query_row(
+        "SELECT export.local_name, symbol.exported
+         FROM exports export JOIN symbols symbol
+           ON symbol.file_id=export.file_id AND symbol.name=export.local_name
+         WHERE export.export_name='default'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(export, ("Component".into(), true));
+    let contract_local: String = conn.query_row(
+        "SELECT local_name FROM contract_exports WHERE export_name='default'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(contract_local, "Component");
+    let render_edges: i64 = conn.query_row(
+        "SELECT count(*) FROM resolved_edges WHERE kind='render'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(render_edges, 1);
+    assert_eq!(other_files()?, retained);
+    let after = crate::publication::Identities::read(&conn)?;
+    assert_eq!(after.documentation, before.documentation);
+    assert_eq!(after.provenance, before.provenance);
+    let unchanged = index_repo(repo.path(), &conn)?;
+    assert_eq!((unchanged.indexed, unchanged.unchanged), (0, 4));
+    assert!(!unchanged.projection_rebuilt);
+    Ok(())
+}
+
+#[test]
 fn extraction_version_change_forces_unchanged_files_through_extraction() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(
@@ -3424,6 +3508,10 @@ fn normalize_g26_phase_zero_sections(sections: &mut [(String, String)]) {
                         && key != "documentation_provenance_enabled"
                         && key != "documentation_provenance_digest"
                         && key != "documentation_provenance_format_version"
+                        // The default-export fix bumps extraction after this
+                        // frozen fixture. Its canonical/public rows still match;
+                        // contract-triggered refresh has a separate regression.
+                        && key != "extraction_version"
                         && !key.starts_with("format_contract_version:")
                 })
                 .map(|line| format!("{line}\n"))
