@@ -132,6 +132,7 @@ fn compact_search_keeps_localization_and_relation_evidence() -> anyhow::Result<(
             matched_identifiers: Vec::new(),
             match_lines: None,
             snippet: "start() { return this.queue.finish(); }".into(),
+            snippet_line: None,
             snippet_truncated: false,
             anchors: vec![root.into()],
             file_anchor: Some("file:src/workflow.ts".into()),
@@ -246,6 +247,7 @@ fn compact_search_emits_anchors_without_followup_scaffolding() {
         matched_identifiers: Vec::new(),
         match_lines: None,
         snippet: "const first = 1; const second = 2;".into(),
+        snippet_line: None,
         snippet_truncated: false,
         anchors: vec![
             "sym:src/overlap.ts#::first@1".into(),
@@ -259,6 +261,19 @@ fn compact_search_emits_anchors_without_followup_scaffolding() {
     assert_eq!(value["anchors"].as_array().map(Vec::len), Some(2));
     assert!(value.get("followups").is_none());
     assert!(value.get("followup_candidates").is_none());
+    assert!(value.get("snippet_line").is_none());
+    let mut shifted = hit;
+    shifted.snippet_line = Some(12);
+    let shifted_value = compact_hit(&shifted, MatchReason::Hybrid);
+    assert_eq!(shifted_value["at"], value["at"]);
+    assert_eq!(shifted_value["anchors"], value["anchors"]);
+    assert_eq!(shifted_value["snippet_line"], 12);
+    shifted.snippet.clear();
+    assert!(
+        compact_hit(&shifted, MatchReason::Hybrid)
+            .get("snippet_line")
+            .is_none()
+    );
 }
 
 #[test]
@@ -279,6 +294,7 @@ fn ordinary_eight_hit_search_fits_under_four_kibibytes() -> anyhow::Result<()> {
             matched_identifiers: Vec::new(),
             match_lines: None,
             snippet: format!("export function handleStep{index}() {{ return next(); }}"),
+            snippet_line: None,
             snippet_truncated: false,
             anchors: vec![format!(
                 "sym:src/services/service-{index}.ts#::handleStep{index}@{}",

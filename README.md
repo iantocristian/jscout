@@ -1186,6 +1186,19 @@ diagnostic metadata, empty fields, and repeated defaults. Search
 `--debug-json`, neighborhood `--debug-json`, and MCP `debug: true` retain the
 full diagnostic representation.
 
+Ranked code-search snippets are query-aware source excerpts: at most four
+source lines and 512 UTF-8 bytes, with ellipses when byte clipping is needed.
+Exact-tier hits prioritize their matched identifiers; other hits select a
+window of literal query matches using the index's FTS tokenizer. A hit with
+no literal source match keeps a bounded header excerpt. `at` still locates
+the whole retrieval chunk; optional `snippet_line` gives the first excerpt
+line when it differs from the chunk start. A leading ellipsis can indicate
+a mid-line start. The source-byte cap does not replace the complete JSON
+response budget, and `snippet_truncated` continues to indicate additional
+response-budget truncation. Use the unchanged anchor with `definition` for
+complete source. Exhaustive search continues to return match lines, not
+snippets.
+
 CLI `--debug-json` is not outer-response-budgeted when `--response-bytes` is
 omitted, so inspecting diagnostics cannot silently remove graph nodes or edges.
 Pass `--response-bytes` explicitly to test diagnostic truncation. Compact CLI

@@ -2310,6 +2310,73 @@ fn definition_renders_configured_source_view_with_a_shared_byte_ceiling() -> Res
 }
 
 #[test]
+fn ranked_snippet_locations_preserve_chunk_anchors_and_exhaustive_shape() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = "export function targetNeedle() {}\n\nexport function wrapper() {\n  // first\n  // second\n  // third\n  prepare();\n  targetNeedle();\n  finish();\n}\n";
+    fs::write(repo.path().join("snippet.ts"), source)?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let invoke = |tool, arguments: serde_json::Value| -> Result<serde_json::Value> {
+        let output = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Baseline,
+            SourceView::Full,
+            tool,
+            &arguments,
+        )?;
+        Ok(serde_json::from_str(&output)?)
+    };
+    let result = invoke(
+        "semantic_search",
+        json!({
+            "query": "targetNeedle", "vector": false, "rerank": false,
+            "limit": 10, "response_bytes": 2000,
+        }),
+    )?;
+    assert!(serde_json::to_vec(&result)?.len() <= 2000);
+    let hit = result["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| hit["symbol"] == "wrapper")
+        .expect("wrapper hit");
+    assert_eq!(hit["at"], "snippet.ts:3-10");
+    assert_eq!(hit["snippet_line"], 7);
+    assert_eq!(
+        hit["snippet"],
+        "  prepare();\n  targetNeedle();\n  finish();\n}"
+    );
+    assert!(source.contains(hit["snippet"].as_str().unwrap()));
+    let definition = invoke(
+        "definition",
+        json!({
+            "anchor": hit["anchor"], "snapshot": result["snapshot"],
+        }),
+    )?;
+    assert!(
+        definition["definitions"][0]["source"]
+            .as_str()
+            .unwrap()
+            .contains("function wrapper()")
+    );
+    assert_eq!(definition["snapshot"], result["snapshot"]);
+    let exhaustive = invoke(
+        "semantic_search",
+        json!({
+            "query": "targetNeedle", "exhaustive": true,
+        }),
+    )?;
+    for hit in exhaustive["hits"].as_array().unwrap() {
+        assert!(hit.get("snippet").is_none());
+        assert!(hit.get("snippet_line").is_none());
+        assert!(hit["match_lines"].is_array());
+    }
+    Ok(())
+}
+
+#[test]
 fn search_anchors_round_trip_exact_same_named_methods() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(

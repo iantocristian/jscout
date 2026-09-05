@@ -2256,6 +2256,7 @@ fn attached_memory_requires_direct_graph_or_artifact_relation_evidence() -> Resu
         matched_identifiers: Vec::new(),
         match_lines: None,
         snippet: "entry() { return nearby(); }".into(),
+        snippet_line: None,
         snippet_truncated: false,
         anchors: vec![entry.clone()],
         file_anchor: Some("file:entry.ts".into()),
@@ -2298,7 +2299,9 @@ fn attached_memory_requires_direct_graph_or_artifact_relation_evidence() -> Resu
 #[test]
 fn response_budget_caps_the_complete_rendered_search_envelope() -> Result<()> {
     let repo = tempfile::tempdir()?;
-    let source = format!("export const needle = '{}';\n", "x".repeat(12_000));
+    // The snippet's source-byte cap does not bound JSON escaping overhead.
+    // These bytes still force response-budget truncation after excerpting.
+    let source = format!("export const needle = '{}';\n", "\u{1}".repeat(12_000));
     fs::write(repo.path().join("large.ts"), source)?;
     let conn = store::open(repo.path())?;
     indexer::index_repo(repo.path(), &conn)?;
@@ -2414,6 +2417,7 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
             matched_identifiers: Vec::new(),
             match_lines: None,
             snippet: "x".repeat(8_000),
+            snippet_line: None,
             snippet_truncated: false,
             anchors: vec!["sym:src/large.ts#::largeHit@1".into()],
             file_anchor: Some("file:src/large.ts".into()),
