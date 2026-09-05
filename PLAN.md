@@ -3974,11 +3974,12 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
 5. Measurement is the acceptance mechanism, and the goal is iterative by
    design. First, the untracked 2026-08-22 and 2026-08-24 production
    windows — the only run with a full argument log — are written up into
-   `eval/` before they are lost. The replay rig is the three-arm cardHistory
-   comparison, the links-iteration session, and the still-pending G23
-   acceptance replay; every phase closes with a replay against the recorded
-   baselines. Phase 0 is implemented: `integrations/jscout/{core,full}/SKILL.md`
-   are the tiered skills (core under 3 KB), `agent-guide --install ROOT --tier
+   `eval/` before they are lost. The original replay plan combined the
+   three-arm cardHistory comparison, the links-iteration session, and the
+   still-pending G23 acceptance replay. Its phase-by-phase replay requirement
+   was subsequently retired as recorded below. Phase 0 is implemented:
+   `integrations/jscout/{core,full}/SKILL.md` are the tiered skills (core under
+   3 KiB), `agent-guide --install ROOT --tier
    core|full --dest agents|claude|codex` installs to the selected directory,
    `mcp.profile` defaults to
    `core` (alias `baseline`; `full` aliases `structural`), `[mcp].tools`
