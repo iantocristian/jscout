@@ -11,8 +11,9 @@ Both defects were reproduced by their new tests before applying the production
 fixes. The extraction-version refresh test also failed before the version bump:
 all four unchanged files were skipped instead of reparsing the two JS/TS files.
 
-- Preserve Oxc's existing identifier binding for `export default Local`, including
-  runtime/contract export metadata. Cover const/function/class identifiers,
+- Preserve Oxc's existing binding for default exports of locally declared
+  identifiers (`export default Local`), including runtime/contract export metadata.
+  Cover const/function/class identifiers,
   direct/named exports, arbitrary-expression exclusions, and type-only exports.
 - Exercise external call/render projection, name/anchor `who_uses`, and workflow
   candidates through a five-file index fixture.
@@ -31,6 +32,12 @@ Verification: **797 tests passed**, `cargo fmt --all -- --check`,
 `git diff --check` passed. The historical G26 golden excludes the intentionally
 changed extraction-version marker; its canonical rows and public results still
 compare unchanged. The frozen baseline file itself was not rewritten.
+
+Imported-binding forwarding (`import X from './x'; export default X`) remains
+unsupported for downstream consumers. That is a pre-existing resolution gap,
+not a regression fixed by this PR; it is left for a separate follow-up. The
+external-edge and usage claims here apply to locally declared identifiers, not
+to forwarding an imported binding.
 
 ## Native repository checks
 
@@ -81,6 +88,20 @@ Local evidence is retained at `/private/tmp/jscout-graph-real.MMNinL/results/`
 Baseline binary SHA-256: `254fb58d6a1beade0bfa4a8b96627ba81e64eeca38f4771ce994f326e182be8a`.
 Fixed binary SHA-256: `87a91b465ca7807a685d0cce6e896a1ad071ec57935955f95f8152806064278c`.
 
+## After updating
+
 After updating jscout, run `jscout index <root>` or let a watch refresh publish the
 new extraction contract. No schema migration or manual database deletion is
 needed. Restart an already-running watcher to use the updated binary.
+
+Manual indexing normally validates whether checker enrichment can be retained;
+it does not unconditionally drop it. This upgrade's extraction-version change
+prevents retaining the old checker publication, so the manual upgrade index
+clears that batch. If the repository was previously enriched, run
+`jscout enrich <root>` afterward to restore checker-backed edges.
+
+Alternatively, `jscout watch <root> --enrich` can perform enrichment automatically.
+Watch retains previous batches as hidden carry sources for its enrichment phase,
+not as checker edges that remain visible under the new code identity. This PR
+does not change the retention policy. The no-op check above exercises incremental
+refresh; manual `jscout index` always performs a full refresh.
