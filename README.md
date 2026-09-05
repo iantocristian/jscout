@@ -1526,6 +1526,11 @@ eviction sheds that prose before structural counts.
 enables the experimental deterministic renderer, and each call can override it
 with `view: "full"` or `view: "elided"`. Both representations obey the same
 per-definition `source_bytes` ceiling and report original/rendered byte counts.
+Definition coverage follows the exact indexed declaration, including bodies split
+across retrieval chunks. Current disk source is used only when its hash matches
+the index. Otherwise, a cached fragment may be returned with
+`source_meta.partial: true` if it cannot cover the declaration. This is distinct
+from `budget_truncated`; increasing a byte budget cannot restore missing source.
 MCP `definition` and `who_uses` use compact agent transport with a complete
 `response_bytes` ceiling; set `debug: true` for their full diagnostic JSON.
 Compact definitions serialize source once, while compact usages group sites by

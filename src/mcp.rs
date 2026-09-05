@@ -18,6 +18,8 @@ use crate::{
     scout, search, semantic, semantic_query, store, structural, surface,
 };
 
+mod definition;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolProfile {
     Baseline,
@@ -1418,47 +1420,7 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
             let matched_targets = targets.len();
             let mut results = Vec::new();
             for t in targets.into_iter().take(5) {
-                let chunk: Option<(String, i64, i64, String)> = conn
-                    .query_row(
-                        "SELECT c.content, c.start, c.end, f.hash
-                         FROM chunks c JOIN files f ON c.file_id = f.id
-                         WHERE f.id = ?1
-                          AND c.start_line <= ?2 AND c.end_line >= ?2
-                         ORDER BY c.name = ?3 DESC, (c.end-c.start), c.start LIMIT 1",
-                        rusqlite::params![t.file_id, t.line, t.name],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                    )
-                    .ok();
-                let rendered = chunk
-                    .map(|(content, start, end, indexed_hash)| {
-                        let disk_source = store::file_source_path(conn, root, t.file_id)
-                            .ok()
-                            .and_then(|path| std::fs::read_to_string(path).ok());
-                        let current = disk_source.as_deref().is_some_and(|source| {
-                            blake3::hash(source.as_bytes()).to_hex().as_str() == indexed_hash
-                        });
-                        if current {
-                            let source = disk_source.as_deref().expect("checked disk source");
-                            scout::render_source(
-                                Path::new(&t.file),
-                                source,
-                                start as usize,
-                                end as usize,
-                                source_view,
-                                source_bytes,
-                            )
-                        } else {
-                            scout::render_source(
-                                Path::new(&t.file),
-                                &content,
-                                0,
-                                content.len(),
-                                source_view,
-                                source_bytes,
-                            )
-                        }
-                    })
-                    .transpose()?;
+                let rendered = definition::render(root, conn, &t, source_view, source_bytes)?;
                 results.push((t, rendered));
             }
             if debug {

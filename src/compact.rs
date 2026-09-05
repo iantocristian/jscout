@@ -727,6 +727,9 @@ pub(crate) fn compact_definition(
         if source.budget_truncated {
             meta.insert("budget_truncated".into(), json!(true));
         }
+        if source.partial {
+            meta.insert("partial".into(), json!(true));
+        }
         value.insert("source_meta".into(), Value::Object(meta));
     }
     Value::Object(value)

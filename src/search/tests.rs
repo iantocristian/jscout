@@ -28,6 +28,24 @@ use crate::{
 };
 
 #[test]
+fn fusion_ties_preserve_input_order_and_the_reranker_cutoff() {
+    // IDs are deliberately out of order: ties follow input ranking order,
+    // not allocation order in this database or a HashMap iteration.
+    let rankings = vec![vec![(90, 1.0), (4, 0.5)], vec![(4, 1.0), (90, 0.5)]];
+    for _ in 0..128 {
+        let fused = super::rrf(&rankings, 60.0);
+        assert_eq!(fused[0].1, fused[1].1);
+        assert_eq!(fused.iter().map(|row| row.0).collect::<Vec<_>>(), [90, 4]);
+        let prefix = fused.iter().take(1).copied().collect();
+        assert_eq!(merge_reranked_prefix(&fused, prefix), fused);
+    }
+    let renamed_ids = vec![vec![(2, 1.0), (100, 0.5)], vec![(100, 1.0), (2, 0.5)]];
+    assert_eq!(super::rrf(&renamed_ids, 60.0)[0].0, 2);
+    let unique_scores = super::rrf(&[vec![(7, 0.0), (8, 0.0), (9, 0.0)]], 60.0);
+    assert!(unique_scores.windows(2).all(|pair| pair[0].1 > pair[1].1));
+}
+
+#[test]
 fn markdown_admission_does_not_change_serialized_code_search_ranking() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(

@@ -47,6 +47,9 @@ carries a top-level `snapshot` (that surface's invalidation key) and
    `snapshot`, both copied verbatim. Then `who_uses` for callers, `calls` for
    member methods, `file_outline` for one file.
 
+`source_meta.partial: true` means a cached definition fragment, not full coverage.
+Increasing the byte budget cannot restore missing source.
+
 Scope transfer: while paging, keep the original `query` and any explicit
 `origins`, `formats`, and `file_roles` unchanged, or the cursor is rejected.
 Carry explicitly supplied `origins` and `formats` into `definition` and

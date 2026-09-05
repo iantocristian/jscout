@@ -48,6 +48,8 @@ pub struct RenderedSource {
     pub rendered_bytes: usize,
     pub elisions: Vec<ElidedRange>,
     pub budget_truncated: bool,
+    /// The available indexed fragment does not cover the full declaration.
+    pub partial: bool,
 }
 
 pub fn render_source(
@@ -83,6 +85,7 @@ pub fn render_source(
         rendered_bytes,
         elisions,
         budget_truncated,
+        partial: false,
     })
 }
 
