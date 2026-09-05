@@ -83,6 +83,7 @@ pub fn run(
     root: &Path,
     client: Client,
     print_only: bool,
+    replace: bool,
     runtime: &config::RuntimeConfig,
 ) -> Result<()> {
     let root = root.canonicalize()?;
@@ -102,7 +103,7 @@ pub fn run(
     );
 
     // Detect conflicts before creating a configuration, skill, or database.
-    let (registration, registered_entry) = client.prepare(&root, &entry)?;
+    let (registration, registered_entry) = client.prepare(&root, &entry, replace)?;
     let destination = client.skill_destination();
     let skill = root.join(destination.relative_path());
     client::check_local_target(&root, &skill)?;
@@ -144,6 +145,10 @@ pub fn run(
             .then_some(runtime.config_path.as_deref())
             .flatten(),
     )?;
+    println!(
+        "keep the index out of version control: ignore {} and its -wal, -shm, and -journal sidecars; setup does not edit Git ignore rules",
+        runtime.effective.database.path.display()
+    );
     commands::run_command(
         Command::Index {
             root: root.clone(),

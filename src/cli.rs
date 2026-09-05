@@ -31,6 +31,9 @@ pub(super) enum Command {
         /// Print client configuration only; do not index, install, or write files
         #[arg(long)]
         print_config: bool,
+        /// Refresh an existing local jscout registration for this repository
+        #[arg(long, conflicts_with = "print_config")]
+        replace: bool,
     },
     /// Inspect, validate, or initialize repository runtime configuration
     Config {

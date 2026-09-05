@@ -16,6 +16,8 @@ jscout search /path/to/repo "checkout inventory" --lexical-only
 Use `--client claude` for Claude Code. [MCP setup](mcp.md) explains the
 files created and offers manual configuration. For CLI-only use, replace
 `setup` with `jscout index /path/to/repo`; configuration is optional.
+Setup prints the database and SQLite sidecar paths to keep out of version
+control; it does not edit ignore files.
 
 The npm package includes the Rust MCP server, gateway/checker Node sidecars,
 and optional inference service sources. A platform-specific optional dependency
@@ -49,9 +51,10 @@ cargo build --release --locked
 `cargo build` does not add anything to `PATH`. Continue using
 `./target/release/jscout` from this checkout, use its absolute path from
 another directory, or put the installed release directory on `PATH`.
-The setup command records the executable it is running, so moving or removing
-that binary later requires inspecting `setup --print-config` and updating the existing registration
-before running setup again.
+The setup command records the executable it is running. After moving that
+binary or switching to npm, run the new installation's
+`jscout setup /path/to/repo --client codex --replace` to refresh the existing
+registration for that repository.
 For CLI-only use, replace the setup command with
 `./target/release/jscout index /path/to/repo`.
 
@@ -156,7 +159,7 @@ environment variables alike.
 npm install -g @jscout/cli@latest
 jscout --version
 jscout config validate /path/to/repo
-jscout setup /path/to/repo --client codex
+jscout setup /path/to/repo --client codex --replace
 ```
 
 Restart existing MCP clients and any local inference service after upgrading:
@@ -173,9 +176,12 @@ memory as well as disposable indexes. Run `jscout embed` and
 a changed embedding profile may require fresh vectors.
 
 Re-running setup preserves existing repository policy and unrelated client
-entries. A conflicting jscout registration is an error; inspect the file and merge
-`--print-config` output before retrying. Customized skills are preserved with
-a warning. See
+entries. `--replace` explicitly refreshes an enabled local jscout registration
+for the same repository, including changed Node/npm paths and newly required
+environment-variable names; other client settings are preserved. Without it,
+conflicting entries remain an error. Remote, disabled, unrecognized, or
+different-root entries still require inspecting the file and manually merging
+`--print-config` output. Customized skills are preserved with a warning. See
 [MCP setup](mcp.md#existing-configuration).
 
 ## Troubleshooting

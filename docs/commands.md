@@ -8,11 +8,16 @@ The following commands share [repository configuration](configuration.md).
 ```bash
 jscout setup <root> --client codex     # index, install skill, register and verify MCP
 jscout setup <root> --client claude    # same flow for Claude Code
+jscout setup <root> --client codex --replace # refresh this root's local registration
 jscout setup <root> --client codex --print-config # print only; no changes
 jscout config init <root>             # full annotated config template; no overwrite
 jscout config validate <root>
 jscout config show <root> --json       # effective values and their sources
 ```
+
+Setup's `--replace` preserves other client settings and refuses remote,
+disabled, unrecognized, or different-root registrations. It cannot be combined
+with `--print-config`; see [existing configuration](mcp.md#existing-configuration).
 
 ## Indexing and retrieval
 

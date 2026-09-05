@@ -19,6 +19,8 @@ indexes the repository, installs the skill matching the effective MCP profile,
 registers the server for the selected client, and checks MCP initialization
 and tool discovery. It makes no embedding or model calls. It does not launch
 a persistent watcher or restart the client.
+It prints the configured database and SQLite sidecar paths to exclude from
+version control, without editing ignore files.
 
 | Client | Project registration | Project skill |
 | --- | --- | --- |
@@ -33,23 +35,41 @@ servers. Setup does not change client trust or approval preferences.
 
 The generated registration uses the current executable and canonical
 repository/config paths. npm installs register the actual Node executable plus
-the package wrapper so bundled sidecar discovery is retained. It is specific to that installation and checkout; after
-moving either, regenerate the entry. Review machine-specific paths before
-sharing project configuration in Git.
+the package wrapper so bundled sidecar discovery is retained. It is specific
+to that installation and checkout. After changing installations, use
+`--replace` below; after moving the checkout, manually review the root paths.
+Review machine-specific paths before sharing project configuration in Git.
 
 ## Existing configuration
 
 Setup preserves existing `.jscout.toml` settings and unrelated client
 configuration. Matching command/argument entries retain extra client settings.
-A conflicting launcher/argument list or disabled jscout server stops setup and
-must be resolved manually. A customized existing skill is preserved with a
-warning, not replaced. It does not change global client configuration.
+A conflicting launcher/argument list or missing required environment-variable
+name stops normal setup. To refresh a registration after upgrading Node,
+changing installations, or configuring an embedding provider:
+
+```bash
+jscout setup /path/to/repo --client codex --replace
+# Or:
+jscout setup /path/to/repo --client claude --replace
+```
+
+`--replace` accepts only an enabled local stdio jscout entry with a recognized
+native or npm launch shape targeting the same canonical repository root. It
+updates `command` and `args`, adds required Codex `env_vars` names without
+dropping custom names, and preserves other client settings. Verification uses
+the updated launcher, not the old executable. Remote, disabled, unrecognized,
+or different-root entries still require manual resolution. `--replace` cannot
+be combined with `--print-config`.
+
+A customized existing skill is preserved with a warning, not replaced. Setup
+does not change global client configuration.
 
 Mutating setup rejects active legacy `JSCOUT_*` non-secret settings: migrate the
 reported values into `.jscout.toml` first so a client with a different launch
 environment gets the same policy. Referenced API-key variables are unaffected.
 Existing local-stdio `env`/`cwd` overrides are preserved and exercised by the
-handshake; disabled, remote/URL, or conflicting registrations are not replaced.
+handshake; `--replace` does not discard them.
 
 Configuration/skill creation and indexing happen before the handshake check;
 client registration is written only after verification succeeds. If indexing

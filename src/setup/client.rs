@@ -65,12 +65,17 @@ impl Client {
         }
     }
 
-    pub(super) fn prepare(self, root: &Path, entry: &Value) -> Result<(FileUpdate, Value)> {
+    pub(super) fn prepare(
+        self,
+        root: &Path,
+        entry: &Value,
+        replace: bool,
+    ) -> Result<(FileUpdate, Value)> {
         let path = root.join(self.config_path());
         check_local_target(root, &path)?;
         let original = read_optional(&path)?;
-        let replacement = self.merge(original.as_deref(), entry)
-            .with_context(|| format!("merge {}; existing jscout entries are never overwritten; use setup --print-config to inspect the required entry", path.display()))?;
+        let replacement = self.merge(original.as_deref(), entry, replace)
+            .with_context(|| format!("merge {}; existing jscout entries are never overwritten without --replace; use setup --print-config to inspect the required entry", path.display()))?;
         let registered: Value =
             match self {
                 Self::Codex => serde_json::to_value(toml::from_str::<toml::Value>(&replacement)?)?
@@ -83,7 +88,7 @@ impl Client {
         Ok((FileUpdate::new(path, original, replacement), registered))
     }
 
-    fn merge(self, original: Option<&str>, entry: &Value) -> Result<String> {
+    fn merge(self, original: Option<&str>, entry: &Value, replace: bool) -> Result<String> {
         let Some(original) = original else {
             return self.render(entry);
         };
@@ -91,8 +96,30 @@ impl Client {
             Self::Codex => {
                 let parsed: toml::Value = toml::from_str(original)?;
                 if let Some(existing) = parsed.get("mcp_servers").and_then(|v| v.get("jscout")) {
-                    check_existing(&serde_json::to_value(existing)?, entry)?;
-                    return Ok(original.to_string());
+                    let existing = serde_json::to_value(existing)?;
+                    let updated = update_entry(&existing, entry, replace)?;
+                    if updated == existing {
+                        return Ok(original.to_string());
+                    }
+                    // Patch only changed fields, retaining user settings and TOML comments.
+                    let mut document: toml_edit::DocumentMut = original.parse()?;
+                    let fragment: toml_edit::DocumentMut = self.render(&updated)?.parse()?;
+                    let table = document["mcp_servers"]["jscout"]
+                        .as_table_like_mut()
+                        .context("jscout must be a table")?;
+                    for key in ["command", "args", "env_vars"] {
+                        if updated.get(key) != existing.get(key) {
+                            let mut item = fragment["mcp_servers"]["jscout"][key].clone();
+                            if let Some(previous) =
+                                table.get(key).and_then(toml_edit::Item::as_value)
+                                && let Some(value) = item.as_value_mut()
+                            {
+                                *value.decor_mut() = previous.decor().clone();
+                            }
+                            table.insert(key, item);
+                        }
+                    }
+                    return Ok(document.to_string());
                 }
                 let mut document: toml_edit::DocumentMut = original.parse()?;
                 if !document.contains_key("mcp_servers") {
@@ -123,10 +150,14 @@ impl Client {
                     .as_object_mut()
                     .context("mcpServers must be an object")?;
                 if let Some(existing) = servers.get("jscout") {
-                    check_existing(existing, entry)?;
-                    return Ok(original.to_string());
+                    let updated = update_entry(existing, entry, replace)?;
+                    if updated == *existing {
+                        return Ok(original.to_string());
+                    }
+                    servers.insert("jscout".to_string(), updated);
+                } else {
+                    servers.insert("jscout".to_string(), entry.clone());
                 }
-                servers.insert("jscout".to_string(), entry.clone());
                 Ok(format!("{}\n", serde_json::to_string_pretty(&document)?))
             }
         }
@@ -160,7 +191,7 @@ fn expand_environment(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Re
     Ok(output)
 }
 
-fn check_existing(existing: &Value, expected: &Value) -> Result<()> {
+fn update_entry(existing: &Value, expected: &Value, replace: bool) -> Result<Value> {
     ensure!(
         existing.get("url").is_none() && existing.get("type").is_none_or(|kind| kind == "stdio"),
         "existing jscout transport is not local stdio"
@@ -169,26 +200,106 @@ fn check_existing(existing: &Value, expected: &Value) -> Result<()> {
         existing.get("experimental_environment").is_none(),
         "existing jscout launch uses a different executor environment"
     );
-    for key in ["command", "args"] {
-        ensure!(
-            existing.get(key) == expected.get(key),
-            "existing jscout {key} differs"
-        );
-    }
     ensure!(
         existing.get("enabled") != Some(&Value::Bool(false)),
         "existing jscout server is disabled"
     );
+    let matching_launch = ["command", "args"]
+        .iter()
+        .all(|key| existing.get(key) == expected.get(key));
+    if replace && !matching_launch {
+        check_replace_target(existing, expected)?;
+    } else if !replace {
+        for key in ["command", "args"] {
+            ensure!(
+                existing.get(key) == expected.get(key),
+                "existing jscout {key} differs; rerun with --replace to refresh this repository's registration"
+            );
+        }
+    }
+    let mut updated = existing.clone();
+    for key in ["command", "args"] {
+        updated[key] = expected[key].clone();
+    }
     if let Some(required) = expected["env_vars"].as_array() {
-        let actual = existing["env_vars"]
-            .as_array()
-            .context("existing jscout entry does not forward the configured environment names")?;
+        let mut names = match existing.get("env_vars") {
+            Some(value) => value
+                .as_array()
+                .context("existing jscout env_vars must be an array of strings")?
+                .clone(),
+            None => Vec::new(),
+        };
         ensure!(
-            required.iter().all(|name| actual.contains(name)),
-            "existing jscout env_vars omits a configured environment name"
+            names.iter().all(Value::is_string),
+            "existing jscout env_vars must be an array of strings"
         );
+        if replace {
+            for name in required {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+            updated["env_vars"] = Value::Array(names);
+        } else {
+            ensure!(
+                required.iter().all(|name| names.contains(name)),
+                "existing jscout env_vars omits a configured environment name; rerun with --replace"
+            );
+        }
     }
     // Client-side timeouts, tool policy, and other user settings remain untouched.
+    Ok(updated)
+}
+
+/// Recognize generated native/npm launch shapes without reading or executing the
+/// previous installation (it may no longer exist). This scopes replacement; it
+/// does not establish trust in other settings from the repository.
+fn check_replace_target(existing: &Value, expected: &Value) -> Result<()> {
+    let command = Path::new(
+        existing["command"]
+            .as_str()
+            .context("MCP command missing")?,
+    );
+    let args = existing["args"]
+        .as_array()
+        .context("MCP args must be an array")?
+        .iter()
+        .map(|arg| arg.as_str().context("MCP args must be strings"))
+        .collect::<Result<Vec<_>>>()?;
+    let prefix = match args.as_slice() {
+        [prefix @ .., "mcp", root]
+            if Some(*root)
+                == expected["args"]
+                    .as_array()
+                    .and_then(|args| args.last())
+                    .and_then(Value::as_str) =>
+        {
+            prefix
+        }
+        _ => anyhow::bail!("--replace requires a jscout registration targeting this repository"),
+    };
+    let prefix = match command.file_name().and_then(|name| name.to_str()) {
+        Some("jscout" | "jscout.exe") => prefix,
+        Some("node" | "node.exe") => match prefix {
+            [wrapper, rest @ ..]
+                if Path::new(wrapper).is_absolute()
+                    && Path::new(wrapper).ends_with("bin/jscout.mjs") =>
+            {
+                rest
+            }
+            _ => anyhow::bail!("--replace does not recognize this npm launcher"),
+        },
+        _ => anyhow::bail!("--replace does not recognize this jscout launcher"),
+    };
+    let known_options = match prefix {
+        [] => true,
+        ["--config", path] => Path::new(path).is_absolute(),
+        _ => false,
+    };
+    ensure!(
+        command.is_absolute() && known_options,
+        "--replace only refreshes supported local jscout launch arguments"
+    );
     Ok(())
 }
 

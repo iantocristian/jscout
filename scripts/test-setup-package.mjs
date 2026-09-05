@@ -44,11 +44,19 @@ try {
     assert.equal(docs.hits[0].path, "README.md");
 
     if (client === "claude") {
+      // Refresh a removed installation through the actual packaged launcher.
+      const outdated = JSON.parse(registered);
+      outdated.mcpServers.jscout.command = "/removed-installation/jscout";
+      outdated.mcpServers.jscout.args = ["mcp", root];
+      outdated.mcpServers.jscout.env = { LANG: "C" };
+      fs.writeFileSync(configPath, JSON.stringify(outdated));
+      assert.match(invoke(root, [...args, "--replace"]), /verified MCP initialization and 7 tools/);
       // Launch the actual saved registration with no inherited JSCOUT_BUNDLED_*
       // or auth environment. This catches registering npm's bare platform binary.
-      const server = JSON.parse(registered).mcpServers.jscout;
+      const server = JSON.parse(fs.readFileSync(configPath, "utf8")).mcpServers.jscout;
       assert.equal(server.command, command);
       assert.deepEqual(server.args, [...prefix, "mcp", root]);
+      assert.deepEqual(server.env, { LANG: "C" });
       const requests = [
         { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "package-smoke", version: "1" } } },
         { jsonrpc: "2.0", method: "notifications/initialized" },

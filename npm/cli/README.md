@@ -19,6 +19,10 @@ installs the matching project skill, registers and verifies MCP, and preserves
 existing policy and unrelated client configuration. Restart/reload the client
 and approve/trust project configuration when prompted.
 
+After upgrading npm/Node or changing installations, run
+`jscout setup /path/to/repo --client codex --replace` to refresh this
+repository's local registration while preserving other client settings.
+
 The matching binary arrives as an optional dependency; there is no compilation
 or install script. Do not install with `--omit=optional`. npm already installs
 the MCP server—there is no separate server package or automatic client mutation.
