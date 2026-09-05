@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-30.
+> Status: authoritative plan as of 2026-09-05.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -32,9 +32,10 @@
 > identities are implemented: code and documentation now have independent
 > invalidation digests inside one atomic publication, while
 > `publication_snapshot` identifies the canonical indexed code,
-> documentation, and documentation-provenance tuple. G28 remains incremental;
-> its phase-1 response economy shipped with G27, while the tiered registration
-> and overview phases remain proposed.
+> documentation, and documentation-provenance tuple. G28 response economy,
+> tiered registration, and compact overview are implemented. Its retained
+> majority-content acceptance condition is not met by the measured ranked
+> responses; the production replay remains retired by maintainer decision.
 
 ## Document policy
 
@@ -3885,7 +3886,7 @@ scratch artifacts are not checked in. The implementation, corpus counts,
 integrity checks, artifact hashes, and full measurement limits are recorded in
 [eval/results/g27-plane-identities-2026-08-30.md](eval/results/g27-plane-identities-2026-08-30.md).
 
-## G28 — agent surface economy (phase 1 code implemented; replay pending)
+## G28 — agent surface economy (implemented; content-ratio acceptance unmet; replay retired)
 
 The surface costs more than the work. An out-of-box MCP session pays the
 structural profile's 13 tool definitions plus instructions — roughly 27 KB,
@@ -3918,8 +3919,8 @@ activated is what a task prompt turns on. Instructed use requires
 availability, so availability stays broad and becomes cheap; attention is
 narrowed by the skill; per-task activation lives in the caller's prompt.
 
-1. The skill is the single teaching surface, per tier. `agent-guide install
-   --tier core|full` installs a compact skill — tool table with required and
+1. The skill is the single teaching surface, per tier. `agent-guide --install
+   ROOT --tier core|full` installs a compact skill — tool table with required and
    optional arguments, two flows (investigate a known identifier; localize a
    fuzzy description), and tips written from the recorded production
    anti-patterns: abandon a `broad_or_query` page immediately rather than
@@ -3973,16 +3974,59 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
 5. Measurement is the acceptance mechanism, and the goal is iterative by
    design. First, the untracked 2026-08-22 and 2026-08-24 production
    windows — the only run with a full argument log — are written up into
-   `eval/` before they are lost. The replay rig is the three-arm cardHistory
-   comparison, the links-iteration session, and the still-pending G23
-   acceptance replay; every phase closes with a replay against the recorded
-   baselines. Phase 0 — tiered skill, installer destinations, and registration
-   config — remains pending. Phase 1 response economy is implemented with G27
-   and pinned by response-shape and differential tests, but its byte/quality
-   replay acceptance has not run. Phase 2, the overview redesign, remains
-   pending. The G27 isolation measurement is evidence for G27, not a substitute
-   for G28's surface-cost and answer-quality thresholds. Documentation and Rust
-   guidance remains subject to its first production telemetry window.
+   `eval/` before they are lost. The original replay plan combined the
+   three-arm cardHistory comparison, the links-iteration session, and the
+   still-pending G23 acceptance replay. Its phase-by-phase replay requirement
+   was subsequently retired as recorded below. Phase 0 is implemented:
+   `integrations/jscout/{core,full}/SKILL.md` are the tiered skills (core under
+   3 KiB), `agent-guide --install ROOT --tier
+   core|full --dest agents|claude|codex` installs to the selected directory,
+   `mcp.profile` defaults to
+   `core` (alias `baseline`; `full` aliases `structural`), `[mcp].tools`
+   narrows registration and is enforced at the call boundary, both server
+   instruction strings are identity, skill pointer, and the two mechanical
+   contracts, and tool descriptions are one line with duplicated property
+   prose removed; the surface-size, one-liner, and allowlist gates are pinned
+   by tests. Phase 1 response economy is implemented with G27 and pinned by
+   response-shape and differential tests. Phase 2 is implemented: the overview
+   defaults `reconnaissance_limit` to zero, a subject implies one, and budget
+   eviction sheds reconnaissance prose before structural counts. The
+   2026-08-22 and 2026-08-24 production windows are written up in
+   [eval/results/production-windows-2026-08-22-24.md](eval/results/production-windows-2026-08-22-24.md)
+   from the measured telemetry and request-log rows; the raw rows and
+   transcripts stay out of the repository and are identified by hash. The
+   byte/quality replay is retired by maintainer decision (Cristian,
+   2026-09-02): it required re-running agents against the production
+   monorepo, and the recorded windows already settle the direction. This is
+   a scope decision, not a result established by the implementation: the
+   live ai-pipe validation confirms adoption and flow compliance but shows
+   no outcome advantage on that 690-file repository, and the favourable
+   7,000-file evidence predates G28 with its raw artifacts held privately.
+   The recorded numbers remain the comparison point for any future
+   production window, and documentation and Rust guidance remains subject to
+   their first such window. A live
+   validation of the shipped surface on ai-pipe with Codex —
+   [eval/results/g28-live-ai-pipe-2026-09-02.md](eval/results/g28-live-ai-pipe-2026-09-02.md)
+   — confirmed that the installed skill is the adoption mechanism (8/8
+   sessions used jscout with it, 0/8 without it on the same server), that the
+   taught flow is followed, and that on a 690-file repository plain shell
+   search is cheaper for the same correctness; the value claim moves to
+   larger repositories. The same surface replayed on the 23,488-file Next.js
+   task with `gpt-5.6-terra` —
+   [eval/results/next-stale-development-cache-g28-2026-09-02.md](eval/results/next-stale-development-cache-g28-2026-09-02.md)
+   — adds the other half of that picture: on a repository whose own
+   `AGENTS.md` prescribes grep first and lists eighteen native skills, no
+   naturalistic replay session (0/3) opened the skill, while the forced arm
+   used the taught flow at 20 calls and 70 KB against 45 calls and 328 KB on
+   the pre-G28 surface, with the same pass. The diagnosis (skill listed in
+   the catalog, tools present at the first turn, nothing in the surface
+   saying "read this file before you search") produced the directive
+   pointer, the trigger-form descriptions, and the "MCP tools, not shell
+   commands" opening line; five-seed short-session measurement moved
+   first-command skill reads from 2/5 to 5/5 and sessions using jscout from
+   3/5 to 4/5 on that repository, and two full replay arms on the fixed
+   surface both read the skill, worked through jscout, and passed (2/2
+   against 0/3 before).
 
 Acceptance: the default registered surface, instructions included, costs
 less than a third of today's structural surface, and the core skill stays
@@ -3990,13 +4034,38 @@ under a quarter of the current guide; a ranked search hit is majority
 content by bytes; the G27 identity fields each appear exactly once on the
 covered response set; the
 overview default response at 150 workspace areas stays within a few
-kilobytes with no reconnaissance prose; replayed against the recorded
-baselines, the skill-guided arm's call count and answer quality do not
-regress and the use-every-endpoint arm's bytes drop by at least half; and
-every routing rule exists in exactly one surface — the skill — with the
-instruction strings reduced to identity, pointer, and mechanical contracts.
-Phase 1 code is complete, but G28 remains open until phases 0 and 2 land and
-the recorded byte/quality replay gates pass.
+kilobytes with no reconnaissance prose; and every routing rule exists in
+exactly one surface — the skill — with the instruction strings reduced to
+identity, pointer, and mechanical contracts. Each of these is pinned by a
+test except the ranked-hit content ratio, which is an output measurement:
+content is the UTF-8 byte length of the JSON-escaped `snippet` string,
+excluding its surrounding quotes; the denominator is the complete compact
+JSON hit object. Field names, anchors, locations, symbols, relations, and
+other metadata never count as content. Report individual hit ratios and
+the byte-weighted aggregate (sum of snippet bytes / sum of hit bytes), with
+empty results reported as unmeasured, not passing. The response envelope
+and hit-array delimiters are outside this per-hit measure. The existing
+`hits_bytes` / `envelope_bytes` telemetry measures a different boundary and
+cannot establish this condition.
+
+The current-output measurement and its reproducible scorer are recorded in
+[eval/results/g28-ranked-content-ratio-2026-09-05.md](eval/results/g28-ranked-content-ratio-2026-09-05.md).
+The majority-content condition is not met on these samples. This corrects
+the prior unsupported acceptance claim; it does not waive the condition,
+change retrieval behavior, or reinstate the retired agent replay.
+
+The pointer is a directive: the
+instructions tell the agent to read the installed skill file before its
+first repository search, and the `semantic_search` description says to use
+it before grep or rg, because the 2026-09-02 Next.js replay showed that a
+bare pointer plus a one-line catalog description was never selected by a
+naturalistic Codex session on a repository with strong native agent
+instructions. The replay gates that were to compare the skill-guided and
+use-every-endpoint arms against the recorded baselines are retired with the
+replay; the baselines are recorded in the production-windows report for any
+later production comparison. G28's implementation is complete; the retained
+content-ratio acceptance remains unmet pending a maintainer decision on the
+response design or the criterion.
 
 ## Evaluation decisions already made
 

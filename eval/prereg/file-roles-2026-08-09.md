@@ -27,8 +27,8 @@ Same eight tasks, same frozen commits (`9d9e9bf9` n8n / `02a187d0` Twenty),
 same three profiles, three trials, `gpt-5.6-terra` high reasoning, Codex CLI
 pinned, same grading and blind adjudication, task-clustered bootstrap. The
 **only** difference between compared builds is the file-roles change (record
-both jscout snapshots). The [SKILL.md](../../integrations/jscout/SKILL.md)
-agent guide stays byte-identical. No other retrieval change rides along.
+both jscout snapshots). The [SKILL.md](https://github.com/iantocristian/jscout/blob/dc26ffd/integrations/jscout/SKILL.md)
+agent guide (the single pre-G28 guide, linked at its last commit) stays byte-identical. No other retrieval change rides along.
 
 ## Pre-registered expectations
 

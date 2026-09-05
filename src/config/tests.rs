@@ -333,7 +333,7 @@ fn init_refuses_to_overwrite_and_emits_the_current_schema() -> anyhow::Result<()
     assert!(loaded.config_loaded);
     assert!(loaded.effective.docs.enabled);
     assert_eq!(loaded.effective.docs.include, ["**/*.md", "**/*.mdx"]);
-    assert_eq!(loaded.effective.mcp.profile, "structural");
+    assert_eq!(loaded.effective.mcp.profile, "core");
     assert_eq!(loaded.effective.mcp.result_transport, "auto");
     assert!(init(root.path(), None).is_err());
     assert!(TEMPLATE.contains("rerank = true"));
@@ -341,6 +341,34 @@ fn init_refuses_to_overwrite_and_emits_the_current_schema() -> anyhow::Result<()
     assert!(TEMPLATE.contains("enabled = true"));
     assert!(TEMPLATE.contains("\"**/*.mdx\""));
     assert!(!TEMPLATE.contains(".jscout-docs.db"));
+    Ok(())
+}
+
+#[test]
+fn mcp_tools_allowlist_rejects_unknown_names_and_explicit_empty_lists() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(
+        root.path().join(FILE_NAME),
+        "version = 1\n[mcp]\ntools = []\n",
+    )?;
+    let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("mcp.tools must list at least one tool")
+    );
+    std::fs::write(
+        root.path().join(FILE_NAME),
+        "version = 1\n[mcp]\ntools = [\"definitions\"]\n",
+    )?;
+    let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+    assert!(error.to_string().contains("unknown tool `definitions`"));
+    std::fs::write(
+        root.path().join(FILE_NAME),
+        "version = 1\n[mcp]\ntools = [\"definition\", \"who_uses\"]\n",
+    )?;
+    let loaded = RuntimeConfig::load(Some(root.path()), None)?;
+    assert_eq!(loaded.effective.mcp.tools, ["definition", "who_uses"]);
     Ok(())
 }
 

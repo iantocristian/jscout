@@ -253,6 +253,9 @@ pub struct McpSettings {
     pub profile: String,
     pub source_view: String,
     pub result_transport: String,
+    /// Optional per-project tool allowlist; empty registers every tool the
+    /// profile allows.
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -92,6 +92,7 @@ fn agent_guide_update_is_explicit_rooted_and_exclusive_with_install() {
         Command::AgentGuide {
             install: None,
             update: Some(root),
+            ..
         } if root == std::path::Path::new("/tmp/repo")
     ));
 

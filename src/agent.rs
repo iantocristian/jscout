@@ -5,21 +5,94 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 
-pub const GUIDE: &str = include_str!("../integrations/jscout/SKILL.md");
+/// The core tier teaches the production-selected surface and nothing else.
+pub const CORE_GUIDE: &str = include_str!("../integrations/jscout/core/SKILL.md");
+/// The full tier adds the memory, overview, graph, and write-back tools.
+pub const FULL_GUIDE: &str = include_str!("../integrations/jscout/full/SKILL.md");
 
-const TARGET: &str = ".agents/skills/jscout/SKILL.md";
 const UPDATE_TEMP_ATTEMPTS: usize = 64;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
-fn target(root: &Path) -> Result<PathBuf> {
+/// Which skill text to install. The tier should match the MCP profile the
+/// repository serves: `core` for the baseline tool set, `full` for structural.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Core,
+    Full,
+}
+
+impl Tier {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "core" => Ok(Self::Core),
+            "full" => Ok(Self::Full),
+            _ => bail!("agent guide tier must be core or full"),
+        }
+    }
+
+    pub fn guide(self) -> &'static str {
+        match self {
+            Self::Core => CORE_GUIDE,
+            Self::Full => FULL_GUIDE,
+        }
+    }
+}
+
+/// Project-local skill locations understood by supported agent clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    Agents,
+    Claude,
+    Codex,
+}
+
+impl Destination {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "agents" => Ok(Self::Agents),
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            _ => bail!("agent guide destination must be agents, claude, or codex"),
+        }
+    }
+
+    pub fn relative_path(self) -> &'static str {
+        match self {
+            Self::Agents => ".agents/skills/jscout/SKILL.md",
+            Self::Claude => ".claude/skills/jscout/SKILL.md",
+            Self::Codex => ".codex/skills/jscout/SKILL.md",
+        }
+    }
+}
+
+/// Resolve `--tier`/`--dest`. Install and print default to `core` and
+/// `agents`; `--update` requires both so an update can never silently target
+/// the wrong destination or downgrade an installed tier.
+pub fn resolve_selectors(
+    updating: bool,
+    tier: Option<&str>,
+    destination: Option<&str>,
+) -> Result<(Tier, Destination)> {
+    if updating && (tier.is_none() || destination.is_none()) {
+        bail!(
+            "agent guide --update requires explicit --tier core|full and --dest agents|claude|codex so it replaces exactly the installed guide"
+        );
+    }
+    Ok((
+        Tier::parse(tier.unwrap_or("core"))?,
+        Destination::parse(destination.unwrap_or("agents"))?,
+    ))
+}
+
+fn target(root: &Path, destination: Destination) -> Result<PathBuf> {
     let root = root
         .canonicalize()
         .with_context(|| format!("resolve repository root {}", root.display()))?;
-    Ok(root.join(TARGET))
+    Ok(root.join(destination.relative_path()))
 }
 
-pub fn install(root: &Path) -> Result<PathBuf> {
-    let target = target(root)?;
+pub fn install(root: &Path, tier: Tier, destination: Destination) -> Result<PathBuf> {
+    let target = target(root, destination)?;
     if target.exists() {
         bail!("agent guide already exists: {}", target.display());
     }
@@ -33,20 +106,20 @@ pub fn install(root: &Path) -> Result<PathBuf> {
         .create_new(true)
         .open(&target)
         .with_context(|| format!("create agent guide {}", target.display()))?;
-    file.write_all(GUIDE.as_bytes())?;
+    file.write_all(tier.guide().as_bytes())?;
     file.sync_all()?;
     Ok(target)
 }
 
-/// Write the current shipped guide to its one supported project-local path.
+/// Write the shipped guide for one tier to one project-local destination.
 ///
 /// Unlike [`install`], this is an explicit overwrite operation. It also
 /// creates a missing target, which makes one command sufficient to bring an
 /// existing checkout to the current guide version. The replacement is staged
 /// beside the target and renamed only after the complete guide has been
 /// flushed, so a failure before replacement leaves the previous guide intact.
-pub fn update(root: &Path) -> Result<PathBuf> {
-    let target = target(root)?;
+pub fn update(root: &Path, tier: Tier, destination: Destination) -> Result<PathBuf> {
+    let target = target(root, destination)?;
     let parent = target
         .parent()
         .context("agent guide has no parent directory")?;
@@ -55,7 +128,7 @@ pub fn update(root: &Path) -> Result<PathBuf> {
 
     let (temporary, mut file) = create_update_temp(parent)?;
     let write_result = (|| -> Result<()> {
-        file.write_all(GUIDE.as_bytes())
+        file.write_all(tier.guide().as_bytes())
             .with_context(|| format!("write temporary agent guide {}", temporary.display()))?;
         file.sync_all()
             .with_context(|| format!("flush temporary agent guide {}", temporary.display()))?;
@@ -107,61 +180,180 @@ fn create_update_temp(parent: &Path) -> Result<(PathBuf, File)> {
 mod tests {
     use anyhow::Result;
 
-    use super::{GUIDE, install, update};
+    use super::{CORE_GUIDE, Destination, FULL_GUIDE, Tier, install, resolve_selectors, update};
+
+    /// The pre-G28 guide was 12,234 bytes; the core tier must stay under a
+    /// quarter of it (G28 acceptance).
+    const CORE_GUIDE_BYTE_LIMIT: usize = 12_234 / 4;
+
+    const SHARED_MARKERS: &[&str] = &[
+        "`exhaustive: true`",
+        "`broad_or_query`",
+        "abandon it",
+        "Never page merely because `next_cursor` exists",
+        "`truncated: false`",
+        "`total_chunks`",
+        "minimum_bytes=N",
+        "`response_bytes: N`",
+        "`sym:` anchor",
+        "copied verbatim",
+        "`who_uses`",
+        "`calls`",
+        "`file_outline`",
+        "`events`",
+        "`documentation_search`",
+        "`publication_snapshot`",
+        "not a session ceiling",
+        "convention, not proof",
+        "restart that surface's traversal",
+        "prose is never runtime proof",
+        "## On instruction",
+        "Scope transfer",
+        "or the cursor is rejected",
+        "Carry explicitly supplied `origins` and `formats` into `definition` and",
+        "from the echoed `scope`",
+    ];
 
     #[test]
-    fn guide_encodes_the_investigation_and_inquiry_contracts() {
-        for marker in [
-            "Investigation loop",
-            "Inquiry loop",
-            "exhaustive: true",
-            "next_cursor",
-            "abandon it immediately",
-            "do not page merely because a cursor",
-            "abandoned query does not need cursor completion",
-            "total_chunks",
-            "match_lines",
-            "response_budget_too_small",
-            "minimum_bytes=<N>",
-            "one returned `sym:` anchor",
-            "strip only that leading prefix",
-            "human-authored `symbol` mode",
-            "explicit `origins` and `formats` allowlists",
-            "Never synthesize locator arguments",
-            "`scope.origins`",
-            "`scope.formats`",
-            "response's top-level `snapshot` and the echoed scope",
-            "separate non-exhaustive",
-            "Baseline forces both unavailable stages off",
-            "semantic_memory",
-            "localize that evidence first",
-            "exact `anchor` or `file`",
-            "Simple occurrence",
-            "anchor-free",
-            "repository_overview` once",
-            "include_memory: false",
-            "expand: false",
-            "one orientation expansion",
-            "Restart the affected exhaustive traversal",
-            "repository convention",
-            "documentation_search",
-            "`publication_snapshot` correlates it with the canonical index",
-            "selection predicate",
-            "selected subject's metadata",
-        ] {
-            assert!(GUIDE.contains(marker), "missing guide contract: {marker}");
+    fn core_guide_teaches_only_the_core_surface() {
+        for marker in SHARED_MARKERS {
+            assert!(
+                CORE_GUIDE.contains(marker),
+                "missing core contract: {marker}"
+            );
         }
-        assert!(!GUIDE.contains("initial result limit at 10"));
-        assert!(!GUIDE.contains("Stop only when"));
+        for absent in [
+            "semantic_memory",
+            "repository_overview",
+            "neighborhood",
+            "annotate",
+            "entities",
+            "paths",
+            "include_memory",
+            "`expand",
+        ] {
+            assert!(
+                !CORE_GUIDE.contains(absent),
+                "core guide teaches a full-profile capability: {absent}"
+            );
+        }
+        assert!(
+            CORE_GUIDE.len() < CORE_GUIDE_BYTE_LIMIT,
+            "core guide is {} bytes; the G28 gate is under {CORE_GUIDE_BYTE_LIMIT}",
+            CORE_GUIDE.len()
+        );
+    }
+
+    /// Codex and similar clients select a skill only when "the task clearly
+    /// matches an available skill's description". The 2026-09-02 Next.js replay
+    /// showed that a jargon description ("Localize and prove code…") was never
+    /// selected (0/3 sessions) while the pre-G28 "Use the jscout repository
+    /// index to…" form was; both tiers keep that proven trigger form.
+    #[test]
+    fn guide_descriptions_state_when_to_use_the_skill() {
+        for (tier, guide) in [("core", CORE_GUIDE), ("full", FULL_GUIDE)] {
+            let (frontmatter, _) = guide
+                .strip_prefix("---\n")
+                .and_then(|body| body.split_once("\n---\n"))
+                .unwrap_or_else(|| panic!("{tier} guide has no YAML frontmatter"));
+            let metadata: serde_yaml_ng::Value = serde_yaml_ng::from_str(frontmatter)
+                .unwrap_or_else(|error| panic!("{tier} guide has invalid YAML: {error}"));
+            assert_eq!(metadata["name"].as_str(), Some("jscout"));
+            let description = metadata["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tier} guide has no frontmatter description"));
+            assert!(
+                description.starts_with("Use the jscout repository index to search"),
+                "{tier} guide description must open with the trigger form: {description}"
+            );
+            for marker in [
+                "before grep or rg",
+                "fix a bug, implement a change, or answer a question",
+                "investigate known identifiers completely",
+                "cross-file questions",
+                "source-backed evidence",
+                "JavaScript or TypeScript project",
+            ] {
+                assert!(
+                    description.contains(marker),
+                    "{tier} guide description lacks `{marker}`: {description}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_guide_adds_inquiry_and_write_back_without_losing_the_core() {
+        for marker in SHARED_MARKERS {
+            assert!(
+                FULL_GUIDE.contains(marker),
+                "missing full contract: {marker}"
+            );
+        }
+        for marker in [
+            "`semantic_memory`",
+            "`repository_overview`",
+            "not a first step",
+            "`neighborhood`",
+            "`entities`",
+            "`paths`",
+            "`annotate`",
+            "## Flow 3",
+            "`include_memory: false`",
+            "`expand: false`",
+            "at most one `expand: true`",
+            "selection predicate",
+            "never `certain`",
+            "never\n`publication_snapshot`",
+            "Memory-first on an anchored question",
+        ] {
+            assert!(
+                FULL_GUIDE.contains(marker),
+                "missing full contract: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_requires_explicit_tier_and_destination() -> Result<()> {
+        assert_eq!(
+            resolve_selectors(false, None, None)?,
+            (Tier::Core, Destination::Agents)
+        );
+        assert_eq!(
+            resolve_selectors(true, Some("full"), Some("claude"))?,
+            (Tier::Full, Destination::Claude)
+        );
+        for (tier, dest) in [(None, None), (Some("full"), None), (None, Some("claude"))] {
+            assert!(
+                resolve_selectors(true, tier, dest)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--update requires explicit --tier")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiers_and_destinations_parse_exactly() -> Result<()> {
+        assert_eq!(Tier::parse("core")?, Tier::Core);
+        assert_eq!(Tier::parse("full")?, Tier::Full);
+        assert!(Tier::parse("structural").is_err());
+        assert_eq!(Destination::parse("agents")?, Destination::Agents);
+        assert_eq!(Destination::parse("claude")?, Destination::Claude);
+        assert_eq!(Destination::parse("codex")?, Destination::Codex);
+        assert!(Destination::parse("cursor").is_err());
+        Ok(())
     }
 
     #[test]
     fn installs_once_without_overwriting() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        let target = install(repo.path())?;
-        assert_eq!(std::fs::read_to_string(&target)?, GUIDE);
+        let target = install(repo.path(), Tier::Core, Destination::Agents)?;
+        assert_eq!(std::fs::read_to_string(&target)?, CORE_GUIDE);
         assert!(
-            install(repo.path())
+            install(repo.path(), Tier::Full, Destination::Agents)
                 .unwrap_err()
                 .to_string()
                 .contains("already exists")
@@ -170,16 +362,32 @@ mod tests {
     }
 
     #[test]
-    fn update_replaces_only_the_supported_target() -> Result<()> {
+    fn destinations_are_independent_files() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        let target = install(repo.path())?;
+        let claude = install(repo.path(), Tier::Full, Destination::Claude)?;
+        let codex = install(repo.path(), Tier::Core, Destination::Codex)?;
+        assert!(claude.ends_with(".claude/skills/jscout/SKILL.md"));
+        assert!(codex.ends_with(".codex/skills/jscout/SKILL.md"));
+        assert_eq!(std::fs::read_to_string(&claude)?, FULL_GUIDE);
+        assert_eq!(std::fs::read_to_string(&codex)?, CORE_GUIDE);
+        assert!(!repo.path().join(".agents").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn update_replaces_only_the_selected_destination() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let target = install(repo.path(), Tier::Core, Destination::Agents)?;
         std::fs::write(&target, "locally stale guide\n")?;
         let unrelated = repo.path().join(".claude/skills/jscout/SKILL.md");
         std::fs::create_dir_all(unrelated.parent().unwrap())?;
         std::fs::write(&unrelated, "unrelated guide\n")?;
 
-        assert_eq!(update(repo.path())?, target);
-        assert_eq!(std::fs::read_to_string(&target)?, GUIDE);
+        assert_eq!(
+            update(repo.path(), Tier::Full, Destination::Agents)?,
+            target
+        );
+        assert_eq!(std::fs::read_to_string(&target)?, FULL_GUIDE);
         assert_eq!(std::fs::read_to_string(unrelated)?, "unrelated guide\n");
         assert!(target.parent().unwrap().read_dir()?.all(|entry| {
             !entry
@@ -194,14 +402,14 @@ mod tests {
     #[test]
     fn update_creates_a_missing_installation() -> Result<()> {
         let repo = tempfile::tempdir()?;
-        let target = update(repo.path())?;
+        let target = update(repo.path(), Tier::Core, Destination::Agents)?;
         assert_eq!(
             target,
             repo.path()
                 .canonicalize()?
                 .join(".agents/skills/jscout/SKILL.md")
         );
-        assert_eq!(std::fs::read_to_string(target)?, GUIDE);
+        assert_eq!(std::fs::read_to_string(target)?, CORE_GUIDE);
         Ok(())
     }
 
@@ -217,10 +425,10 @@ mod tests {
         std::fs::write(&linked, "do not overwrite\n")?;
         symlink(&linked, &target)?;
 
-        update(repo.path())?;
+        update(repo.path(), Tier::Core, Destination::Agents)?;
 
         assert!(!std::fs::symlink_metadata(&target)?.file_type().is_symlink());
-        assert_eq!(std::fs::read_to_string(target)?, GUIDE);
+        assert_eq!(std::fs::read_to_string(target)?, CORE_GUIDE);
         assert_eq!(std::fs::read_to_string(linked)?, "do not overwrite\n");
         Ok(())
     }

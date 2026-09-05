@@ -130,8 +130,10 @@ jscout entities <root> [query] # runtime, contract, route, config, data, flag, h
 jscout paths <root> A B        # bounded ranked paths between exact boundaries
 jscout overview <root>         # deterministic cold-start inventory
   --semantic                   #   optional current/fresh untrusted memory overlay
-jscout mcp <root>              # MCP stdio server: code, graph, entity, overview,
-                               #   semantic_memory, exact evidence, and annotate tools
+jscout mcp <root>              # MCP stdio server; the core profile (default) serves
+                               #   search, definition, who_uses, calls, file_outline, events,
+                               #   documentation_search; --profile full adds graph, entity,
+                               #   overview, semantic_memory, and annotate tools
                                #   --result-transport auto|text|structured overrides config
 jscout memory <root> [query]   # compact semantic handles and freshness
   --anchor EXACT_ANCHOR        #   hard direct-support join; also --file/--reconnaissance-subject
@@ -155,9 +157,11 @@ jscout scout refresh R         # replace stale/degraded workflows, cards, summar
   --max-calls N                #   reuses each artifact's recorded model/configuration
 jscout stats <root>            # parse stats
 jscout chunks <root>           # dump AST-aware chunks as JSONL
-jscout agent-guide             # print agent integration guidance
+jscout agent-guide             # print the core skill (--tier full for the full one)
 jscout agent-guide --install R # install a project-local jscout skill
-jscout agent-guide --update R  # replace it with the current shipped skill
+  --tier core|full             #   core teaches the default tool surface; full adds memory/graph
+  --dest agents|claude|codex   #   .agents/, .claude/, or .codex/skills/jscout/SKILL.md
+jscout agent-guide --update R --tier core --dest agents  # replace exactly that installed skill
 ```
 
 ### Markdown and MDX documentation retrieval
@@ -1451,29 +1455,52 @@ From the npm package, with no absolute path to maintain:
 
 Run `jscout index` (or `jscout watch`) beside it to keep the DB fresh.
 
-MCP metadata alone does not reliably cause every agent client to select a
-repository tool. Install the shipped project-local guide so supported agents
-receive an explicit integration contract:
+The skill is the teaching surface: server instructions carry only the
+server's identity, a pointer to the skill, and two mechanical contracts, and
+tool descriptions are one line each. Install the project-local skill so the
+agent learns the flows without reading the schema:
 
 ```bash
-jscout agent-guide --install /path/to/repo
+jscout agent-guide --install /path/to/repo                     # core tier, .agents/skills
+jscout agent-guide --install /path/to/repo --tier full --dest claude   # pair with mcp.profile = "full"
 ```
 
-The command creates `.agents/skills/jscout/SKILL.md` and refuses to overwrite
-an existing guide. Existing installations are deliberately not changed during
-an upgrade of the jscout binary; run `jscout agent-guide --update /path/to/repo`
-to stage a complete sibling file and replace that exact project-local file in
-one rename with the current shipped guide. `--update` also creates the fixed
-target when it is missing, but it does not discover or alter copies under
-other agent-specific directories. Use
-`jscout agent-guide` to print the same text for clients that consume `AGENTS.md`
-or another instruction format.
+`--tier core` (the default) teaches the production-selected surface —
+`semantic_search`, `definition`, `who_uses`, `calls`, `file_outline`,
+`events`, and `documentation_search` — with two flows and the recorded
+anti-patterns, in under 3 KB. `--tier full` adds `semantic_memory`,
+`repository_overview`, `neighborhood`, `entities`, `paths`, and `annotate`
+with the inquiry and write-back flows. `--dest` selects
+`.agents/skills/jscout/SKILL.md` (default), `.claude/skills/jscout/SKILL.md`,
+or `.codex/skills/jscout/SKILL.md`. The install refuses to overwrite an
+existing guide; `jscout agent-guide --update` replaces one exact destination
+in a single rename and creates it when missing, and requires explicit
+`--tier` and `--dest` so it can never silently target another destination or
+downgrade an installed tier. `jscout agent-guide` alone prints the text for
+clients that consume `AGENTS.md`.
 
-For controlled evaluation, `jscout mcp` accepts `--profile baseline` (no
-semantic memory, `annotate`, `neighborhood`, or search expansion) and
-`--profile structural` (the default). `--database PATH` separates the index
+The skill tier and the MCP profile are independent settings that should be
+paired: `jscout mcp` serves the `core` profile by default (alias `baseline`),
+the seven tools the core skill teaches; `--profile full` (alias `structural`,
+or `mcp.profile = "full"` in `.jscout.toml`) registers the six additional
+tools the full skill teaches. Installing the full skill without the full
+profile teaches tools the server does not expose. A `[mcp].tools` allowlist
+narrows either profile per project — it must name at least one tool, and an
+allowlist that leaves nothing registered under the effective profile
+(documentation included) is refused at server start; omit it to register
+everything the profile allows — and a call to a tool that is not registered
+is refused at the boundary before any connection or lock is taken. The
+server instructions name the repository, tell the agent to read the
+installed skill before its first repository search, and carry the two
+mechanical contracts; every routing rule, documentation included, lives in
+the skill. `--database PATH` separates the index
 and semantic-memory state from the source root for isolated warm/cold runs.
 See [eval/README.md](eval/README.md) for the paired-run protocol and grader.
+
+`repository_overview` returns corpus totals and a bounded area table by
+default; per-project reconnaissance prose appears only for an explicit
+`reconnaissance_subject` or a non-zero `reconnaissance_limit`, and budget
+eviction sheds that prose before structural counts.
 
 `definition` returns full source by default. `jscout mcp --source-view elided`
 enables the experimental deterministic renderer, and each call can override it
