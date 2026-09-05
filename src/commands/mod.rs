@@ -58,6 +58,7 @@ impl Command {
     pub(super) fn root(&self) -> Option<&Path> {
         match self {
             Self::Stats { root }
+            | Self::Setup { root, .. }
             | Self::Chunks { root, .. }
             | Self::Index { root, .. }
             | Self::Embed { root, .. }
@@ -188,6 +189,11 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
     let configured_database = runtime.effective.database.path.as_path();
     match command {
         Command::Config { .. } => unreachable!("configuration commands are dispatched first"),
+        Command::Setup {
+            root,
+            client,
+            print_config,
+        } => crate::setup::run(&root, client, print_config, runtime),
         Command::Docs { command } => docs::run(command, runtime),
         Command::Stats { root } => cmd_stats(&root),
         Command::Chunks { root, filter } => cmd_chunks(&root, filter.as_deref()),

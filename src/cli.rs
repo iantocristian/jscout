@@ -20,6 +20,18 @@ pub(super) struct Cli {
 
 #[derive(Subcommand)]
 pub(super) enum Command {
+    /// Index a repository, install its agent skill, and register project-local MCP
+    Setup {
+        /// Repository root (defaults to the current directory)
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        /// Agent client to configure; never changes global client settings
+        #[arg(long, value_enum)]
+        client: crate::setup::Client,
+        /// Print client configuration only; do not index, install, or write files
+        #[arg(long)]
+        print_config: bool,
+    },
     /// Inspect, validate, or initialize repository runtime configuration
     Config {
         #[command(subcommand)]

@@ -48,15 +48,23 @@ fi
 
 staging="$(mktemp -d "$output_dir/.jscout-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
-mkdir -p "$staging/$bundle/gateway" "$staging/$bundle/checker"
+mkdir -p "$staging/$bundle/gateway" "$staging/$bundle/checker" "$staging/$bundle/inference" "$staging/$bundle/docs"
 cp "$binary" "$staging/$bundle/$binary_name"
 cp README.md "$staging/$bundle/README.md"
 cp PLAN.md "$staging/$bundle/PLAN.md"
 cp .env.example "$staging/$bundle/.env.example"
+cp .jscout.toml.example "$staging/$bundle/.jscout.toml.example"
+cp LICENSE-MIT LICENSE-APACHE "$staging/$bundle/"
+for guide in installation mcp inference configuration commands documentation advanced; do
+  cp "docs/$guide.md" "$staging/$bundle/docs/"
+done
 cp gateway/package.json gateway/package-lock.json "$staging/$bundle/gateway/"
 cp -R gateway/src "$staging/$bundle/gateway/src"
 cp checker/package.json checker/package-lock.json "$staging/$bundle/checker/"
 cp -R checker/src "$staging/$bundle/checker/src"
+# Keep the optional Python service reproducible without a source checkout.
+# No Python environment or model downloads belong in the release archive.
+cp inference/service.py inference/pyproject.toml inference/uv.lock "$staging/$bundle/inference/"
 
 # Install the exact lockfile into the release tree. The installed binary then
 # discovers gateway/src/main.mjs beside itself without a source checkout.

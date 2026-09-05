@@ -1087,13 +1087,6 @@ pub(super) fn source_name(source: ValueSource) -> &'static str {
     }
 }
 
-pub(super) fn display_optional_path(path: Option<&Path>) -> String {
-    path.map_or_else(
-        || "<disabled>".to_string(),
-        |path| path.display().to_string(),
-    )
-}
-
 fn nonempty_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
