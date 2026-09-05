@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use super::load::{display_optional_path, source_name};
+use super::load::source_name;
 use super::{RuntimeConfig, ValueSource};
 
 impl RuntimeConfig {
@@ -28,108 +28,16 @@ impl RuntimeConfig {
                 }
             ),
             format!("fingerprint: {}", self.fingerprint),
-            format!("database: {}", self.effective.database.path.display()),
-            format!(
-                "docs: enabled={} include={:?} exclude={:?}",
-                self.effective.docs.enabled,
-                self.effective.docs.include,
-                self.effective.docs.exclude,
-            ),
-            format!(
-                "docs-search: vector={} rerank={} freshness={} max_rank_movement={} limit={} response_bytes={}",
-                self.effective.docs.search.vector,
-                self.effective.docs.search.rerank,
-                self.effective.docs.search.freshness,
-                self.effective.docs.search.max_rank_movement,
-                self.effective.docs.search.limit,
-                self.effective.docs.search.response_bytes,
-            ),
-            format!(
-                "search: vector={} rerank={} memory={} expand={} expansion_mode={} limit={} response_bytes={}",
-                self.effective.search.vector,
-                self.effective.search.rerank,
-                self.effective.search.attach_memory,
-                self.effective.search.expansion.enabled,
-                self.effective.search.expansion.mode,
-                self.effective.search.limit,
-                self.effective.search.response_bytes
-            ),
-            format!(
-                "embedding: provider={} model={} endpoint={}",
-                self.effective
-                    .embedding
-                    .provider
-                    .as_deref()
-                    .unwrap_or("none"),
-                self.effective
-                    .embedding
-                    .model
-                    .as_deref()
-                    .unwrap_or("<none>"),
-                self.effective.embedding.url.as_deref().unwrap_or(
-                    match self.effective.embedding.provider.as_deref() {
-                        Some("local") => self.effective.inference.url.as_str(),
-                        Some(_) => "<provider default>",
-                        None => "<none>",
-                    }
-                )
-            ),
-            format!(
-                "inference: client={} bind={}:{} allow_remote={}",
-                self.effective.inference.url,
-                self.effective.inference.host,
-                self.effective.inference.port,
-                self.effective.inference.allow_remote,
-            ),
-            format!(
-                "reranker: endpoint={} model={}",
-                self.effective.reranker.url.as_deref().unwrap_or_else(|| {
-                    if self.effective.embedding.provider.as_deref() == Some("local") {
-                        "<local inference default>"
-                    } else {
-                        "<none>"
-                    }
-                }),
-                self.effective.reranker.model
-            ),
-            format!(
-                "llm: model={} reasoning={} max_concurrency={} base_url={}",
-                self.effective.llm.model,
-                self.effective
-                    .llm
-                    .reasoning
-                    .as_deref()
-                    .unwrap_or("<provider default>"),
-                self.effective.llm.max_concurrency,
-                self.effective
-                    .llm
-                    .openai_base_url
-                    .as_deref()
-                    .unwrap_or("<provider default>")
-            ),
-            format!(
-                "mcp: profile={} tools={} source_view={} result_transport={} telemetry={} request_log={}",
-                self.effective.mcp.profile,
-                if self.effective.mcp.tools.is_empty() {
-                    "all".to_string()
-                } else {
-                    self.effective.mcp.tools.join(",")
-                },
-                self.effective.mcp.source_view,
-                self.effective.mcp.result_transport,
-                display_optional_path(self.effective.telemetry.file.as_deref()),
-                display_optional_path(self.effective.telemetry.request_log.as_deref())
-            ),
-            format!(
-                "sidecars: node={} gateway={} checker={}",
-                self.effective.sidecars.node,
-                display_optional_path(self.effective.sidecars.gateway.as_deref()),
-                display_optional_path(self.effective.sidecars.checker.as_deref()),
-            ),
-            "sources:".to_string(),
         ];
+        // Loading already serializes this non-secret value to fingerprint it.
+        // Reuse that representation instead of maintaining a partial second
+        // list of settings here. Collections remain one policy value, matching
+        // their source entry (including custom model-provider definitions).
+        let effective = serde_json::to_value(&self.effective)
+            .expect("loaded runtime configuration is serializable");
         for (key, source) in &self.sources {
-            lines.push(format!("  {key}: {}", source_name(*source)));
+            let value = key.split('.').fold(&effective, |value, part| &value[part]);
+            lines.push(format!("{key} = {value} [{}]", source_name(*source)));
         }
         lines.join("\n")
     }

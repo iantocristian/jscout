@@ -37,6 +37,7 @@ mod scouting;
 mod search;
 mod semantic;
 mod semantic_query;
+mod setup;
 mod stats;
 mod store;
 mod structural;

@@ -977,7 +977,7 @@ fn plan_tool_call(tools: &[String], profile: ToolProfile, name: &str) -> Result<
 
 /// An allowlist may only narrow the profile; one that leaves nothing
 /// registered is refused at server start rather than serving an empty surface.
-fn ensure_effective_surface(
+pub(crate) fn ensure_effective_surface(
     profile: ToolProfile,
     docs_enabled: bool,
     tools: &[String],
@@ -1003,7 +1003,11 @@ pub(crate) fn tool_registered(allowlist: &[String], name: &str) -> bool {
 
 /// `tool_defs` narrowed by the `[mcp].tools` allowlist; an empty allowlist
 /// registers everything the profile allows.
-fn allowed_tool_defs(profile: ToolProfile, docs_enabled: bool, allowlist: &[String]) -> Value {
+pub(crate) fn allowed_tool_defs(
+    profile: ToolProfile,
+    docs_enabled: bool,
+    allowlist: &[String],
+) -> Value {
     let mut tools = tool_defs(profile, docs_enabled);
     if !allowlist.is_empty()
         && let Some(definitions) = tools.as_array_mut()

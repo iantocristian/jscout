@@ -96,6 +96,13 @@ if (!fs.existsSync(binary)) {
 // Bundled sidecar discovery transport. Repository config and the documented
 // legacy override variables remain authoritative in the Rust process.
 const env = { ...process.env };
+// Setup uses this pair to register the installed wrapper, not the private
+// platform binary. Absolute Node and launcher paths also work with GUI PATHs.
+env.JSCOUT_BUNDLED_LAUNCHER = fileURLToPath(import.meta.url);
+env.JSCOUT_BUNDLED_NODE = process.execPath;
+// This is discovery, not a user override: --project and inference.project
+// still take precedence in Rust. Always identify this wrapper's own bundle.
+env.JSCOUT_BUNDLED_INFERENCE_PROJECT = path.join(packageRoot, "inference");
 const sidecars = [
   [
     "JSCOUT_PI_AI_GATEWAY",

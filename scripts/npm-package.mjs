@@ -183,6 +183,15 @@ function buildWrapperPackage(version, outputRoot) {
     );
   }
 
+  // Only service sources and the dependency lockfile. Python, dependencies,
+  // virtual environments, and models are installed only by inference serve.
+  for (const file of ["service.py", "pyproject.toml", "uv.lock"]) {
+    copyInto(
+      path.join(repoRoot, "inference", file),
+      path.join(stage, "inference", file),
+    );
+  }
+
   for (const [sidecar, expected] of [
     ["gateway", ["@earendil-works/pi-ai"]],
     ["checker", ["typescript", "@noble/hashes"]],

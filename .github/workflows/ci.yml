@@ -58,6 +58,8 @@ jobs:
           node-version: 22.19.0
       - name: Run performance harness tests
         run: node --test bench/perf/perf.test.mjs
+      - name: Check user documentation links and JSON examples
+        run: node --test scripts/docs.test.mjs
 
   release-package:
     runs-on: ubuntu-latest
@@ -75,10 +77,16 @@ jobs:
         run: scripts/package-release.sh
       - name: Validate npm launcher and package assembly
         run: |
-          node --test npm/cli/test/launcher.test.mjs
+          node --test npm/cli/test/*.test.mjs
           node scripts/npm-package.mjs
           npm pack --dry-run target/npm/cli
           npm pack --dry-run target/npm/linux-x64-gnu
+          # Exercise the assembled wrapper with the matching local platform
+          # package, without downloading dependencies or running install hooks.
+          mkdir -p target/npm/cli/node_modules/@jscout
+          ln -s "$PWD/target/npm/linux-x64-gnu" target/npm/cli/node_modules/@jscout/linux-x64-gnu
+          node scripts/test-inference-package.mjs target/npm/cli/bin/jscout.mjs
+          node scripts/test-setup-package.mjs target/npm/cli/bin/jscout.mjs
           # Only ever run during a release, so a syntax error in it would
           # otherwise surface at the worst possible moment.
           node --check scripts/npm-bootstrap-publish.mjs
@@ -93,3 +101,5 @@ jobs:
             "$binary" llm doctor --model local:smoke
           bundle_dir="$(dirname "$binary")"
           "$binary" checker doctor "$bundle_dir"
+          node scripts/test-inference-package.mjs "$binary"
+          node scripts/test-setup-package.mjs "$binary"
