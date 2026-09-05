@@ -59,7 +59,7 @@ pub struct WorkflowPlan {
 
 /// Build exact candidate/evidence inputs. Explicit seeds form one workflow
 /// boundary. With no explicit seeds, each deterministic repository surface is
-/// attempted independently and equal candidate fingerprints are collapsed.
+/// attempted independently and equal candidate boundaries are collapsed.
 pub fn workflows(
     root: &Path,
     conn: &Connection,
@@ -1389,12 +1389,18 @@ fn is_entry_file(path: &str) -> bool {
 /// should not spend separate calls merely because a different member was the
 /// seed. The execution fingerprint remains seed-aware for exact run reuse.
 fn candidate_boundary_fingerprint(set: &WorkflowCandidateSet) -> String {
+    let mut anchors = set
+        .candidates
+        .iter()
+        .map(|candidate| candidate.anchor.as_str())
+        .collect::<Vec<_>>();
+    anchors.sort_unstable();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"jscout-workflow-auto-boundary-v1\0");
     hasher.update(set.snapshot.as_bytes());
-    for candidate in &set.candidates {
+    for anchor in anchors {
         hasher.update(b"\0");
-        hasher.update(candidate.anchor.as_bytes());
+        hasher.update(anchor.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
