@@ -44,18 +44,45 @@ min_confidence = "likely"
 file_roles = ["production", "unknown"]
 
 # Provider selection is explicit. An API key alone never enables embeddings.
+# Uncomment exactly ONE recipe below. Each is a complete [embedding] section;
+# do not combine them or add a second [embedding] section elsewhere.
+# BEGIN embedding recipe: local
 # [embedding]
-# provider = "local" # local, voyage, openai, or none
+# provider = "local"
 # model = "BAAI/bge-m3"
 # revision = "5617a9f61b028005a4858fdac845db406aefb181"
 # batch = 64
 # origins = ["repository", "workspace"]
+# query_prefix = ""
+# END embedding recipe
+#
+# BEGIN embedding recipe: voyage
+# [embedding]
+# provider = "voyage"
+# model = "voyage-code-3"
+# api_key_env = "VOYAGE_API_KEY"
+# END embedding recipe
+#
+# BEGIN embedding recipe: openai
+# [embedding]
+# provider = "openai"
+# model = "text-embedding-3-small"
 # api_key_env = "OPENAI_API_KEY" # variable name only; never put the key here
+# END embedding recipe
+#
+# BEGIN embedding recipe: openai-compatible
+# [embedding]
+# provider = "openai"
+# model = "your-embedding-model"
+# api_key_env = "JSCOUT_EMBED_KEY"
 # url = "https://embedding-gateway.example.com/v1/embeddings"
 # query_prefix = ""
+# END embedding recipe
 
 [inference]
-url = "http://127.0.0.1:8792"
+# Client URL normally derives from host/port. Override only when connecting
+# to a separately managed service; an explicit URL does not follow port edits.
+# url = "http://127.0.0.1:8792"
 host = "127.0.0.1"
 port = 8792
 uv = "uv"

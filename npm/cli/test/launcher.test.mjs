@@ -98,6 +98,36 @@ process.stdout.write(JSON.stringify({
   assert.equal(overriddenEnvironment.bundledGateway, "");
 });
 
+test("identifies this installed launcher, Node, and inference bundle", (context) => {
+  const { root, launcher } = temporaryLauncher();
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  installFakePlatformBinary(
+    root,
+    `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  launcher: process.env.JSCOUT_BUNDLED_LAUNCHER,
+  node: process.env.JSCOUT_BUNDLED_NODE,
+  inference: process.env.JSCOUT_BUNDLED_INFERENCE_PROJECT,
+}));
+`,
+  );
+  const result = spawnSync(process.execPath, [launcher], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      JSCOUT_BUNDLED_LAUNCHER: "/stale/install/launcher.mjs",
+      JSCOUT_BUNDLED_NODE: "/stale/install/node",
+      JSCOUT_BUNDLED_INFERENCE_PROJECT: "/stale/install/inference",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    launcher: fs.realpathSync(launcher),
+    node: process.execPath,
+    inference: path.join(fs.realpathSync(root), "cli", "inference"),
+  });
+});
+
 test("forwards repeated SIGINT while the child is still running", async (context) => {
   const { root, launcher } = temporaryLauncher();
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));

@@ -2,6 +2,7 @@ use super::{
     FILE_NAME, RuntimeConfig, SCHEMA_VERSION, TEMPLATE, ValueSource, init,
     parse_legacy_compatible_providers,
 };
+use std::collections::BTreeSet;
 use std::path::Path;
 
 fn write_config(root: &Path, text: &str) -> anyhow::Result<()> {
@@ -92,10 +93,9 @@ file = "logs/mcp.jsonl"
     assert_eq!(config.sources["docs.include"], ValueSource::Config);
     assert_eq!(config.sources["docs.search.limit"], ValueSource::Config);
     let shown = config.show_text();
-    assert!(shown.contains("docs: enabled=true include="));
-    assert!(shown.contains(
-        "docs-search: vector=false rerank=false freshness=true max_rank_movement=3 limit=7 response_bytes=12000"
-    ));
+    assert!(shown.contains("docs.enabled = true [builtin]"));
+    assert!(shown.contains("docs.search.freshness = true [config]"));
+    assert!(shown.contains("docs.search.max_rank_movement = 3 [config]"));
     let json = config.show_json()?;
     assert!(json.contains("\"docs\""));
     Ok(())
@@ -131,7 +131,7 @@ freshness = true
     );
     assert_eq!(config.sources["docs.enabled"], ValueSource::Config);
     assert_eq!(config.sources["docs.search.vector"], ValueSource::Config);
-    assert!(config.show_text().contains("docs: enabled=false"));
+    assert!(config.show_text().contains("docs.enabled = false [config]"));
     Ok(())
 }
 
@@ -345,6 +345,221 @@ fn init_refuses_to_overwrite_and_emits_the_current_schema() -> anyhow::Result<()
     assert!(TEMPLATE.contains("enabled = true"));
     assert!(TEMPLATE.contains("\"**/*.mdx\""));
     assert!(!TEMPLATE.contains(".jscout-docs.db"));
+    Ok(())
+}
+
+#[test]
+fn template_active_settings_match_builtin_defaults() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let defaults = RuntimeConfig::load(Some(root.path()), None)?;
+    init(root.path(), None)?;
+    let initialized = RuntimeConfig::load(Some(root.path()), None)?;
+    assert_eq!(
+        serde_json::to_value(&initialized.effective)?,
+        serde_json::to_value(&defaults.effective)?,
+        "active template settings must not silently select a different policy"
+    );
+    assert_eq!(initialized.fingerprint, defaults.fingerprint);
+    assert_eq!(
+        serde_json::to_value(super::SearchSettings::default())?,
+        serde_json::to_value(defaults.effective.search)?
+    );
+    Ok(())
+}
+
+#[test]
+fn template_inference_client_follows_port_without_an_override() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    write_config(root.path(), &TEMPLATE.replace("port = 8792", "port = 8793"))?;
+    let config = RuntimeConfig::load(Some(root.path()), None)?;
+    assert_eq!(config.effective.inference.url, "http://127.0.0.1:8793");
+    assert_eq!(config.sources["inference.url"], ValueSource::Builtin);
+    Ok(())
+}
+
+#[test]
+fn each_commented_embedding_recipe_is_independently_valid() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut recipes = Vec::new();
+    let mut current = None;
+    for line in TEMPLATE.lines() {
+        if let Some(name) = line.strip_prefix("# BEGIN embedding recipe: ") {
+            assert!(current.is_none(), "nested recipe {name}");
+            current = Some((name, "version = 1\n".to_string()));
+        } else if line == "# END embedding recipe" {
+            recipes.push(current.take().expect("recipe end must have a beginning"));
+        } else if let Some((_, text)) = current.as_mut() {
+            text.push_str(line.strip_prefix("# ").expect("recipe must be commented"));
+            text.push('\n');
+        }
+    }
+    assert!(current.is_none(), "unterminated embedding recipe");
+    assert_eq!(recipes.len(), 4);
+    for (name, text) in recipes {
+        write_config(root.path(), &text)?;
+        let config = RuntimeConfig::load(Some(root.path()), None)
+            .unwrap_or_else(|error| panic!("embedding recipe {name}: {error:#}"));
+        assert!(config.effective.embedding.provider.is_some(), "{name}");
+        assert!(config.effective.embedding.model.is_some(), "{name}");
+        assert_eq!(
+            config.effective.embedding.url.is_some(),
+            name == "openai-compatible",
+            "only the custom OpenAI recipe should override its endpoint"
+        );
+    }
+    Ok(())
+}
+
+// Runtime serialization is the shared source of truth for display and coverage.
+// Array-table members use their TOML spelling, while lists of scalar values
+// remain a single key. A provider fixture expands the otherwise-empty array.
+fn configuration_keys(value: &serde_json::Value, prefix: &str, keys: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (field, value) in fields {
+                let field = match field.as_str() {
+                    "baseUrl" => "base_url",
+                    "apiKeyEnv" => "api_key_env",
+                    "contextWindow" => "context_window",
+                    "maxTokens" => "max_tokens",
+                    field => field,
+                };
+                let key = if prefix.is_empty() {
+                    field.to_string()
+                } else {
+                    format!("{prefix}.{field}")
+                };
+                configuration_keys(value, &key, keys);
+            }
+        }
+        serde_json::Value::Array(values) if values.first().is_some_and(|v| v.is_object()) => {
+            configuration_keys(&values[0], prefix, keys);
+        }
+        _ => {
+            keys.insert(prefix.to_string());
+        }
+    }
+}
+
+#[test]
+fn text_display_and_configuration_docs_cover_every_setting() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let config = RuntimeConfig::load(Some(root.path()), None)?;
+    let value = serde_json::to_value(&config.effective)?;
+    let mut keys = BTreeSet::new();
+    configuration_keys(&value, "", &mut keys);
+    assert_eq!(keys, config.sources.keys().cloned().collect());
+    let shown = config.show_text();
+    let reference = include_str!("../../docs/configuration.md");
+    let analysis = include_str!("../../docs/codebase-analysis/15-configuration.md");
+    for key in &keys {
+        let value = key.split('.').fold(&value, |value, part| &value[part]);
+        assert!(
+            shown.contains(&format!("{key} = {value} [")),
+            "missing value: {key}"
+        );
+        assert!(
+            reference.contains(&format!("| `{key}` |")),
+            "undocumented key: {key}"
+        );
+        assert!(
+            analysis.contains(&format!("| `{key}` |")),
+            "stale analysis table: {key}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn template_and_reference_cover_nested_provider_fields_too() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    write_config(
+        root.path(),
+        r#"version = 1
+[[llm.openai_compatible_providers]]
+id = "local"
+base_url = "http://127.0.0.1:1234/v1"
+api_key_env = "LOCAL_LLM_API_KEY"
+[[llm.openai_compatible_providers.models]]
+id = "example"
+"#,
+    )?;
+    let config = RuntimeConfig::load(Some(root.path()), None)?;
+    let mut expected = BTreeSet::from(["version".to_string()]);
+    configuration_keys(&serde_json::to_value(config.effective)?, "", &mut expected);
+
+    let mut template_keys = BTreeSet::new();
+    let mut section = "";
+    for line in TEMPLATE.lines() {
+        let line = line.strip_prefix("# ").unwrap_or(line).trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.trim_matches(['[', ']']);
+        } else if let Some((key, _)) = line.split_once('=') {
+            let key = key.trim();
+            if !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                template_keys.insert(if section.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{section}.{key}")
+                });
+            }
+        }
+    }
+    assert_eq!(
+        template_keys, expected,
+        "template must cover every TOML field"
+    );
+    let reference = include_str!("../../docs/configuration.md");
+    for key in expected {
+        assert!(
+            reference.contains(&format!("| `{key}` |")),
+            "undocumented field: {key}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn documented_toml_recipes_load_without_providers_or_credentials() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    for (name, document) in [
+        ("README.md", include_str!("../../README.md")),
+        (
+            "installation.md",
+            include_str!("../../docs/installation.md"),
+        ),
+        ("inference.md", include_str!("../../docs/inference.md")),
+        (
+            "configuration.md",
+            include_str!("../../docs/configuration.md"),
+        ),
+        (
+            "documentation.md",
+            include_str!("../../docs/documentation.md"),
+        ),
+        ("mcp.md", include_str!("../../docs/mcp.md")),
+    ] {
+        for (index, block) in document.split("```toml\n").skip(1).enumerate() {
+            let recipe = block.split_once("```").expect("closed TOML fence").0;
+            let parsed: toml::Value = toml::from_str(recipe)
+                .unwrap_or_else(|error| panic!("{name} TOML recipe {index}: {error:#}"));
+            if name == "mcp.md" {
+                continue; // Client TOML has a different schema from repository policy.
+            }
+            let text = if parsed.get("version").is_some() {
+                recipe.to_string()
+            } else {
+                format!("version = {SCHEMA_VERSION}\n{recipe}")
+            };
+            write_config(root.path(), &text)?;
+            RuntimeConfig::load(Some(root.path()), None)
+                .unwrap_or_else(|error| panic!("{name} config recipe {index}: {error:#}"));
+        }
+    }
     Ok(())
 }
 
