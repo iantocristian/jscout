@@ -2249,6 +2249,233 @@ fn annotate_writes_fresh_workflow_memory_retrieved_only_by_structural_profile() 
 }
 
 #[test]
+fn definition_returns_the_entire_split_declaration() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let source = format!(
+        "export function large(value: number) {{\n{}  return 'LATE_BODY_MARKER';\n}}\n",
+        "  value += 1;\n".repeat(900),
+    );
+    fs::write(repo.path().join("large.ts"), &source)?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let (anchor, start, end): (String, u32, u32) = conn.query_row(
+        "SELECT node.node_key, s.decl_start, s.decl_end
+         FROM symbols s JOIN graph_nodes node ON node.native_table='symbols' AND node.native_id=s.id
+         WHERE s.name='large'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let count: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
+    assert!(count > 1, "fixture must actually split");
+    for arguments in [json!({"symbol":"large"}), json!({"anchor":anchor})] {
+        let mut args = arguments;
+        args["source_bytes"] = json!(30_000);
+        args["response_bytes"] = json!(40_000);
+        let rendered = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            "definition",
+            &args,
+        )?;
+        let result: serde_json::Value = serde_json::from_str(&rendered)?;
+        let definition = &result["definitions"][0];
+        assert_eq!(definition["source"], &source[start as usize..end as usize]);
+        assert!(definition["source_meta"].get("partial").is_none());
+        assert!(definition["source_meta"].get("budget_truncated").is_none());
+    }
+    for (source_bytes, response_bytes) in [(128, 40_000), (30_000, 1_000)] {
+        let rendered = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            "definition",
+            &json!({"anchor":anchor, "source_bytes":source_bytes, "response_bytes":response_bytes}),
+        )?;
+        assert!(rendered.len() <= response_bytes);
+        let result: serde_json::Value = serde_json::from_str(&rendered)?;
+        let meta = &result["definitions"][0]["source_meta"];
+        assert_eq!(meta["budget_truncated"], true);
+        assert_eq!(meta["original_bytes"], end - start);
+        assert!(
+            meta.get("partial").is_none(),
+            "budget shedding is not partial input coverage"
+        );
+    }
+
+    // Preserve the indexed snapshot; changed disk text must never be rendered.
+    fs::write(
+        repo.path().join("large.ts"),
+        "export const UNINDEXED = true;",
+    )?;
+    for missing in [false, true] {
+        if missing {
+            fs::remove_file(repo.path().join("large.ts"))?;
+        }
+        for debug in [false, true] {
+            let rendered = call_tool(
+                repo.path(),
+                &conn,
+                None,
+                ToolProfile::Structural,
+                SourceView::Full,
+                "definition",
+                &json!({"anchor":anchor, "source_bytes":30_000, "debug":debug}),
+            )?;
+            let result: serde_json::Value = serde_json::from_str(&rendered)?;
+            let definition = &result["definitions"][0];
+            assert_eq!(definition["source_meta"]["partial"], true);
+            assert!(definition["source_meta"].get("budget_truncated").is_none());
+            let available = definition["source"].as_str().unwrap();
+            assert!(available.starts_with("function large"));
+            assert!(!available.contains("UNINDEXED") && !available.contains("LATE_BODY_MARKER"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn definition_uses_exact_spans_for_same_line_symbols_and_cached_source() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("same.ts"),
+        "class First { run() { return 'FIRST_MARKER'; } } class Second { run() { return 'SECOND_MARKER'; } }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let anchor: String = conn.query_row(
+        "SELECT node_key FROM graph_nodes WHERE node_kind='symbol' AND node_key LIKE '%#Second::run@%'",
+        [], |r| r.get(0),
+    )?;
+    for missing in [false, true] {
+        if missing {
+            fs::remove_file(repo.path().join("same.ts"))?;
+        }
+        for args in [json!({"anchor":anchor}), json!({"symbol":"run"})] {
+            let exact = args.get("anchor").is_some();
+            let rendered = call_tool(
+                repo.path(),
+                &conn,
+                None,
+                ToolProfile::Structural,
+                SourceView::Full,
+                "definition",
+                &args,
+            )?;
+            let result: serde_json::Value = serde_json::from_str(&rendered)?;
+            let definitions = result["definitions"].as_array().unwrap();
+            assert_eq!(definitions.len(), if exact { 1 } else { 2 });
+            for definition in definitions {
+                let source = definition["source"].as_str().unwrap();
+                assert!(source.starts_with("run()") && source.ends_with('}'));
+                assert_ne!(
+                    source.contains("FIRST_MARKER"),
+                    source.contains("SECOND_MARKER")
+                );
+                if exact {
+                    assert!(source.contains("SECOND_MARKER"));
+                }
+                assert!(definition["source_meta"].get("partial").is_none());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn definition_fallback_distinguishes_whole_methods_from_split_fragments() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let method = "run() { return 'WHOLE_METHOD'; }";
+    // Anonymous classes have method chunks but no method symbol rows. Make the
+    // class large enough to emit member chunks, including an oversized member.
+    let source = format!(
+        "export default class {{\n  {method}\n  huge(value: number) {{\n{}  }}\n}}\n",
+        "    value += 1;\n".repeat(900),
+    );
+    fs::write(repo.path().join("fallback.ts"), &source)?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let symbols: i64 = conn.query_row(
+        "SELECT count(*) FROM symbols WHERE name IN ('run', 'huge')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(symbols, 0, "exercise the actual method-chunk fallback");
+    for disk_state in ["current", "stale", "missing"] {
+        match disk_state {
+            "stale" => fs::write(repo.path().join("fallback.ts"), "UNINDEXED")?,
+            "missing" => fs::remove_file(repo.path().join("fallback.ts"))?,
+            _ => {}
+        }
+        for (symbol, partial) in [("run", false), ("huge#part1", true)] {
+            let rendered = call_tool(
+                repo.path(),
+                &conn,
+                None,
+                ToolProfile::Structural,
+                SourceView::Full,
+                "definition",
+                &json!({"symbol": symbol}),
+            )?;
+            let result: serde_json::Value = serde_json::from_str(&rendered)?;
+            let definitions = result["definitions"].as_array().unwrap();
+            assert_eq!(definitions.len(), 1);
+            let definition = &definitions[0];
+            assert_eq!(
+                definition["source_meta"]["partial"]
+                    .as_bool()
+                    .unwrap_or(false),
+                partial,
+                "{symbol}: {disk_state}"
+            );
+            let available = definition["source"].as_str().unwrap();
+            assert!(!available.contains("UNINDEXED"));
+            if !partial {
+                assert_eq!(available, method);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn definition_declarator_boundary_excludes_statement_keywords_and_siblings() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("exports.ts"),
+        "export const cache = { value: 1 }, sibling = 'UNRELATED';\nexport class Worker {}\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    for (symbol, expected) in [
+        ("cache", "cache = { value: 1 }"),
+        ("Worker", "class Worker {}"),
+    ] {
+        let rendered = call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            "definition",
+            &json!({"symbol": symbol}),
+        )?;
+        let result: serde_json::Value = serde_json::from_str(&rendered)?;
+        assert_eq!(result["definitions"][0]["source"], expected);
+        assert!(
+            result["definitions"][0]["source_meta"]
+                .get("partial")
+                .is_none()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn definition_renders_configured_source_view_with_a_shared_byte_ceiling() -> Result<()> {
     let repo = tempfile::tempdir()?;
     fs::write(

@@ -1785,13 +1785,19 @@ impl Reranker {
 
 /// Reciprocal Rank Fusion over the available rankings.
 fn rrf(rankings: &[Vec<(i64, f64)>], k: f64) -> Vec<(i64, f64)> {
-    let mut scores: HashMap<i64, f64> = HashMap::new();
+    let mut positions = HashMap::new();
+    let mut out = Vec::<(i64, f64)>::new();
     for ranking in rankings {
         for (rank, (id, _)) in ranking.iter().enumerate() {
-            *scores.entry(*id).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
+            let position = *positions.entry(*id).or_insert_with(|| {
+                out.push((*id, 0.0));
+                out.len() - 1
+            });
+            out[position].1 += 1.0 / (k + rank as f64 + 1.0);
         }
     }
-    let mut out: Vec<(i64, f64)> = scores.into_iter().collect();
+    // Stable sorting breaks equal scores by first appearance in the supplied
+    // rankings, independent of HashMap iteration and database row IDs.
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
     out
 }

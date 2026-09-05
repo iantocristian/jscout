@@ -368,6 +368,9 @@ pub struct SymbolTarget {
     pub kind: String,
     pub line: i64,
     pub exported: bool,
+    /// Exact declaration extent, not a retrieval chunk or a name/line guess.
+    #[serde(skip)]
+    pub(crate) declaration: Option<std::ops::Range<u32>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -441,7 +444,7 @@ pub fn find_symbol_by_anchor_in_scope(
     let target = conn
         .query_row(
             "SELECT file.path, file.origin, file.id, symbol.name, symbol.kind,
-                    symbol.line, symbol.exported
+                    symbol.line, symbol.exported, symbol.decl_start, symbol.decl_end
              FROM graph_nodes node
              JOIN symbols symbol
                ON node.native_table='symbols' AND node.native_id=symbol.id
@@ -458,6 +461,7 @@ pub fn find_symbol_by_anchor_in_scope(
                     kind: row.get(4)?,
                     line: row.get(5)?,
                     exported: row.get::<_, i64>(6)? != 0,
+                    declaration: Some(row.get(7)?..row.get(8)?),
                 })
             },
         )
@@ -623,7 +627,7 @@ pub fn find_symbols_in_scope(
     };
     let mut out = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT f.path, f.origin, f.id, s.name, s.kind, s.line, s.exported
+        "SELECT f.path, f.origin, f.id, s.name, s.kind, s.line, s.exported, s.decl_start, s.decl_end
          FROM symbols s JOIN code_files f ON s.file_id = f.id
          WHERE s.name = ?1
            AND ((?2 AND f.origin='repository')
@@ -643,6 +647,7 @@ pub fn find_symbols_in_scope(
                 kind: r.get(4)?,
                 line: r.get(5)?,
                 exported: r.get::<_, i64>(6)? != 0,
+                declaration: Some(r.get(7)?..r.get(8)?),
             })
         },
     )?;
@@ -652,10 +657,11 @@ pub fn find_symbols_in_scope(
             out.push(t);
         }
     }
-    // Class methods aren't root symbols; they exist as method chunks.
+    // Members without symbol rows (e.g. anonymous classes) still have chunks.
     if out.is_empty() {
         let mut stmt = conn.prepare(
-            "SELECT f.path, f.origin, f.id, c.name, c.start_line, c.scope_chain
+            "SELECT f.path, f.origin, f.id, c.name, c.start_line, c.scope_chain,
+                    c.start, c.end, c.name = c.symbols
              FROM code_chunks c JOIN code_files f ON c.file_id = f.id
              WHERE c.name = ?1 AND c.kind = 'method'
                AND ((?2 AND f.origin='repository')
@@ -676,6 +682,10 @@ pub fn find_symbols_in_scope(
                         kind: "method".into(),
                         line: r.get(4)?,
                         exported: false,
+                        // A whole member retains its sole symbol as its name.
+                        // Line-split fragments are named `name#partN` instead;
+                        // their byte span cannot establish declaration coverage.
+                        declaration: r.get::<_, bool>(8)?.then_some(r.get(6)?..r.get(7)?),
                     },
                     r.get::<_, String>(5)?,
                 ))

@@ -98,6 +98,7 @@ fn symbol_target() -> SymbolTarget {
         kind: "class".into(),
         line: 8,
         exported: true,
+        declaration: None,
     }
 }
 
@@ -818,6 +819,7 @@ fn compact_definition_serializes_source_once_and_obeys_the_whole_budget() -> any
         rendered_bytes: 3_500,
         elisions: Vec::new(),
         budget_truncated: false,
+        partial: false,
     };
 
     let identity = response_identity();

@@ -86,6 +86,153 @@ fn profile_fingerprint_changes_with_configuration() {
     assert_ne!(first, second);
 }
 
+// Exercise discovery and embedding over HTTP, including their different wire
+// shapes, rather than comparing two copies of the fingerprint helper.
+fn local_handshake(
+    discovery_revision: Option<&str>,
+    response_revision: Option<&str>,
+    requested_revision: Option<&str>,
+    change_configuration: bool,
+) -> anyhow::Result<(anyhow::Result<ProfileSpec>, super::EmbeddingResponse)> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+    let metadata = |revision: Option<&str>| {
+        let mut value = serde_json::json!({
+            "model": "test-local", "dimensions": 2,
+            "configuration": {"dtype": "float16", "normalized": true}
+        });
+        if let Some(revision) = revision {
+            value["revision"] = serde_json::from_str(revision).unwrap();
+        }
+        value
+    };
+    let discovery =
+        serde_json::json!({"provider": "local", "embedding": metadata(discovery_revision)});
+    let mut response = metadata(response_revision);
+    response["provider"] = serde_json::json!("local");
+    response["vectors"] = serde_json::json!([[1.0, 0.0]]);
+    if change_configuration {
+        response["configuration"]["dtype"] = serde_json::json!("float32");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    listener.set_nonblocking(true)?;
+    let server = std::thread::spawn(move || -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for (expected, body) in [
+            ("GET /configuration ", discovery),
+            ("POST /embed ", response),
+        ] {
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            anyhow::ensure!(line.starts_with(expected), "unexpected request: {line}");
+            let mut length = 0usize;
+            loop {
+                line.clear();
+                anyhow::ensure!(
+                    reader.read_line(&mut line)? > 0,
+                    "incomplete request headers"
+                );
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse()?;
+                }
+            }
+            reader.read_exact(&mut vec![0; length])?;
+            let body = body.to_string();
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            reader.get_mut().flush()?;
+        }
+        Ok(())
+    });
+    let provider = Provider {
+        name: "local".into(),
+        model: "test-local".into(),
+        url: format!("http://{address}/embed"),
+        key: None,
+        protocol: Protocol::Local,
+        query_prefix: String::new(),
+        revision: requested_revision.map(str::to_string),
+    };
+    let profile = provider.profile();
+    let response = provider.embed_documents(&["source".into()]);
+    server
+        .join()
+        .expect("local protocol test server panicked")?;
+    Ok((profile, response?))
+}
+
+#[test]
+fn local_inference_normalizes_absent_and_null_revisions() -> anyhow::Result<()> {
+    let mut fingerprints = std::collections::HashSet::new();
+    for discovery in [None, Some("null")] {
+        for response in [None, Some("null")] {
+            let (profile, embedded) = local_handshake(discovery, response, None, false)?;
+            let profile = profile?;
+            super::validate_response_profile(&profile, &embedded)?;
+            fingerprints.insert(profile.fingerprint);
+        }
+    }
+    assert_eq!(fingerprints.len(), 1);
+    let (pinned, embedded) = local_handshake(
+        Some("\"pinned\""),
+        Some("\"pinned\""),
+        Some("pinned"),
+        false,
+    )?;
+    let pinned = pinned?;
+    super::validate_response_profile(&pinned, &embedded)?;
+    assert!(!fingerprints.contains(&pinned.fingerprint));
+    Ok(())
+}
+
+#[test]
+fn local_inference_still_rejects_revision_and_configuration_changes() -> anyhow::Result<()> {
+    for (response, change_configuration) in [
+        (Some("\"other\""), false),
+        (None, false),
+        (Some("\"pinned\""), true),
+    ] {
+        let (profile, embedded) =
+            local_handshake(Some("\"pinned\""), response, None, change_configuration)?;
+        assert!(super::validate_response_profile(&profile?, &embedded).is_err());
+    }
+    for unknown in [None, Some("null"), Some("\"other\"")] {
+        let (profile, _) = local_handshake(unknown, unknown, Some("pinned"), false)?;
+        assert!(
+            profile
+                .unwrap_err()
+                .to_string()
+                .contains("revision mismatch")
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn semantic_vector_failure_actions_distinguish_service_from_index() {
     let inference = semantic_vector_failure(

@@ -5,7 +5,7 @@ description: "Use the jscout repository index to search code before grep or rg w
 
 # jscout core
 
-Tools here are MCP tools on the jscout server, not shell commands.
+These are jscout MCP tools, not shell commands.
 Localize first, then verify in source. Responses carry `snapshot` (this
 surface's key) and `publication_snapshot`.
 
@@ -31,9 +31,10 @@ surface's key) and `publication_snapshot`.
    `truncated: false`; page-local `returned` must sum to
    `total_chunks`. On `response_budget_too_small ... minimum_bytes=N`, retry
    the same page with `response_bytes: N`.
-3. Drill down with `definition`: one returned `sym:` anchor plus the response
-   `snapshot`, both copied verbatim. Then `who_uses` for callers, `calls`
-   for members, `file_outline` for a file.
+3. `definition`: one returned `sym:` anchor and its `snapshot`, copied verbatim.
+   Then `who_uses` for callers, `calls` for members, `file_outline` for files.
+
+`source_meta.partial` flags incomplete cached source.
 
 Scope transfer: while paging, keep the original `query` and any explicit
 `origins`, `formats`, and `file_roles` unchanged, or the cursor is rejected.

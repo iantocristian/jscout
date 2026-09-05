@@ -284,11 +284,7 @@ impl Provider {
                     .context("local inference configuration has no embedding dimensions")?
                     as usize;
                 (
-                    json!({
-                        "protocol": "jscout-local-v1",
-                        "document_text": document_text_format,
-                        "embedding": embedding,
-                    }),
+                    local_profile_configuration(embedding, document_text_format),
                     Some(dimensions),
                 )
             }
@@ -432,16 +428,7 @@ impl Provider {
             {
                 bail!("local embedding response dimension metadata does not match vectors");
             }
-            let configuration = json!({
-                "protocol": "jscout-local-v1",
-                "document_text": document_text_format,
-                "embedding": {
-                    "model": response["model"],
-                    "dimensions": response["dimensions"],
-                    "revision": response["revision"],
-                    "configuration": response["configuration"],
-                },
-            });
+            let configuration = local_profile_configuration(&response, document_text_format);
             let config_json = serde_json::to_string(&configuration)?;
             (
                 vectors,
@@ -464,6 +451,22 @@ impl Provider {
             profile_fingerprint: response_fingerprint,
         })
     }
+}
+
+// Discovery nests these fields; embedding responses put them at the root.
+// Project both into the same ordered identity, including null for an unknown
+// optional revision. A real revision remains part of the fingerprint.
+fn local_profile_configuration(embedding: &Value, document_text_format: &str) -> Value {
+    json!({
+        "protocol": "jscout-local-v1",
+        "document_text": document_text_format,
+        "embedding": {
+            "model": embedding["model"],
+            "dimensions": embedding["dimensions"],
+            "revision": embedding["revision"],
+            "configuration": embedding["configuration"],
+        },
+    })
 }
 
 fn parse_vectors(value: &Value) -> Result<Vec<Vec<f32>>> {
