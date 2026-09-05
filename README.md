@@ -1527,7 +1527,11 @@ enables the experimental deterministic renderer, and each call can override it
 with `view: "full"` or `view: "elided"`. Both representations obey the same
 per-definition `source_bytes` ceiling and report original/rendered byte counts.
 Definition coverage follows the exact indexed declaration, including bodies split
-across retrieval chunks. Current disk source is used only when its hash matches
+across retrieval chunks. The span starts at the declaration/declarator AST node,
+not necessarily its enclosing statement: `export const cache = {}` renders as
+`cache = {}`, and `export class Worker {}` as `class Worker {}`. Statement-level
+keywords and sibling declarators are not included.
+Current disk source is used only when its hash matches
 the index. Otherwise, a cached fragment may be returned with
 `source_meta.partial: true` if it cannot cover the declaration. This is distinct
 from `budget_truncated`; increasing a byte budget cannot restore missing source.

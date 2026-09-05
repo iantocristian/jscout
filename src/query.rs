@@ -657,10 +657,11 @@ pub fn find_symbols_in_scope(
             out.push(t);
         }
     }
-    // Class methods aren't root symbols; they exist as method chunks.
+    // Members without symbol rows (e.g. anonymous classes) still have chunks.
     if out.is_empty() {
         let mut stmt = conn.prepare(
-            "SELECT f.path, f.origin, f.id, c.name, c.start_line, c.scope_chain
+            "SELECT f.path, f.origin, f.id, c.name, c.start_line, c.scope_chain,
+                    c.start, c.end, c.name = c.symbols
              FROM code_chunks c JOIN code_files f ON c.file_id = f.id
              WHERE c.name = ?1 AND c.kind = 'method'
                AND ((?2 AND f.origin='repository')
@@ -681,7 +682,10 @@ pub fn find_symbols_in_scope(
                         kind: "method".into(),
                         line: r.get(4)?,
                         exported: false,
-                        declaration: None,
+                        // A whole member retains its sole symbol as its name.
+                        // Line-split fragments are named `name#partN` instead;
+                        // their byte span cannot establish declaration coverage.
+                        declaration: r.get::<_, bool>(8)?.then_some(r.get(6)?..r.get(7)?),
                     },
                     r.get::<_, String>(5)?,
                 ))
