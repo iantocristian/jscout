@@ -568,6 +568,30 @@ fn compact_and_debug_json_modes_parse_without_ambiguity() {
 }
 
 #[test]
+fn non_search_cli_and_module_response_defaults_remain_24000_bytes() {
+    for arguments in [
+        ["jscout", "memory", ".", "needle"].as_slice(),
+        ["jscout", "overview", "."].as_slice(),
+    ] {
+        let cli = Cli::try_parse_from(arguments).expect("non-search command parses");
+        let (Command::Memory { response_bytes, .. } | Command::Overview { response_bytes, .. }) =
+            cli.command
+        else {
+            panic!("expected memory or overview");
+        };
+        assert_eq!(response_bytes, 24_000);
+    }
+    assert_eq!(
+        crate::semantic_query::QueryOptions::default().response_byte_limit,
+        24_000
+    );
+    assert_eq!(
+        crate::surface::OverviewOptions::default().response_byte_limit,
+        24_000
+    );
+}
+
+#[test]
 fn debug_json_is_unbounded_unless_the_caller_sets_a_budget() {
     let configured = crate::config::SearchSettings::default().response_bytes;
     assert_eq!(

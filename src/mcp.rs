@@ -14,8 +14,8 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use crate::{
-    config, docs::retrieval as docs_retrieval, embed, query, scout, search, semantic,
-    semantic_query, store, structural, surface,
+    compact::DEFAULT_TOOL_RESPONSE_BYTES, config, docs::retrieval as docs_retrieval, embed, query,
+    scout, search, semantic, semantic_query, store, structural, surface,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,7 +656,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "snapshot": { "type": "string", "description": "Optional code snapshot returned with the exact anchor" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
                     "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist" },
-                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum response bytes" },
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES, "minimum": 256, "description": "Maximum response bytes" },
                     "debug": { "type": "boolean", "default": false, "description": "Full diagnostic JSON" }
                 },
                 "oneOf": [
@@ -678,7 +678,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist" },
                     "view": { "type": "string", "enum": ["full", "elided"], "description": "Optional override for the server's source representation" },
                     "source_bytes": { "type": "integer", "default": 12000, "description": "Maximum rendered source bytes per definition; identical ceiling for full and elided views" },
-                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 256, "description": "Maximum response bytes" },
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES, "minimum": 256, "description": "Maximum response bytes" },
                     "debug": { "type": "boolean", "default": false, "description": "Full diagnostic JSON" }
                 },
                 "oneOf": [
@@ -695,7 +695,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                 "properties": {
                     "path": { "type": "string", "description": "Repo-relative path (or unique suffix)" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
-                    "response_bytes": { "type": "integer", "default": 24000, "description": "Maximum response bytes" }
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES, "description": "Maximum response bytes" }
                 },
                 "required": ["path"]
             }
@@ -708,7 +708,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                 "properties": {
                     "name": { "type": "string", "description": "Optional event name filter" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
-                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 1, "description": "Maximum response bytes" }
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES, "minimum": 1, "description": "Maximum response bytes" }
                 }
             }
         },
@@ -724,7 +724,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "receiver": { "type": "string", "description": "Dotted suffix the static receiver chain must end with, e.g. wave.card" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
                     "limit": { "type": "integer", "default": 200, "minimum": 1, "maximum": 1000 },
-                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 1, "description": "Maximum response bytes" }
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES, "minimum": 1, "description": "Maximum response bytes" }
                 },
                 "required": ["method"]
             }
@@ -743,7 +743,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
                     "limit": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 },
                     "occurrences_per_entity": { "type": "integer", "default": 8, "minimum": 1, "maximum": 50 },
-                    "response_bytes": { "type": "integer", "default": 24000 }
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES }
                 }
             }
         },
@@ -765,7 +765,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "kinds": { "type": "array", "items": { "type": "string" } },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "default": ["production", "unknown"] },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
-                    "response_bytes": { "type": "integer", "default": 24000 }
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES }
                 },
                 "required": ["from", "to"]
             }
@@ -785,7 +785,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "reconnaissance_limit": { "type": "integer", "default": 0, "minimum": 0, "maximum": 100, "description": "0 omits reconnaissance prose; a subject implies at least 1" },
                     "reconnaissance_subject": { "type": "string", "description": "Exact subject key returned by a prior overview, e.g. area:repository:packages/app" },
                     "reconnaissance_detail": { "type": "boolean", "default": false, "description": "Return the exact subject's full explanation and cited evidence; requires reconnaissance_subject" },
-                    "response_bytes": { "type": "integer", "default": 24000 }
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES }
                 }
             }
         },
@@ -816,7 +816,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "source_depth": { "type": "integer", "minimum": 1, "maximum": 32, "default": 8 },
                     "source_bytes": { "type": "integer", "minimum": 1, "maximum": 16000, "default": 2000 },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
-                    "response_bytes": { "type": "integer", "minimum": 1, "default": 24000 }
+                    "response_bytes": { "type": "integer", "minimum": 1, "default": DEFAULT_TOOL_RESPONSE_BYTES }
                 }
             }
         },
@@ -905,7 +905,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "kinds": { "type": "array", "items": { "type": "string" }, "description": "Optional edge-kind allowlist" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Optional file-role allowlist; [] includes all roles" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
-                    "response_bytes": { "type": "integer", "default": 24000, "minimum": 1 },
+                    "response_bytes": { "type": "integer", "default": DEFAULT_TOOL_RESPONSE_BYTES, "minimum": 1 },
                     "debug": { "type": "boolean", "default": false, "description": "Full diagnostic JSON" }
                 },
                 "required": ["anchor"]
@@ -1338,7 +1338,10 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
         }
         "who_uses" => {
             let debug = args["debug"].as_bool().unwrap_or(false);
-            let response_bytes = args["response_bytes"].as_u64().unwrap_or(24_000) as usize;
+            let response_bytes = args["response_bytes"]
+                .as_u64()
+                .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64)
+                as usize;
             let identity = crate::publication::Identities::read(conn)?
                 .response(crate::publication::Plane::Code);
             let origins = configured_origins(args, search_defaults);
@@ -1394,7 +1397,10 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
         }
         "definition" => {
             let debug = args["debug"].as_bool().unwrap_or(false);
-            let response_bytes = args["response_bytes"].as_u64().unwrap_or(24_000) as usize;
+            let response_bytes = args["response_bytes"]
+                .as_u64()
+                .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64)
+                as usize;
             let identity = crate::publication::Identities::read(conn)?
                 .response(crate::publication::Plane::Code);
             let source_view = args["view"]
@@ -1488,7 +1494,10 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
             let repository = origins.iter().any(|origin| origin == "repository");
             let workspace = origins.iter().any(|origin| origin == "workspace");
             let dependency = origins.iter().any(|origin| origin == "dependency");
-            let response_bytes = args["response_bytes"].as_u64().unwrap_or(24_000) as usize;
+            let response_bytes = args["response_bytes"]
+                .as_u64()
+                .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64)
+                as usize;
             let identity = crate::publication::Identities::read(conn)?
                 .response(crate::publication::Plane::Code);
             let mut stmt = conn.prepare(
@@ -1531,7 +1540,9 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
                 "events",
                 sites,
                 &identity,
-                args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+                args["response_bytes"]
+                    .as_u64()
+                    .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64) as usize,
             )
         }
         "calls" => {
@@ -1555,7 +1566,9 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
             render_bounded_object_arrays(
                 serde_json::to_value(result)?,
                 &["matches"],
-                args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+                args["response_bytes"]
+                    .as_u64()
+                    .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64) as usize,
             )
         }
         "entities" => {
@@ -1585,7 +1598,9 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
             render_bounded_object_arrays(
                 serde_json::to_value(result)?,
                 &["entities"],
-                args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+                args["response_bytes"]
+                    .as_u64()
+                    .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64) as usize,
             )
         }
         "paths" => {
@@ -1628,7 +1643,9 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
             render_bounded_object_arrays(
                 serde_json::to_value(result)?,
                 &["paths"],
-                args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+                args["response_bytes"]
+                    .as_u64()
+                    .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64) as usize,
             )
         }
         "repository_overview" => {
@@ -1653,7 +1670,10 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
                         .as_str()
                         .map(str::to_string),
                     reconnaissance_detail: args["reconnaissance_detail"].as_bool().unwrap_or(false),
-                    response_byte_limit: args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+                    response_byte_limit: args["response_bytes"]
+                        .as_u64()
+                        .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64)
+                        as usize,
                 },
             )?;
             Ok(serde_json::to_string(&result)?)
@@ -1721,7 +1741,10 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
                     } else {
                         search_defaults.origins.clone()
                     },
-                    response_byte_limit: args["response_bytes"].as_u64().unwrap_or(24_000) as usize,
+                    response_byte_limit: args["response_bytes"]
+                        .as_u64()
+                        .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64)
+                        as usize,
                     artifact_view,
                     debug,
                 },
@@ -1780,7 +1803,10 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
                     .is_some_and(|roles| !roles.is_empty()),
             };
             let result = structural::neighborhood(conn, anchor, &options)?;
-            let response_bytes = args["response_bytes"].as_u64().unwrap_or(24_000) as usize;
+            let response_bytes = args["response_bytes"]
+                .as_u64()
+                .unwrap_or(DEFAULT_TOOL_RESPONSE_BYTES as u64)
+                as usize;
             if args["debug"].as_bool().unwrap_or(false) {
                 render_bounded_object_arrays(
                     serde_json::to_value(result)?,

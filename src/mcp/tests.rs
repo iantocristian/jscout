@@ -1579,6 +1579,30 @@ fn paths_schema_caps_graph_scope() {
 }
 
 #[test]
+fn non_search_tool_schemas_share_a_default_separate_from_search() {
+    assert_eq!(crate::compact::DEFAULT_TOOL_RESPONSE_BYTES, 24_000);
+    let definitions = tool_defs(ToolProfile::Structural, true);
+    let mut budgeted_tools = 0;
+    for tool in definitions.as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let Some(budget) = tool["inputSchema"]["properties"].get("response_bytes") else {
+            continue;
+        };
+        if matches!(name, "semantic_search" | "documentation_search") {
+            assert!(budget.get("default").is_none(), "{name} uses configuration");
+        } else {
+            assert_eq!(
+                budget["default"],
+                crate::compact::DEFAULT_TOOL_RESPONSE_BYTES,
+                "{name}"
+            );
+            budgeted_tools += 1;
+        }
+    }
+    assert_eq!(budgeted_tools, 10);
+}
+
+#[test]
 fn neighborhood_schema_has_a_whole_response_budget() {
     let structural = tool_defs(ToolProfile::Structural, true);
     let neighborhood = structural

@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::publication::{Identities, Plane, ResponseIdentity};
-use crate::{file_role, formats, origin, semantic, store};
+use crate::{compact, file_role, formats, origin, semantic, store};
 
 const OVERVIEW_CITATIONS_PER_CLASSIFICATION: usize = 3;
 const OVERVIEW_CITATION_CHARS: usize = 320;
@@ -323,7 +323,7 @@ impl Default for OverviewOptions {
             reconnaissance_limit: 0,
             reconnaissance_subject: None,
             reconnaissance_detail: false,
-            response_byte_limit: 24_000,
+            response_byte_limit: compact::DEFAULT_TOOL_RESPONSE_BYTES,
         }
     }
 }

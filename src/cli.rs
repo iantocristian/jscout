@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::{origin, scouting, semantic, semantic_query};
+use crate::{compact, origin, scouting, semantic, semantic_query};
 
 #[derive(Parser)]
 #[command(
@@ -321,7 +321,7 @@ pub(super) enum Command {
         #[arg(long = "origin", value_delimiter = ',', default_values_t = origin::defaults())]
         file_origins: Vec<String>,
         /// Maximum bytes in the complete rendered JSON response
-        #[arg(long, default_value_t = semantic_query::DEFAULT_RESPONSE_BYTE_LIMIT)]
+        #[arg(long, default_value_t = compact::DEFAULT_TOOL_RESPONSE_BYTES)]
         response_bytes: usize,
         /// Maximum direct evidence supports retained per artifact
         #[arg(long)]
@@ -368,7 +368,7 @@ pub(super) enum Command {
         #[arg(long, requires = "reconnaissance_subject")]
         reconnaissance_detail: bool,
         /// Maximum bytes in the complete rendered JSON response
-        #[arg(long, default_value_t = 24_000)]
+        #[arg(long, default_value_t = compact::DEFAULT_TOOL_RESPONSE_BYTES)]
         response_bytes: usize,
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]

@@ -53,7 +53,7 @@ Column three is the legacy `JSCOUT_*` name; an em dash means the key has no envi
 | `search.rerank` | — | `true` |
 | `search.attach_memory` | — | `false` |
 | `search.limit` | — | `10` (`search::DEFAULT_RESULT_LIMIT`) |
-| `search.response_bytes` | — | `24000` (`DEFAULT_RESPONSE_BYTE_LIMIT`) |
+| `search.response_bytes` | — | `30000` (`search::DEFAULT_RESPONSE_BYTE_LIMIT`) |
 | `search.file_roles` | — | `[]` |
 | `search.origins` | — | `["repository", "workspace"]` (`origin::DEFAULT`) |
 | `search.memory_limit` | — | `4`, ceiling 100 |
