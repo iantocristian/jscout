@@ -252,9 +252,15 @@ mod tests {
     #[test]
     fn guide_descriptions_state_when_to_use_the_skill() {
         for (tier, guide) in [("core", CORE_GUIDE), ("full", FULL_GUIDE)] {
-            let description = guide
-                .lines()
-                .find_map(|line| line.strip_prefix("description: "))
+            let (frontmatter, _) = guide
+                .strip_prefix("---\n")
+                .and_then(|body| body.split_once("\n---\n"))
+                .unwrap_or_else(|| panic!("{tier} guide has no YAML frontmatter"));
+            let metadata: serde_yaml_ng::Value = serde_yaml_ng::from_str(frontmatter)
+                .unwrap_or_else(|error| panic!("{tier} guide has invalid YAML: {error}"));
+            assert_eq!(metadata["name"].as_str(), Some("jscout"));
+            let description = metadata["description"]
+                .as_str()
                 .unwrap_or_else(|| panic!("{tier} guide has no frontmatter description"));
             assert!(
                 description.starts_with("Use the jscout repository index to search"),

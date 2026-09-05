@@ -1,6 +1,6 @@
 # jscout architecture and implementation plan
 
-> Status: authoritative plan as of 2026-08-30.
+> Status: authoritative plan as of 2026-09-05.
 >
 > G1–G10 have functional implementations, but G10 is not accepted for
 > large-repository operation until its required scale correction passes. G11
@@ -32,9 +32,10 @@
 > identities are implemented: code and documentation now have independent
 > invalidation digests inside one atomic publication, while
 > `publication_snapshot` identifies the canonical indexed code,
-> documentation, and documentation-provenance tuple. G28 remains incremental;
-> its phase-1 response economy shipped with G27, while the tiered registration
-> and overview phases remain proposed.
+> documentation, and documentation-provenance tuple. G28 response economy,
+> tiered registration, and compact overview are implemented. Its retained
+> majority-content acceptance condition is not met by the measured ranked
+> responses; the production replay remains retired by maintainer decision.
 
 ## Document policy
 
@@ -3885,7 +3886,7 @@ scratch artifacts are not checked in. The implementation, corpus counts,
 integrity checks, artifact hashes, and full measurement limits are recorded in
 [eval/results/g27-plane-identities-2026-08-30.md](eval/results/g27-plane-identities-2026-08-30.md).
 
-## G28 — agent surface economy (implemented; replay retired)
+## G28 — agent surface economy (implemented; content-ratio acceptance unmet; replay retired)
 
 The surface costs more than the work. An out-of-box MCP session pays the
 structural profile's 13 tool definitions plus instructions — roughly 27 KB,
@@ -3918,8 +3919,8 @@ activated is what a task prompt turns on. Instructed use requires
 availability, so availability stays broad and becomes cheap; attention is
 narrowed by the skill; per-task activation lives in the caller's prompt.
 
-1. The skill is the single teaching surface, per tier. `agent-guide install
-   --tier core|full` installs a compact skill — tool table with required and
+1. The skill is the single teaching surface, per tier. `agent-guide --install
+   ROOT --tier core|full` installs a compact skill — tool table with required and
    optional arguments, two flows (investigate a known identifier; localize a
    fuzzy description), and tips written from the recorded production
    anti-patterns: abandon a `broad_or_query` page immediately rather than
@@ -3977,8 +3978,9 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    comparison, the links-iteration session, and the still-pending G23
    acceptance replay; every phase closes with a replay against the recorded
    baselines. Phase 0 is implemented: `integrations/jscout/{core,full}/SKILL.md`
-   are the tiered skills (core under 3 KB), `agent-guide --tier --dest`
-   installs to `.agents/`, `.claude/`, or `.codex/`, `mcp.profile` defaults to
+   are the tiered skills (core under 3 KB), `agent-guide --install ROOT --tier
+   core|full --dest agents|claude|codex` installs to the selected directory,
+   `mcp.profile` defaults to
    `core` (alias `baseline`; `full` aliases `structural`), `[mcp].tools`
    narrows registration and is enforced at the call boundary, both server
    instruction strings are identity, skill pointer, and the two mechanical
@@ -4034,9 +4036,24 @@ overview default response at 150 workspace areas stays within a few
 kilobytes with no reconnaissance prose; and every routing rule exists in
 exactly one surface — the skill — with the instruction strings reduced to
 identity, pointer, and mechanical contracts. Each of these is pinned by a
-test except the ranked-hit content ratio, which is measured from the
-`hits_bytes` and `envelope_bytes` telemetry fields in the production-windows
-report rather than by a fixture. The pointer is a directive: the
+test except the ranked-hit content ratio, which is an output measurement:
+content is the UTF-8 byte length of the JSON-escaped `snippet` string,
+excluding its surrounding quotes; the denominator is the complete compact
+JSON hit object. Field names, anchors, locations, symbols, relations, and
+other metadata never count as content. Report individual hit ratios and
+the byte-weighted aggregate (sum of snippet bytes / sum of hit bytes), with
+empty results reported as unmeasured, not passing. The response envelope
+and hit-array delimiters are outside this per-hit measure. The existing
+`hits_bytes` / `envelope_bytes` telemetry measures a different boundary and
+cannot establish this condition.
+
+The current-output measurement and its reproducible scorer are recorded in
+[eval/results/g28-ranked-content-ratio-2026-09-05.md](eval/results/g28-ranked-content-ratio-2026-09-05.md).
+The majority-content condition is not met on these samples. This corrects
+the prior unsupported acceptance claim; it does not waive the condition,
+change retrieval behavior, or reinstate the retired agent replay.
+
+The pointer is a directive: the
 instructions tell the agent to read the installed skill file before its
 first repository search, and the `semantic_search` description says to use
 it before grep or rg, because the 2026-09-02 Next.js replay showed that a
@@ -4045,7 +4062,9 @@ naturalistic Codex session on a repository with strong native agent
 instructions. The replay gates that were to compare the skill-guided and
 use-every-endpoint arms against the recorded baselines are retired with the
 replay; the baselines are recorded in the production-windows report for any
-later production comparison. G28 is closed.
+later production comparison. G28's implementation is complete; the retained
+content-ratio acceptance remains unmet pending a maintainer decision on the
+response design or the criterion.
 
 ## Evaluation decisions already made
 

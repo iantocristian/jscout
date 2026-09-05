@@ -1,6 +1,6 @@
 ---
 name: jscout
-description: Use the jscout repository index to search code before grep or rg whenever you fix a bug, implement a change, or answer a question in this JavaScript or TypeScript project: investigate known identifiers completely, answer causal and cross-file questions with source-backed evidence, and search authored Markdown and MDX.
+description: "Use the jscout repository index to search code before grep or rg whenever you fix a bug, implement a change, or answer a question in this JavaScript or TypeScript project: investigate known identifiers completely, answer causal and cross-file questions with source-backed evidence, and search authored Markdown and MDX."
 ---
 
 # jscout full

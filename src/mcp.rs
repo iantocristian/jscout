@@ -190,10 +190,6 @@ fn version_at_least(version: &str, minimum: [u64; 3]) -> bool {
     [major, minor, patch] >= minimum
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "initialize carries every server identity input; bundling them hides which one advertised a tool"
-)]
 fn initialize_result(
     requested_protocol: &str,
     binary_fingerprint: &str,
@@ -202,7 +198,6 @@ fn initialize_result(
     result_transport: ResultTransportPolicy,
     client_info: &McpClientInfo,
     runtime: &config::RuntimeConfig,
-    tools: &[String],
 ) -> Value {
     json!({
         "protocolVersion": requested_protocol,
@@ -342,7 +337,6 @@ pub fn serve(
                         result_transport,
                         &client_info,
                         runtime,
-                        &tools,
                     ),
                 )
             }
@@ -575,13 +569,13 @@ fn render_tool_result(
 /// mechanical contracts only; every routing rule lives in the installed skill
 /// (G28). Tool descriptions are one line each for the same reason.
 const BASELINE_SERVER_INSTRUCTIONS: &str = concat!(
-    "jscout indexes this repository's code and documentation. Before the first repository search, read the installed jscout skill at .agents/skills/jscout/SKILL.md (or the .claude or .codex equivalent; `jscout agent-guide --tier core` installs it) and follow its flows; it is the usage contract for these tools. ",
+    "jscout indexes this repository's code and documentation. Before the first repository search, read the installed jscout skill at .agents/skills/jscout/SKILL.md (or the .claude or .codex equivalent; `jscout agent-guide --tier core` prints the guide) and follow its flows; it is the usage contract for these tools. ",
     "Every successful response that observes one atomic index publication reports its plane digest as snapshot and the canonical indexed publication identity as publication_snapshot; only snapshot is an invalidation key. ",
     "Mechanical contracts: continue an exhaustive search only by copying the returned next_cursor unchanged until truncated=false, and retry a response_budget_too_small error with minimum_bytes=N on the same page and cursor with response_bytes=N."
 );
 
 const STRUCTURAL_SERVER_INSTRUCTIONS: &str = concat!(
-    "jscout indexes this repository's code and documentation and keeps evidence-backed semantic memory for it. Before the first repository search, read the installed jscout skill at .agents/skills/jscout/SKILL.md (or the .claude or .codex equivalent; `jscout agent-guide --tier full` installs it) and follow its flows; it is the usage contract for these tools. ",
+    "jscout indexes this repository's code and documentation and keeps evidence-backed semantic memory for it. Before the first repository search, read the installed jscout skill at .agents/skills/jscout/SKILL.md (or the .claude or .codex equivalent; `jscout agent-guide --tier full` prints the guide) and follow its flows; it is the usage contract for these tools. ",
     "Every successful response that observes one atomic index publication reports its plane digest as snapshot and the canonical indexed publication identity as publication_snapshot; only snapshot is an invalidation key. ",
     "Mechanical contracts: continue an exhaustive search only by copying the returned next_cursor unchanged until truncated=false, and retry a response_budget_too_small error with minimum_bytes=N on the same page and cursor with response_bytes=N."
 );

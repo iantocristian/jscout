@@ -35,7 +35,6 @@ fn initialize_exposes_effective_documentation_freshness_defaults() -> Result<()>
         ResultTransportPolicy::Text,
         &McpClientInfo::default(),
         &runtime,
-        &[],
     );
     let defaults = &result["serverInfo"]["documentationRetrievalDefaults"];
     assert_eq!(defaults["freshness"], json!(true));
@@ -1249,8 +1248,8 @@ fn profile_instructions_are_identity_pointer_and_mechanical_contracts() {
             instructions.len()
         );
     }
-    assert!(baseline.contains("--tier core"));
-    assert!(structural.contains("--tier full"));
+    assert!(baseline.contains("`jscout agent-guide --tier core` prints the guide"));
+    assert!(structural.contains("`jscout agent-guide --tier full` prints the guide"));
 
     for profile in [ToolProfile::Baseline, ToolProfile::Structural] {
         let tools = tool_defs(profile, true);
