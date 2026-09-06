@@ -1,5 +1,15 @@
 # Evaluation
 
+## September 5 Next.js capability replay
+
+The [Astra six-attempt report](results/next-astra-full-scout-2026-09-05.md)
+records correctness beside attempt duration, fresh/cached/output tokens,
+preparation cost, and actual tool use. Its [compact machine results](results/next-astra-full-scout-2026-09-05.json)
+retain exact measurements and source hashes without copying source transcripts
+or databases into this repository. Original oracle grades and the stronger
+supplemental root-params checks remain separate. The report also distinguishes
+the historical Sol and same-day Terra cohorts from the Astra experiment.
+
 ## G24 documentation retrieval
 
 The G24 harness freezes a generated Git history, six repository-state
