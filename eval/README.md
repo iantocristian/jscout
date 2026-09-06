@@ -1,5 +1,14 @@
 # Evaluation
 
+## September 6 Next.js instruction comparison
+
+The [ten-attempt instruction report](results/next-astra-instructions-2026-09-06.md)
+compares current, explicit-memory, efficiency and no-`rg` instructions with a
+control on the existing cases. It uses a latest-main build and upgraded copies
+of the same prepared databases, without repeating generative scouting.
+See the [fixed experiment](prereg/next-astra-instructions-2026-09-06.md) and
+[machine results](results/next-astra-instructions-2026-09-06.json).
+
 ## September 5 Next.js capability replay
 
 The [Astra six-attempt report](results/next-astra-full-scout-2026-09-05.md)
@@ -622,6 +631,15 @@ history-free snapshot; grading compares against the real implementation.
    copy-on-write clone of the same prepared database so embeddings and scout
    generations are not repeated or allowed to vary between them. Grep remains
    a single `control` treatment.
+
+   Two additional, opt-in instruction treatments are available: `memory`
+   requires a relevant anchored memory inquiry, a relevant returned body read,
+   and verification against source; `efficiency` asks for scoped/exact discovery
+   and reuse of adequate unchanged source without reducing correctness checks.
+   They do not inherit each other or the no-`rg` restriction. These are prompt
+   interventions, not data profiles: use the same `memory-embed` database to
+   compare instruction effects with memory availability held fixed. The default
+   remains `skill,forced`.
 
    ```bash
    node scripts/eval-run-replay.mjs \
