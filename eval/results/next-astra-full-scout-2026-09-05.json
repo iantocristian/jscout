@@ -1,0 +1,612 @@
+{
+  "schema_version": 1,
+  "experiment": "next-astra-full-scout-2026-09-05",
+  "recorded_date": "2026-09-06",
+  "jscout_commit": "7b738ba1ce40e59fc5dc2c7c7271832b45de8706",
+  "binary_sha256": "c269ba22534f834950b406c22ea36912a6b03482c91efaa6faf92f91e6a10609",
+  "solver": {
+    "model": "gpt-6-astra",
+    "reasoning": "high",
+    "attempts_per_cell": 1,
+    "timeout_seconds": 3600
+  },
+  "parents": {
+    "next-optimistic-prefetch": "7cb68c12828a758492ea54251393b4f988aecd6e",
+    "next-root-params-types": "1d8e326d1b360da4a439cf440316fe76a359bfd3"
+  },
+  "arms": [
+    {
+      "task": "next-optimistic-prefetch",
+      "session": "grep-control-next-optimistic-prefetch-astra-full-a",
+      "profile": "grep",
+      "treatment": "control",
+      "solver_duration_ms": 1172934,
+      "time_to_first_correct_patch_ms": null,
+      "original_oracle": {
+        "status": "fail",
+        "exit_code": 1,
+        "tests_passed": 10,
+        "tests_total": 11
+      },
+      "supplemental": null,
+      "tokens": {
+        "input_tokens": 5009171,
+        "cached_input_tokens": 4871552,
+        "noncached_input_tokens": 137619,
+        "output_tokens": 25134,
+        "reasoning_output_tokens": 9556,
+        "total_tokens": 5034305
+      },
+      "shell_commands": 62,
+      "shell_output_bytes": 320314,
+      "jscout": {
+        "calls": 0,
+        "tool_counts": {},
+        "canonical_bytes": 0,
+        "tool_result_wire_bytes": 0,
+        "server_ms": 0,
+        "failed_calls": 0,
+        "degraded_calls": 0,
+        "semantic_artifacts_returned": 0
+      }
+    },
+    {
+      "task": "next-optimistic-prefetch",
+      "session": "checker-scout-embed-skill-next-optimistic-prefetch-astra-full-a",
+      "profile": "checker-scout-embed",
+      "treatment": "skill",
+      "solver_duration_ms": 994224,
+      "time_to_first_correct_patch_ms": null,
+      "original_oracle": {
+        "status": "fail",
+        "exit_code": 1,
+        "tests_passed": 10,
+        "tests_total": 11
+      },
+      "supplemental": null,
+      "tokens": {
+        "input_tokens": 6473263,
+        "cached_input_tokens": 6315904,
+        "noncached_input_tokens": 157359,
+        "output_tokens": 22568,
+        "reasoning_output_tokens": 8318,
+        "total_tokens": 6495831
+      },
+      "shell_commands": 74,
+      "shell_output_bytes": 329965,
+      "jscout": {
+        "calls": 8,
+        "tool_counts": {
+          "semantic_search": 6,
+          "definition": 1,
+          "who_uses": 1
+        },
+        "canonical_bytes": 27621,
+        "tool_result_wire_bytes": 57197,
+        "server_ms": 9240,
+        "failed_calls": 0,
+        "degraded_calls": 0,
+        "semantic_artifacts_returned": 0
+      }
+    },
+    {
+      "task": "next-optimistic-prefetch",
+      "session": "memory-embed-skill-next-optimistic-prefetch-astra-full-a",
+      "profile": "memory-embed",
+      "treatment": "skill",
+      "solver_duration_ms": 776445,
+      "time_to_first_correct_patch_ms": null,
+      "original_oracle": {
+        "status": "fail",
+        "exit_code": 1,
+        "tests_passed": 10,
+        "tests_total": 11
+      },
+      "supplemental": null,
+      "tokens": {
+        "input_tokens": 4800050,
+        "cached_input_tokens": 4671232,
+        "noncached_input_tokens": 128818,
+        "output_tokens": 16422,
+        "reasoning_output_tokens": 5414,
+        "total_tokens": 4816472
+      },
+      "shell_commands": 53,
+      "shell_output_bytes": 209851,
+      "jscout": {
+        "calls": 4,
+        "tool_counts": {
+          "semantic_search": 2,
+          "definition": 1,
+          "who_uses": 1
+        },
+        "canonical_bytes": 15617,
+        "tool_result_wire_bytes": 32284,
+        "server_ms": 3817,
+        "failed_calls": 0,
+        "degraded_calls": 0,
+        "semantic_artifacts_returned": 0
+      }
+    },
+    {
+      "task": "next-root-params-types",
+      "session": "grep-control-next-root-params-types-astra-full-a",
+      "profile": "grep",
+      "treatment": "control",
+      "solver_duration_ms": 507782,
+      "time_to_first_correct_patch_ms": null,
+      "original_oracle": {
+        "status": "pass",
+        "exit_code": 0,
+        "tests_passed": null,
+        "tests_total": null
+      },
+      "supplemental": {
+        "passed": 3,
+        "total": 12,
+        "states": [
+          {
+            "mode": "build",
+            "case": "S",
+            "status": "fail"
+          },
+          {
+            "mode": "build",
+            "case": "M",
+            "status": "fail"
+          },
+          {
+            "mode": "build",
+            "case": "M0",
+            "status": "fail"
+          },
+          {
+            "mode": "build",
+            "case": "N",
+            "status": "pass"
+          },
+          {
+            "mode": "dev",
+            "case": "S",
+            "status": "fail"
+          },
+          {
+            "mode": "dev",
+            "case": "M",
+            "status": "fail"
+          },
+          {
+            "mode": "dev",
+            "case": "M0",
+            "status": "fail"
+          },
+          {
+            "mode": "dev",
+            "case": "N",
+            "status": "pass"
+          },
+          {
+            "mode": "typegen",
+            "case": "S",
+            "status": "fail"
+          },
+          {
+            "mode": "typegen",
+            "case": "M",
+            "status": "fail"
+          },
+          {
+            "mode": "typegen",
+            "case": "M0",
+            "status": "fail"
+          },
+          {
+            "mode": "typegen",
+            "case": "N",
+            "status": "pass"
+          }
+        ]
+      },
+      "tokens": {
+        "input_tokens": 1601353,
+        "cached_input_tokens": 1518208,
+        "noncached_input_tokens": 83145,
+        "output_tokens": 12922,
+        "reasoning_output_tokens": 3679,
+        "total_tokens": 1614275
+      },
+      "shell_commands": 40,
+      "shell_output_bytes": 138480,
+      "jscout": {
+        "calls": 0,
+        "tool_counts": {},
+        "canonical_bytes": 0,
+        "tool_result_wire_bytes": 0,
+        "server_ms": 0,
+        "failed_calls": 0,
+        "degraded_calls": 0,
+        "semantic_artifacts_returned": 0
+      }
+    },
+    {
+      "task": "next-root-params-types",
+      "session": "checker-scout-embed-skill-next-root-params-types-astra-full-a",
+      "profile": "checker-scout-embed",
+      "treatment": "skill",
+      "solver_duration_ms": 754883,
+      "time_to_first_correct_patch_ms": null,
+      "original_oracle": {
+        "status": "pass",
+        "exit_code": 0,
+        "tests_passed": null,
+        "tests_total": null
+      },
+      "supplemental": {
+        "passed": 3,
+        "total": 12,
+        "states": [
+          {
+            "mode": "build",
+            "case": "S",
+            "status": "fail"
+          },
+          {
+            "mode": "build",
+            "case": "M",
+            "status": "fail"
+          },
+          {
+            "mode": "build",
+            "case": "M0",
+            "status": "fail"
+          },
+          {
+            "mode": "build",
+            "case": "N",
+            "status": "pass"
+          },
+          {
+            "mode": "dev",
+            "case": "S",
+            "status": "fail"
+          },
+          {
+            "mode": "dev",
+            "case": "M",
+            "status": "fail"
+          },
+          {
+            "mode": "dev",
+            "case": "M0",
+            "status": "fail"
+          },
+          {
+            "mode": "dev",
+            "case": "N",
+            "status": "pass"
+          },
+          {
+            "mode": "typegen",
+            "case": "S",
+            "status": "fail"
+          },
+          {
+            "mode": "typegen",
+            "case": "M",
+            "status": "fail"
+          },
+          {
+            "mode": "typegen",
+            "case": "M0",
+            "status": "fail"
+          },
+          {
+            "mode": "typegen",
+            "case": "N",
+            "status": "pass"
+          }
+        ]
+      },
+      "tokens": {
+        "input_tokens": 4078495,
+        "cached_input_tokens": 3953536,
+        "noncached_input_tokens": 124959,
+        "output_tokens": 17898,
+        "reasoning_output_tokens": 6182,
+        "total_tokens": 4096393
+      },
+      "shell_commands": 49,
+      "shell_output_bytes": 177196,
+      "jscout": {
+        "calls": 6,
+        "tool_counts": {
+          "semantic_search": 4,
+          "definition": 1,
+          "who_uses": 1
+        },
+        "canonical_bytes": 40736,
+        "tool_result_wire_bytes": 84900,
+        "server_ms": 4072,
+        "failed_calls": 0,
+        "degraded_calls": 0,
+        "semantic_artifacts_returned": 0
+      }
+    },
+    {
+      "task": "next-root-params-types",
+      "session": "memory-embed-skill-next-root-params-types-astra-full-a",
+      "profile": "memory-embed",
+      "treatment": "skill",
+      "solver_duration_ms": 1149590,
+      "time_to_first_correct_patch_ms": null,
+      "original_oracle": {
+        "status": "pass",
+        "exit_code": 0,
+        "tests_passed": null,
+        "tests_total": null
+      },
+      "supplemental": {
+        "passed": 12,
+        "total": 12,
+        "states": [
+          {
+            "mode": "build",
+            "case": "S",
+            "status": "pass"
+          },
+          {
+            "mode": "build",
+            "case": "M",
+            "status": "pass"
+          },
+          {
+            "mode": "build",
+            "case": "M0",
+            "status": "pass"
+          },
+          {
+            "mode": "build",
+            "case": "N",
+            "status": "pass"
+          },
+          {
+            "mode": "dev",
+            "case": "S",
+            "status": "pass"
+          },
+          {
+            "mode": "dev",
+            "case": "M",
+            "status": "pass"
+          },
+          {
+            "mode": "dev",
+            "case": "M0",
+            "status": "pass"
+          },
+          {
+            "mode": "dev",
+            "case": "N",
+            "status": "pass"
+          },
+          {
+            "mode": "typegen",
+            "case": "S",
+            "status": "pass"
+          },
+          {
+            "mode": "typegen",
+            "case": "M",
+            "status": "pass"
+          },
+          {
+            "mode": "typegen",
+            "case": "M0",
+            "status": "pass"
+          },
+          {
+            "mode": "typegen",
+            "case": "N",
+            "status": "pass"
+          }
+        ]
+      },
+      "tokens": {
+        "input_tokens": 5284424,
+        "cached_input_tokens": 5140992,
+        "noncached_input_tokens": 143432,
+        "output_tokens": 27316,
+        "reasoning_output_tokens": 8957,
+        "total_tokens": 5311740
+      },
+      "shell_commands": 71,
+      "shell_output_bytes": 164291,
+      "jscout": {
+        "calls": 9,
+        "tool_counts": {
+          "semantic_search": 7,
+          "who_uses": 1,
+          "definition": 1
+        },
+        "canonical_bytes": 35011,
+        "tool_result_wire_bytes": 73103,
+        "server_ms": 5643,
+        "failed_calls": 0,
+        "degraded_calls": 0,
+        "semantic_artifacts_returned": 0
+      }
+    }
+  ],
+  "totals": {
+    "solver_duration_ms": 5355858,
+    "fresh_input_tokens": 775332,
+    "cached_input_tokens": 26471424,
+    "output_tokens": 122260,
+    "jscout_calls": 27,
+    "jscout_canonical_bytes": 118985,
+    "jscout_server_ms": 22772
+  },
+  "preparation": {
+    "model": "gpt-6-astra",
+    "reasoning": "low",
+    "tasks_run_concurrently": true,
+    "tasks": [
+      {
+        "task": "next-optimistic-prefetch",
+        "elapsed_ms": 11521526,
+        "logical_calls": 704,
+        "reported_provider_attempts": 704,
+        "reported_tokens": 3139000,
+        "outcomes": {
+          "repository/completed": 96,
+          "workflow/completed": 75,
+          "workflow/incomplete": 21,
+          "card/completed": 448,
+          "summary/completed": 64
+        }
+      },
+      {
+        "task": "next-root-params-types",
+        "elapsed_ms": 11687627,
+        "logical_calls": 704,
+        "reported_provider_attempts": 706,
+        "reported_tokens": 3274187,
+        "outcomes": {
+          "repository/completed": 96,
+          "workflow/completed": 73,
+          "workflow/failed": 1,
+          "workflow/incomplete": 22,
+          "card/completed": 447,
+          "card/failed": 1,
+          "summary/completed": 64
+        }
+      }
+    ]
+  },
+  "measurement_notes": [
+    "Solver duration excludes external preparation and grading; no first-correct-patch time was measured.",
+    "Input minus cached input gives fresh input. Output includes reasoning. Cumulative event snapshots are not added.",
+    "Canonical result bytes and tool-result wire bytes are alternative representations, not additive content.",
+    "Original and supplemental grades remain separate. Parent supplemental negatives are not solver attempts.",
+    "Preparation token fields retain provider accounting semantics and are not cash charges.",
+    "No memory artifacts were consulted; successful memory-arm patch is not proof of memory benefit."
+  ],
+  "evidence": {
+    "root": "jscout-replay-runs/next-astra-full-scout-2026-09-05",
+    "files": [
+      {
+        "path": "RESULTS.md",
+        "sha256": "840852dc16985e15777a1c9cbc860a77c37d4714338e2a3976471d9a80868608"
+      },
+      {
+        "path": "protocol.md",
+        "sha256": "351f0190ec14e4302c21db8eeff1a1c74088b70082da48ab17fc23cdf103884c"
+      },
+      {
+        "path": "readiness.json",
+        "sha256": "4a676c7380b5bcfb718cc4c890994bfe9a2d86dafdd943fc43563fcc8d391c67"
+      },
+      {
+        "path": "analysis/analysis.final.json",
+        "sha256": "d4e9846c0af3f35aa9122e28aa676c2e5f3bda7dbda7cbfcb6b34e57ff20c85c"
+      },
+      {
+        "path": "analysis/historical-comparison.md",
+        "sha256": "625f7198de24ec872bede7b7ea2d353c212a85aa5c07243babeb68c76486e748"
+      },
+      {
+        "path": "analysis/memory-treatment-use.md",
+        "sha256": "4a842af2596ee272e4781ddf87990081afee0500bdf2b45e790ce2ac43a1f1f3"
+      },
+      {
+        "path": "supplemental/results/summary.json",
+        "sha256": "fa4aa80c4ef8334af0d2de2155e89dadb75e5e718926ebe51908413f3c94a664"
+      },
+      {
+        "path": "supplemental-repaired/source-freeze.json",
+        "sha256": "15d5f5c56402255616102d65fca98022279afcca431eb555f9846cc81500ac47"
+      },
+      {
+        "path": "supplemental-repaired/results/summary.json",
+        "sha256": "50011c6a9f1bae1d5838731fe81d13ef1516f01777a73d306ac9d2d024c253ba"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/grep-control-next-optimistic-prefetch-astra-full-a/events.jsonl",
+        "sha256": "9c1c55c54852090ece85194cc211a08183a00a6174d01f9c5ecc1836ebde5240"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/grep-control-next-optimistic-prefetch-astra-full-a/agent.patch",
+        "sha256": "9ffce1557d3bed45e22f5af90bd9aa6e054dddd1b9ebfdcaaad1ce545a10b082"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/grep-control-next-optimistic-prefetch-astra-full-a/grade.json",
+        "sha256": "a437d314259c0b7af219969a51197b20e18c1ea4b625cee6aa8af1e8f5b99eb5"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/checker-scout-embed-skill-next-optimistic-prefetch-astra-full-a/events.jsonl",
+        "sha256": "ee806c063fda6810733c0c0e23b4417dd78c76d3192974610b543ff065b9c608"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/checker-scout-embed-skill-next-optimistic-prefetch-astra-full-a/agent.patch",
+        "sha256": "42fa6af9b7ab60db089c28df09f7910a75328171f19a9b608d1a8bdd9a69212b"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/checker-scout-embed-skill-next-optimistic-prefetch-astra-full-a/grade.json",
+        "sha256": "3d2386820235220cdc00df29add8ea918cb74c230ffffb803699476cfd959a7f"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/memory-embed-skill-next-optimistic-prefetch-astra-full-a/events.jsonl",
+        "sha256": "0ebe1eab7cfe1743859f247e64df2b4bcb59cf4ebcb52a40568b3a79b9d51cb2"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/memory-embed-skill-next-optimistic-prefetch-astra-full-a/agent.patch",
+        "sha256": "066ff4fa1fb9d55465fa8280d8f8c3c43f3dfdfaaa8938aa2739092e97e36e61"
+      },
+      {
+        "path": "solvers/prefetch/artifacts/memory-embed-skill-next-optimistic-prefetch-astra-full-a/grade.json",
+        "sha256": "19b1cbc37e2fc66caf07a98ea131dc83a8083f2d45ce52add038f2d4acdd0a5f"
+      },
+      {
+        "path": "solvers/root-params/artifacts/grep-control-next-root-params-types-astra-full-a/events.jsonl",
+        "sha256": "e0f7fd458e40fa9de11d66117c787a9cfc8d085001cfbb48613bf9ddaf81f9c7"
+      },
+      {
+        "path": "solvers/root-params/artifacts/grep-control-next-root-params-types-astra-full-a/agent.patch",
+        "sha256": "cd79f374a445bf171169b18273522518780e1607638eb0bde3a39441c189ece8"
+      },
+      {
+        "path": "solvers/root-params/artifacts/grep-control-next-root-params-types-astra-full-a/grade.json",
+        "sha256": "5f569dd2dc9dd72b4777bb9f632993aa7897c8764bce1378cfae26ebc69053e2"
+      },
+      {
+        "path": "solvers/root-params/artifacts/checker-scout-embed-skill-next-root-params-types-astra-full-a/events.jsonl",
+        "sha256": "c962f500fd0559d5569c9f43e4b1a1108568f6ede2655d79af034360b6850ce0"
+      },
+      {
+        "path": "solvers/root-params/artifacts/checker-scout-embed-skill-next-root-params-types-astra-full-a/agent.patch",
+        "sha256": "40918a5ff738677e6c10bb1dd0c98812f7cbf8426a150b3b10465d2945e5fe81"
+      },
+      {
+        "path": "solvers/root-params/artifacts/checker-scout-embed-skill-next-root-params-types-astra-full-a/grade.json",
+        "sha256": "55deaa2fe94f1dc4ed781191aacd63b38ad390cd2718946441020f6516fff47a"
+      },
+      {
+        "path": "solvers/root-params/artifacts/memory-embed-skill-next-root-params-types-astra-full-a/events.jsonl",
+        "sha256": "c91879daed9b6d38796161b380d67a7f93de7b0ab6abe37b1493d3b2eb4e960a"
+      },
+      {
+        "path": "solvers/root-params/artifacts/memory-embed-skill-next-root-params-types-astra-full-a/agent.patch",
+        "sha256": "05400530a9432a655203540ab2361f820b6880c5b19b4ba496556bbd23a8bad3"
+      },
+      {
+        "path": "solvers/root-params/artifacts/memory-embed-skill-next-root-params-types-astra-full-a/grade.json",
+        "sha256": "dfadc4ba59d26862cf564d3d193a1bebfd14d160357b1a8ddd6464b7658fde53"
+      }
+    ],
+    "separate_terra_report": {
+      "root": "jscout-replay-runs/next-main-snippets-2026-09-05",
+      "path": "comparison.md",
+      "sha256": "ffe7a1b73bc7769df1c6e8ea591b92f51a6236f90cfea2009a739523fb49658d"
+    }
+  }
+}
