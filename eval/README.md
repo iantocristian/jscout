@@ -1,5 +1,14 @@
 # Evaluation
 
+## Running a matrix
+
+Use the [Matrix runbook](MATRIX-RUNBOOK.md) as the canonical operating procedure.
+It covers preflight gates, native versus solver sandbox permissions, exact case
+configuration, browser/inference setup, database reuse, launch/resume, grading,
+owned-process cleanup and accounting. Historical campaign notes are evidence,
+not interchangeable launch recipes. The runbook distinguishes built-in harness
+checks from the additional operator/supervisor gates still required.
+
 ## September 6 Next.js instruction comparison
 
 The [ten-attempt instruction report](results/next-astra-instructions-2026-09-06.md)
@@ -535,6 +544,12 @@ history-free snapshot; grading compares against the real implementation.
    It also retains a per-session
    `jscout-requests.jsonl` containing every MCP request and exact tool
    arguments; the shared privacy-minimal telemetry remains the metrics input:
+
+   **Execution procedure:** follow the [Matrix runbook](MATRIX-RUNBOOK.md).
+   The examples and defaults below describe runner capabilities, not a
+   preflight-complete campaign. In particular, pin model/effort and full input
+   identity explicitly, certify native browser/inference/grading, and use the
+   runbook's supervised retention/cleanup path before launching paid attempts.
 
    ```bash
    node scripts/eval-run-replay.mjs \
