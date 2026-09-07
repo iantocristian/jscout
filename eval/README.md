@@ -9,6 +9,15 @@ owned-process cleanup and accounting. Historical campaign notes are evidence,
 not interchangeable launch recipes. The runbook distinguishes built-in harness
 checks from the additional operator/supervisor gates still required.
 
+## September 7 Next.js search-scope replay
+
+The [query-only product replay](results/next-search-scope-2026-09-07.md) measures
+AND defaults, broad-OR confirmation, and path-scoped code/documentation lookup
+against unchanged copies of the existing Next.js databases. It includes
+response bytes, process timings, and preserved-result checks, with no solver,
+scouting, indexing, or inference reruns. See the
+[machine evidence](results/next-search-scope-2026-09-07.json).
+
 ## September 6 Next.js instruction comparison
 
 The [ten-attempt instruction report](results/next-astra-instructions-2026-09-06.md)
