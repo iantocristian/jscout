@@ -128,8 +128,9 @@ Exact identifiers located implementations and callers, including the shared
 type writer's three entry points. Ranked results were mixed. Two warned broad
 OR queries consumed 42,991 bytes (36.1% of all canonical output); both traversals
 were abandoned. Shell command totals include tests, editing and log inspection,
-not just discovery. A separate source-delivery/duplicate-work audit is needed to
-quantify the overhead; this report does not treat every shell call as waste.
+not just discovery. The subsequent [discovery audit and proposed follow-ups](next-astra-discovery-audit-2026-09-06.md)
+quantify overlap and retained source delivery, distinguish verification work,
+and document incomplete capture. Neither report treats every shell call as waste.
 
 **Neither memory-arm solver consulted semantic memory.** There were no memory
 tool calls, returned artifacts, or semantic-vector execution. Both read the

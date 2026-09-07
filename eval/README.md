@@ -10,6 +10,11 @@ or databases into this repository. Original oracle grades and the stronger
 supplemental root-params checks remain separate. The report also distinguishes
 the historical Sol and same-day Terra cohorts from the Astra experiment.
 
+The [discovery audit and proposed follow-ups](results/next-astra-discovery-audit-2026-09-06.md)
+break down shell/`rg` versus jscout use, repeated discovery and source delivery,
+and verification effort. They propose separate efficiency, explicit-memory and
+no-`rg` comparisons, with measurement limits and execution decisions left explicit.
+
 ## G24 documentation retrieval
 
 The G24 harness freezes a generated Git history, six repository-state
