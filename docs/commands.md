@@ -27,12 +27,17 @@ jscout index <root>            # rebuild disposable structural state in .jscout.
                                #   --database PATH isolates index/memory state
                                #   --deps pkg,@scope/pkg indexes named dependency internals
                                #   --no-deps disables configured dependencies for this pass
-jscout search <root> "query"   # hybrid BM25 + embedding search (BM25-only without a provider)
+jscout search <root> [query]   # hybrid BM25 + embedding search (BM25-only without a provider)
                                #   --database PATH reads an isolated index
+                               #   --path FILE / --path-prefix DIR narrow indexed candidates
+                               #   omit query only with a path filter
+                               #   --exhaustive defaults to --match-mode all (AND)
+                               #   --match-mode any selects OR; --allow-broad confirms large OR sets
                                #   add --expand for a bounded structural context pack
                                #   --no-vector, --no-rerank, or --lexical-only control stages
                                #   --json is compact; --debug-json retains diagnostics
-jscout docs search <root> Q    # Markdown/MDX BM25 plus ready shared-profile vectors
+jscout docs search <root> [Q]  # Markdown/MDX BM25 plus ready shared-profile vectors
+                               #   --path FILE / --path-prefix DIR; omit Q for path-only lookup
                                #   --lexical-only needs no embedding provider
                                #   --no-freshness preserves pure relevance order
 jscout docs embed <root>       # embed missing Markdown/MDX representations
@@ -107,6 +112,57 @@ jscout agent-guide --install R # install a project-local jscout skill
   --dest agents|claude|codex   #   .agents/, .claude/, or .codex/skills/jscout/SKILL.md
 jscout agent-guide --update R --tier core --dest agents  # replace exactly that installed skill
 ```
+
+## Search scope and exhaustive results
+
+Both code and documentation search accept `--path` for an exact
+repository-relative file and `--path-prefix` for a directory subtree.
+These are literal paths, not globs: `--path-prefix src/app/` includes
+`src/app/page.ts` but not `src/apple.ts`. The prefix is normalized to one
+trailing slash. Both filters intersect when supplied together; code's
+origin, format, and role filters still apply. Candidate scope is applied
+before ranking limits, including vector and exact-identifier candidates.
+Filtering does not traverse the filesystem, change admission, or require reindexing.
+
+```bash
+jscout search /path/to/repo "cache" --path-prefix packages/server --exhaustive --json
+jscout search /path/to/repo --path src/cache.ts --json
+jscout docs search /path/to/repo --path README.md --json
+jscout docs search /path/to/repo "deployment" --path-prefix docs/operations
+```
+
+Omitting the query requires a path filter and returns bounded indexed chunks
+in deterministic path/start/id order. Path-only lookup skips vectors,
+reranking, freshness ordering, memory, and expansion. Membership comes from
+the index; documentation still verifies selected source-file hashes before
+delivery, with indexed content as the mismatch fallback. For a text query,
+ranked behavior is unchanged;
+explicit expansion can supply separately labeled related context outside the
+primary path scope.
+
+`--exhaustive` defaults to `--match-mode all`: every query token must occur
+in the same indexed source-content chunk, without requiring adjacency or
+one matching line. Use `--match-mode any` explicitly for OR. Neither mode
+interprets input as regex or FTS syntax, and zero AND matches do not trigger
+an OR retry. The match operator and `--allow-broad` are exhaustive-only.
+
+A multi-token OR request matching at least 200 chunks initially returns
+`confirmation_required: true`, the count and a `broad_or_query` warning,
+with no hits or cursor. This is not an empty completed search. Refine it or
+explicitly confirm the counted set:
+
+```bash
+jscout search /path/to/repo "cache route" --exhaustive --match-mode any --json
+# Only if that OR evidence set is intended:
+jscout search /path/to/repo "cache route" --exhaustive --match-mode any --allow-broad --json
+```
+
+For an intended traversal, copy `next_cursor` into `--cursor` until
+`truncated: false`. Preserve the query, match mode, and path/role/origin/format
+filters; confirmation need not repeat on continuation. On
+`response_budget_too_small ... minimum_bytes=N`, retry the same page with
+`--response-bytes N`. Documentation search does not have exhaustive matching
+or this broad-query guard; its textual lexical/hybrid ranking is unchanged.
 
 ## Anchor arguments and resolution boundaries
 

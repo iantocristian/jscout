@@ -253,6 +253,63 @@ fn search_format_scope_is_repeatable_and_omitted_by_default() {
 }
 
 #[test]
+fn search_scope_and_exhaustive_operator_cli_contract() {
+    let Cli { command, .. } = Cli::try_parse_from([
+        "jscout",
+        "search",
+        ".",
+        "--path-prefix",
+        "src",
+        "--exhaustive",
+        "--match-mode",
+        "any",
+        "--allow-broad",
+    ])
+    .unwrap();
+    let Command::Search {
+        query,
+        path_prefix,
+        match_mode,
+        allow_broad,
+        ..
+    } = command
+    else {
+        panic!("expected search");
+    };
+    assert!(query.is_none());
+    assert_eq!(path_prefix.as_deref(), Some("src"));
+    assert_eq!(match_mode, Some(crate::search::MatchMode::Any));
+    assert!(allow_broad);
+    let Cli { command, .. } =
+        Cli::try_parse_from(["jscout", "docs", "search", ".", "--path", "README.md"]).unwrap();
+    let Command::Docs {
+        command: crate::cli::DocsCommand::Search { query, path, .. },
+    } = command
+    else {
+        panic!("expected docs search");
+    };
+    assert!(query.is_none());
+    assert_eq!(path.as_deref(), Some("README.md"));
+    for argv in [
+        vec!["jscout", "search", "."],
+        vec!["jscout", "docs", "search", "."],
+        vec!["jscout", "search", ".", "text", "--match-mode", "all"],
+        vec!["jscout", "search", ".", "text", "--allow-broad"],
+        vec![
+            "jscout",
+            "search",
+            ".",
+            "text",
+            "--exhaustive",
+            "--match-mode",
+            "invalid",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(argv.clone()).is_err(), "{argv:?}");
+    }
+}
+
+#[test]
 fn rust_only_cli_scope_resolves_provider_only_for_vector_memory() -> Result<()> {
     let embedding = EmbeddingSettings {
         provider: Some("voyage".into()),
@@ -327,7 +384,7 @@ fn documentation_commands_and_required_vector_controls_parse() {
     else {
         panic!("expected documentation search")
     };
-    assert_eq!(query, "release guide");
+    assert_eq!(query.as_deref(), Some("release guide"));
     assert!(vector);
     assert!(no_rerank);
     assert!(no_freshness);

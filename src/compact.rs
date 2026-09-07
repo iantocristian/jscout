@@ -77,6 +77,10 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         json!(result.publication_snapshot),
     );
     if let Some(exhaustive) = &result.exhaustive {
+        response.insert(
+            "confirmation_required".into(),
+            json!(exhaustive.confirmation_required),
+        );
         response.insert("effective".into(), json!(exhaustive.effective));
         response.insert("scope".into(), json!(exhaustive.scope));
         response.insert("total_chunks".into(), json!(exhaustive.total_chunks));
@@ -89,6 +93,8 @@ pub(crate) fn search_value(result: &search::SearchResult) -> Value {
         if !exhaustive.warnings.is_empty() {
             response.insert("warnings".into(), json!(exhaustive.warnings));
         }
+    } else if !result.path_scope.is_empty() {
+        response.insert("scope".into(), json!(result.path_scope));
     }
     if search_retrieval_is_actionable(&result.retrieval) {
         response.insert("retrieval".into(), json!(result.retrieval));

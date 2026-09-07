@@ -10,9 +10,9 @@ use crate::embed;
 use super::{
     DEFAULT_EXPANSION_PATH_LIMIT, DEFAULT_MEMORY_GRAPH_DEPTH, DEFAULT_MEMORY_GRAPH_NODE_LIMIT,
     DEFAULT_RESPONSE_BYTE_LIMIT, ExpansionOptions, ExpansionProjection, Hit,
-    MAX_EXHAUSTIVE_PAGE_SIZE, MatchReason, Reranker, ResponseBudget, ResponseBudgetTooSmall,
-    RetrievalStatus, SearchExpansion, SearchMode, SearchOptions, SearchResult,
-    SearchScopeFileRoles, SearchScopeFormats, apply_repository_policy_penalty,
+    MAX_EXHAUSTIVE_PAGE_SIZE, MatchMode, MatchReason, PathScope, Reranker, ResponseBudget,
+    ResponseBudgetTooSmall, RetrievalStatus, SearchExpansion, SearchMode, SearchOptions,
+    SearchResult, SearchScopeFileRoles, SearchScopeFormats, apply_repository_policy_penalty,
     apply_response_budget, approximate_name_usage_occurrences, candidate_pool_limits,
     contains_code_identifier, edge_identity, exact_intent_tokens, exhaustive_fts_query,
     exhaustive_warnings, merge_reranked_prefix, prefilter_ranking_by_role, record_vector_ranking,
@@ -152,6 +152,7 @@ fn rust_identifier_collisions_do_not_change_ecmascript_exact_candidates() -> Res
         &[],
         &origin::defaults(),
         &[],
+        &PathScope::default(),
     )?;
     assert!(!before.definitions[0].is_empty());
     assert!(!before.occurrences[0].is_empty());
@@ -211,6 +212,7 @@ fn rust_identifier_collisions_do_not_change_ecmascript_exact_candidates() -> Res
         &[],
         &origin::defaults(),
         &[],
+        &PathScope::default(),
     )?;
     assert_eq!(after.identifiers, before.identifiers);
     assert_eq!(after.definitions, before.definitions);
@@ -428,6 +430,22 @@ fn rust_only_ranked_scope_disables_vector_before_provider_resolution() -> Result
     assert_eq!(result.retrieval.vector, "disabled");
     assert!(!result.hits.is_empty());
     assert!(result.hits.iter().all(|hit| hit.file == "native.rs"));
+    let lookup = search(
+        &conn,
+        Some(&provider),
+        "",
+        &SearchOptions {
+            path_scope: PathScope::new(Some("native.rs".into()), None)?,
+            include_memory: true,
+            expand: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(lookup.retrieval.vector, "disabled");
+    assert_eq!(lookup.retrieval.reranker, "disabled");
+    assert!(lookup.semantic_retrieval.is_none());
+    assert!(lookup.expansion.is_none());
+    assert_eq!(lookup.hits.len(), 1);
     Ok(())
 }
 
@@ -1599,26 +1617,251 @@ fn exhaustive_search_clamps_only_an_omitted_configured_limit() {
 #[test]
 fn exhaustive_fts_query_scopes_every_term_to_content() {
     assert_eq!(
-        exhaustive_fts_query("alpha beta.gamma"),
+        exhaustive_fts_query("alpha beta.gamma", MatchMode::Any),
         "content:\"alpha\" OR content:\"beta\" OR content:\"gamma\""
+    );
+    assert_eq!(
+        exhaustive_fts_query("alpha beta.gamma", MatchMode::All),
+        "content:\"alpha\" AND content:\"beta\" AND content:\"gamma\""
     );
 }
 
 #[test]
+fn exhaustive_all_is_chunk_local_and_cursors_bind_operator_and_path_scope() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join("src"))?;
+    for (path, text) in [
+        ("src/a.ts", "export const alpha = true;"),
+        ("src/b.ts", "export const beta = true;"),
+        ("src/c.ts", "export const both = alpha + beta;"),
+        ("src/d.ts", "export const other = alpha + beta;"),
+        ("outside.ts", "export const outside = alpha + beta;"),
+    ] {
+        fs::write(repo.path().join(path), text)?;
+    }
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let options = SearchOptions {
+        mode: SearchMode::Exhaustive { cursor: None },
+        path_scope: PathScope::new(None, Some("src".into()))?,
+        limit: 1,
+        rerank: false,
+        ..Default::default()
+    };
+    let all = search(&conn, None, "alpha beta", &options)?;
+    let metadata = all.exhaustive.as_ref().unwrap();
+    assert_eq!(
+        metadata.total_chunks, 2,
+        "terms must occur in the same chunk"
+    );
+    assert_eq!(metadata.effective.match_mode, MatchMode::All);
+    assert_eq!(all.hits[0].file, "src/c.ts");
+    let diagnostic = serde_json::to_string(&all)?;
+    assert_eq!(diagnostic.matches("\"scope\":").count(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&diagnostic)?["scope"]["path_prefix"],
+        "src/"
+    );
+    let next = SearchOptions {
+        mode: SearchMode::Exhaustive {
+            cursor: metadata.next_cursor.clone(),
+        },
+        path_scope: PathScope {
+            path: None,
+            path_prefix: Some("./src//".into()),
+        },
+        ..options.clone()
+    };
+    let second = search(&conn, None, "alpha beta", &next)?;
+    assert_eq!(second.hits[0].file, "src/d.ts");
+    assert!(!second.exhaustive.as_ref().unwrap().truncated);
+    for changed in [
+        SearchOptions {
+            match_mode: Some(MatchMode::Any),
+            ..next.clone()
+        },
+        SearchOptions {
+            path_scope: PathScope::default(),
+            ..next.clone()
+        },
+        SearchOptions {
+            path_scope: PathScope::new(Some("src/c.ts".into()), Some("src".into()))?,
+            ..next.clone()
+        },
+    ] {
+        assert!(
+            search(&conn, None, "alpha beta", &changed)
+                .unwrap_err()
+                .to_string()
+                .contains("query and scope")
+        );
+    }
+    let any = search(
+        &conn,
+        None,
+        "alpha beta",
+        &SearchOptions {
+            match_mode: Some(MatchMode::Any),
+            ..options.clone()
+        },
+    )?;
+    assert_eq!(any.exhaustive.as_ref().unwrap().total_chunks, 4);
+    let none = search(&conn, None, "alpha absentTerm", &options)?;
+    assert_eq!(
+        none.exhaustive.as_ref().unwrap().total_chunks,
+        0,
+        "no silent OR fallback"
+    );
+    Ok(())
+}
+
+#[test]
+fn code_path_scope_prefilters_every_lexical_candidate_source_and_supports_lookup() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir_all(repo.path().join("scope"))?;
+    fs::create_dir_all(repo.path().join("scope-sibling"))?;
+    for index in 0..12 {
+        fs::write(
+            repo.path().join(format!("scope-sibling/{index:02}.ts")),
+            "export function ScopedNeedle() { return ScopedNeedle(); }\nexport const state = { textualNeedle: true };\n",
+        )?;
+    }
+    fs::write(
+        repo.path().join("scope/z_%.ts"),
+        "export function ScopedNeedle() { return ScopedNeedle(); }\nexport const state = { textualNeedle: true };\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::index_repo(repo.path(), &conn)?;
+    let scope = PathScope::new(Some("scope/z_%.ts".into()), Some("scope".into()))?;
+    let assert_scoped = |ids: &[i64]| -> Result<()> {
+        assert!(!ids.is_empty());
+        for id in ids {
+            let path: String = conn.query_row(
+                "SELECT f.path FROM chunks c JOIN files f ON f.id=c.file_id WHERE c.id=?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(path, "scope/z_%.ts");
+        }
+        Ok(())
+    };
+    assert_scoped(&super::exact_definition_chunks(
+        &conn,
+        "ScopedNeedle",
+        1,
+        &[],
+        &origin::defaults(),
+        &[],
+        &scope,
+    )?)?;
+    assert_scoped(&super::exact_occurrence_chunks(
+        &conn,
+        "ScopedNeedle",
+        1,
+        &[],
+        &origin::defaults(),
+        &[],
+        &scope,
+    )?)?;
+    assert_scoped(&super::exact_occurrence_chunks(
+        &conn,
+        "textualNeedle",
+        1,
+        &[],
+        &origin::defaults(),
+        &[],
+        &scope,
+    )?)?;
+    let lexical = super::bm25_ranking(
+        &conn,
+        "textualNeedle",
+        1,
+        &[],
+        &origin::defaults(),
+        &[],
+        &scope,
+    )?;
+    assert_scoped(&lexical.iter().map(|row| row.0).collect::<Vec<_>>())?;
+    let options = SearchOptions {
+        path_scope: scope.clone(),
+        limit: 1,
+        include_memory: true,
+        expand: true,
+        ..Default::default()
+    };
+    let lookup = search(&conn, None, "", &options)?;
+    assert_eq!(lookup.hits.len(), 1);
+    assert_eq!(lookup.hits[0].file, "scope/z_%.ts");
+    assert!(!lookup.hits[0].snippet.is_empty());
+    assert!(lookup.expansion.is_none());
+    assert!(lookup.semantic_retrieval.is_none());
+    assert_eq!(lookup.retrieval.vector, "disabled");
+    conn.execute("INSERT INTO files(path,hash,role,origin,corpus,format) VALUES('scope/invalid.ts','docs-file','production','repository','docs','typescript')", [])?;
+    conn.execute("INSERT INTO chunks(file_id,kind,name,scope_chain,symbols,start,end,start_line,end_line,hash,content) VALUES(?1,'module','invalid','','',0,1,1,1,'docs-chunk','x')", [conn.last_insert_rowid()])?;
+    for mode in [SearchMode::Ranked, SearchMode::Exhaustive { cursor: None }] {
+        let isolated = search(
+            &conn,
+            None,
+            "",
+            &SearchOptions {
+                mode,
+                path_scope: PathScope::new(Some("scope/invalid.ts".into()), None)?,
+                ..Default::default()
+            },
+        )?;
+        assert!(
+            isolated.hits.is_empty(),
+            "path-only lookup must still enforce the code corpus"
+        );
+    }
+    let exhaustive_options = SearchOptions {
+        mode: SearchMode::Exhaustive { cursor: None },
+        ..options
+    };
+    let first = search(&conn, None, "", &exhaustive_options)?;
+    assert!(first.hits[0].match_lines.is_none());
+    let second = search(
+        &conn,
+        None,
+        "",
+        &SearchOptions {
+            mode: SearchMode::Exhaustive {
+                cursor: first.exhaustive.unwrap().next_cursor,
+            },
+            ..exhaustive_options
+        },
+    )?;
+    assert_eq!(second.hits[0].file, "scope/z_%.ts");
+    assert_ne!(first.hits[0].chunk_id, second.hits[0].chunk_id);
+    assert!(search(&conn, None, "", &SearchOptions::default()).is_err());
+    assert!(
+        search(
+            &conn,
+            None,
+            "query",
+            &SearchOptions {
+                match_mode: Some(MatchMode::All),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn broad_or_warning_is_first_page_only_and_requires_distinct_terms_and_threshold() {
-    let warnings = exhaustive_warnings("history.cache HISTORY", 200, true);
+    let warnings = exhaustive_warnings("history.cache HISTORY", 200, true, MatchMode::Any);
     assert_eq!(warnings.len(), 1);
     assert_eq!(warnings[0].code, "broad_or_query");
     assert_eq!(warnings[0].terms, ["history", "cache"]);
     assert_eq!(warnings[0].total_chunks, 200);
-    assert_eq!(
-        warnings[0].message,
-        "Exhaustive search OR-joins FTS terms. Refine or abandon this traversal if that is not the intended evidence set."
-    );
+    assert!(warnings[0].message.contains("allow_broad=true"));
 
-    assert!(exhaustive_warnings("history.cache", 199, true).is_empty());
-    assert!(exhaustive_warnings("history.history", 200, true).is_empty());
-    assert!(exhaustive_warnings("history.cache", 200, false).is_empty());
+    assert!(exhaustive_warnings("history.cache", 199, true, MatchMode::Any).is_empty());
+    assert!(exhaustive_warnings("history.history", 200, true, MatchMode::Any).is_empty());
+    assert!(exhaustive_warnings("history.cache", 200, false, MatchMode::Any).is_empty());
+    assert!(exhaustive_warnings("history.cache", 200, true, MatchMode::All).is_empty());
 }
 
 #[test]
@@ -1634,6 +1877,8 @@ fn exhaustive_search_surfaces_broad_or_warning_only_on_the_initial_page() -> Res
     indexer::index_repo(repo.path(), &conn)?;
     let options = |cursor| SearchOptions {
         mode: SearchMode::Exhaustive { cursor },
+        match_mode: Some(MatchMode::Any),
+        allow_broad: true,
         limit: 1,
         rerank: false,
         compact: true,
@@ -1641,8 +1886,67 @@ fn exhaustive_search_surfaces_broad_or_warning_only_on_the_initial_page() -> Res
         ..Default::default()
     };
 
+    let guarded = search(
+        &conn,
+        None,
+        "history.cache",
+        &SearchOptions {
+            allow_broad: false,
+            ..options(None)
+        },
+    )?;
+    let guard = guarded.exhaustive.as_ref().unwrap();
+    assert!(guard.confirmation_required);
+    assert!(guard.total_chunks >= 200);
+    assert_eq!(guard.returned, 0);
+    assert!(guard.truncated);
+    assert!(guard.next_cursor.is_none());
+    assert!(guarded.hits.is_empty());
+    assert!(guarded.response_budget.rendered_bytes < 2_000);
+    assert_eq!(
+        crate::compact::search_value(&guarded)["confirmation_required"],
+        true
+    );
+    for compact in [true, false] {
+        let mut tiny = SearchOptions {
+            allow_broad: false,
+            compact,
+            response_byte_limit: 1,
+            ..options(None)
+        };
+        let error = search(&conn, None, "history.cache", &tiny).unwrap_err();
+        tiny.response_byte_limit = error
+            .downcast_ref::<ResponseBudgetTooSmall>()
+            .unwrap()
+            .minimum_bytes;
+        let retry = search(&conn, None, "history.cache", &tiny)?;
+        let metadata = retry.exhaustive.as_ref().unwrap();
+        assert!(metadata.confirmation_required && metadata.truncated);
+        assert_eq!(metadata.total_chunks, guard.total_chunks);
+        assert!(metadata.next_cursor.is_none() && retry.hits.is_empty());
+        assert!(retry.response_budget.rendered_bytes <= tiny.response_byte_limit);
+    }
+    let scoped = search(
+        &conn,
+        None,
+        "history.cache",
+        &SearchOptions {
+            path_scope: PathScope::new(Some("subject-000.ts".into()), None)?,
+            allow_broad: false,
+            ..options(None)
+        },
+    )?;
+    assert!(!scoped.exhaustive.as_ref().unwrap().confirmation_required);
+    assert_eq!(
+        scoped.hits.len(),
+        1,
+        "count guard must use the requested scope"
+    );
+
     let first = search(&conn, None, "history.cache", &options(None))?;
     let metadata = first.exhaustive.as_ref().expect("exhaustive metadata");
+    assert!(!metadata.confirmation_required);
+    assert_eq!(metadata.total_chunks, guard.total_chunks);
     assert!(metadata.total_chunks >= 200);
     assert_eq!(metadata.warnings.len(), 1);
     let compact = crate::compact::search_value(&first);
@@ -1660,7 +1964,10 @@ fn exhaustive_search_surfaces_broad_or_warning_only_on_the_initial_page() -> Res
         &conn,
         None,
         "history.cache",
-        &options(metadata.next_cursor.clone()),
+        &SearchOptions {
+            allow_broad: false,
+            ..options(metadata.next_cursor.clone())
+        },
     )?;
     assert!(
         second
@@ -1939,6 +2246,9 @@ fn expansion_uses_one_global_node_edge_and_byte_budget() -> Result<()> {
         "greet run",
         &SearchOptions {
             mode: super::SearchMode::Ranked,
+            path_scope: PathScope::default(),
+            match_mode: None,
+            allow_broad: false,
             limit: 8,
             expand: true,
             file_roles: Vec::new(),
@@ -1986,6 +2296,9 @@ fn expansion_uses_one_global_node_edge_and_byte_budget() -> Result<()> {
         "greet",
         &SearchOptions {
             mode: super::SearchMode::Ranked,
+            path_scope: PathScope::default(),
+            match_mode: None,
+            allow_broad: false,
             limit: 8,
             expand: true,
             file_roles: Vec::new(),
@@ -2371,6 +2684,7 @@ fn response_budget_removes_low_ranked_subgraphs_not_all_edges() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
         publication_snapshot: "p".repeat(64),
+        path_scope: PathScope::default(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),
@@ -2418,6 +2732,7 @@ fn response_budget_preserves_primary_code_before_memory() -> Result<()> {
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
         publication_snapshot: "p".repeat(64),
+        path_scope: PathScope::default(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: vec![Hit {
@@ -2532,6 +2847,7 @@ fn search_caps_rendered_semantic_supports_even_under_a_large_byte_budget() -> Re
     let mut result = SearchResult {
         snapshot: "s".repeat(64),
         publication_snapshot: "p".repeat(64),
+        path_scope: PathScope::default(),
         exhaustive: None,
         retrieval: RetrievalStatus::vector_disabled(),
         hits: Vec::new(),

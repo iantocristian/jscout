@@ -52,7 +52,23 @@ jscout docs search /path/to/repo "current deployment procedure" --lexical-only
 # Optional: reuse the existing [embedding] provider and model.
 jscout docs embed /path/to/repo
 jscout docs search /path/to/repo "current deployment procedure"
+
+# Restrict candidates before lexical/vector ranking, or browse an indexed file.
+jscout docs search /path/to/repo "deployment" --path-prefix docs/operations
+jscout docs search /path/to/repo --path README.md --json
 ```
+
+`--path` selects an exact repository-relative file. `--path-prefix` selects
+a directory subtree on a path-component boundary; `docs/api/` includes its
+descendants but not `docs/api-old`. Both are literal paths, not globs, and
+intersect when combined. MCP uses the same `path` and `path_prefix` fields.
+Omit or leave the query empty only with a path filter to return bounded,
+deterministically ordered indexed chunks without vector, reranker, or
+freshness work. Path-only lookup selects from the index without filesystem
+traversal or reindexing. Delivery retains the usual selected-source hash
+verification and falls back to indexed content on mismatch. Textual documentation ranking remains the
+existing lexical/hybrid search; code search's exhaustive `match_mode` and
+`allow_broad` controls do not apply here.
 
 After changing `docs.search.freshness`, run `jscout index`. A running
 `jscout watch` reloads the documentation indexing policy and forces a full

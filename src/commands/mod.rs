@@ -248,10 +248,14 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
         Command::Search {
             root,
             query,
+            path,
+            path_prefix,
             database,
             limit,
             exhaustive,
             cursor,
+            match_mode,
+            allow_broad,
             file_roles,
             formats,
             file_origins,
@@ -281,14 +285,21 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             expand_file_roles,
         } => {
             let configured = &runtime.effective.search;
-            let vector =
-                !exhaustive && resolve_flag(vector, lexical_only || no_vector, configured.vector);
-            let rerank =
-                !exhaustive && resolve_flag(rerank, lexical_only || no_rerank, configured.rerank);
-            let include_memory =
-                !exhaustive && resolve_flag(memory, no_memory, configured.attach_memory);
-            let expand =
-                !exhaustive && resolve_flag(expand, no_expand, configured.expansion.enabled);
+            let query = query.as_deref().unwrap_or("");
+            let path_scope = crate::search_scope::PathScope::new(path, path_prefix)?;
+            let path_only = query.trim().is_empty() && !path_scope.is_empty();
+            let vector = !exhaustive
+                && !path_only
+                && resolve_flag(vector, lexical_only || no_vector, configured.vector);
+            let rerank = !exhaustive
+                && !path_only
+                && resolve_flag(rerank, lexical_only || no_rerank, configured.rerank);
+            let include_memory = !exhaustive
+                && !path_only
+                && resolve_flag(memory, no_memory, configured.attach_memory);
+            let expand = !exhaustive
+                && !path_only
+                && resolve_flag(expand, no_expand, configured.expansion.enabled);
             let file_roles = or_configured(file_roles, &configured.file_roles);
             let file_origins = or_configured(file_origins, &configured.origins);
             let expand_file_roles =
@@ -303,11 +314,14 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             cmd_search(
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
-                &query,
+                query,
                 provider.as_ref(),
                 json,
                 debug_json,
                 search::SearchOptions {
+                    path_scope,
+                    match_mode,
+                    allow_broad,
                     mode: if exhaustive {
                         search::SearchMode::Exhaustive { cursor }
                     } else {

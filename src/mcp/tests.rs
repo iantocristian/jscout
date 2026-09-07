@@ -1206,6 +1206,151 @@ fn baseline_ranked_search_forces_unavailable_configured_stages_off() -> Result<(
 }
 
 #[test]
+fn search_path_scope_validates_mcp_arguments_and_disables_path_only_stages() -> Result<()> {
+    let defaults = config::SearchSettings {
+        vector: true,
+        rerank: true,
+        attach_memory: true,
+        expansion: config::ExpansionSettings {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (vector, options) = search_options_from_args(
+        ToolProfile::Structural,
+        &json!({"path_prefix":"./src//"}),
+        &defaults,
+    )?;
+    assert_eq!(options.path_scope.path_prefix.as_deref(), Some("src/"));
+    assert!(!vector && !options.rerank && !options.include_memory && !options.expand);
+    for args in [
+        json!({"query":"x", "path":17}),
+        json!({"query":"x", "path_prefix":"../src"}),
+        json!({"query":"x", "path_prefix":""}),
+        json!({"query":17}),
+        json!({"query":"x", "match_mode":"any"}),
+        json!({"query":"x", "allow_broad":true}),
+        json!({"query":"x", "exhaustive":true, "match_mode":"invalid"}),
+        json!({"query":"x", "exhaustive":true, "allow_broad":"true"}),
+    ] {
+        assert!(
+            search_options_from_args(ToolProfile::Structural, &args, &defaults).is_err(),
+            "{args}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn exhaustive_guard_and_path_scope_are_actionable_at_mcp_boundary() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join("src"))?;
+    for n in 0..205 {
+        fs::write(
+            repo.path().join(format!("src/f{n:03}.ts")),
+            format!("export function f{n}() {{ return 'alpha'; }}\n"),
+        )?;
+    }
+    fs::write(
+        repo.path().join("src/both.ts"),
+        "export function both() { return 'alpha beta'; }\n",
+    )?;
+    let conn = store::open(repo.path())?;
+    indexer::refresh_repo_with_options(repo.path(), &conn, &indexer::IndexOptions::default())?;
+    let call = |args: serde_json::Value| -> Result<serde_json::Value> {
+        Ok(serde_json::from_str(&call_tool(
+            repo.path(),
+            &conn,
+            None,
+            ToolProfile::Structural,
+            SourceView::Full,
+            "semantic_search",
+            &args,
+        )?)?)
+    };
+    let all = call(json!({"query":"alpha beta", "exhaustive":true}))?;
+    assert_eq!(all["effective"]["match_mode"], "all");
+    assert_eq!(all["confirmation_required"], false);
+    assert_eq!(all["total_chunks"], 1);
+    let guard = call(json!({"query":"alpha beta", "exhaustive":true, "match_mode":"any"}))?;
+    assert_eq!(guard["confirmation_required"], true);
+    assert_eq!(guard["returned"], 0);
+    assert_eq!(guard["truncated"], true);
+    assert!(guard["total_chunks"].as_u64().unwrap() >= 200);
+    assert!(guard["next_cursor"].is_null());
+    assert!(guard["hits"].as_array().unwrap().is_empty());
+    assert!(serde_json::to_vec(&guard)?.len() < 2_000);
+    assert_eq!(
+        exhaustive_telemetry_metrics(Some(&guard)).confirmation_required,
+        Some(true)
+    );
+    let confirmed = call(json!({"query":"alpha beta", "exhaustive":true,
+        "match_mode":"any", "allow_broad":true, "limit":2}))?;
+    assert_eq!(confirmed["returned"], 2);
+    assert_eq!(confirmed["confirmation_required"], false);
+    let continued = call(json!({"query":"alpha beta", "exhaustive":true,
+        "match_mode":"any", "cursor":confirmed["next_cursor"], "limit":2}))?;
+    assert_eq!(continued["returned"], 2);
+    assert_eq!(continued["confirmation_required"], false);
+    let scoped = call(json!({"query":"alpha beta", "exhaustive":true,
+        "match_mode":"any", "path":"./src/both.ts"}))?;
+    assert_eq!(scoped["total_chunks"], 1);
+    assert_eq!(scoped["scope"]["path"], "src/both.ts");
+    let path_only = call(json!({"path":"src/both.ts"}))?;
+    assert_eq!(path_only["scope"]["path"], "src/both.ts");
+    assert_eq!(path_only["hits"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn documentation_path_lookup_works_at_mcp_boundary_without_text_or_inference() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    fs::create_dir(repo.path().join("docs"))?;
+    fs::create_dir(repo.path().join("docs-other"))?;
+    for path in ["README.md", "docs/README.md", "docs-other/README.md"] {
+        fs::write(
+            repo.path().join(path),
+            "# Guide\n\nShared deployment details.\n",
+        )?;
+    }
+    let conn = store::open(repo.path())?;
+    indexer::refresh_repo_with_options(repo.path(), &conn, &indexer::IndexOptions::default())?;
+    let defaults = config::RuntimeConfig::load(Some(repo.path()), None)?
+        .effective
+        .docs;
+    for args in [
+        json!({"query":"deployment", "match_mode":"all"}),
+        json!({"path":"README.md", "allow_broad":false}),
+    ] {
+        assert!(call_documentation_tool(repo.path(), &conn, None, &defaults, &args).is_err());
+    }
+    for (args, expected_path) in [
+        (
+            json!({"path":"README.md", "require_vector":true}),
+            "README.md",
+        ),
+        (
+            json!({"query":"deployment", "path_prefix":"docs", "vector":false}),
+            "docs/README.md",
+        ),
+        (json!({"path_prefix":"./docs/"}), "docs/README.md"),
+    ] {
+        let value: serde_json::Value = serde_json::from_str(&call_documentation_tool(
+            repo.path(),
+            &conn,
+            None,
+            &defaults,
+            &args,
+        )?)?;
+        assert_eq!(value["hits"].as_array().unwrap().len(), 1, "{value}");
+        assert_eq!(value["hits"][0]["path"], expected_path);
+        assert!(value["scope"].is_object());
+    }
+    Ok(())
+}
+
+#[test]
 fn profile_instructions_are_identity_pointer_and_mechanical_contracts() {
     let baseline = server_instructions(ToolProfile::Baseline);
     let structural = server_instructions(ToolProfile::Structural);

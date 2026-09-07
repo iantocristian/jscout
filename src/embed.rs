@@ -1947,6 +1947,7 @@ pub fn vector_search(
     limit: usize,
     file_origins: &[String],
     requested_formats: &[String],
+    path_scope: &crate::search_scope::PathScope,
 ) -> Result<VectorSearchResult> {
     if selected_code_vector_formats(requested_formats).is_empty() {
         return Ok(VectorSearchResult {
@@ -1984,6 +1985,7 @@ pub fn vector_search(
         limit,
         file_origins,
         requested_formats,
+        path_scope,
     )
     .map_err(|error| vector_failure("code", VectorFailureKind::Index, error))?;
     vector_index += index_started.elapsed();
@@ -2018,6 +2020,7 @@ fn exact_vector_search(
     limit: usize,
     file_origins: &[String],
     requested_formats: &[String],
+    path_scope: &crate::search_scope::PathScope,
 ) -> Result<Vec<(i64, f64)>> {
     let table = vector_table(profile.dimensions)?;
     let selected_formats = selected_code_vector_formats(requested_formats);
@@ -2025,6 +2028,20 @@ fn exact_vector_search(
         return Ok(Vec::new());
     }
     let mut scores = Vec::new();
+    // sqlite-vec's rowid IN constraint restricts KNN itself. Filtering the
+    // joined result after k would lose scoped neighbors to closer outside rows.
+    let path_filter = if path_scope.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "AND v.rowid IN (
+                SELECT entry.id FROM embedding_index_entries entry
+                JOIN chunks chunk ON chunk.id=entry.chunk_id
+                JOIN files file ON file.id=chunk.file_id
+                WHERE {})",
+            path_scope.sql("file.path", 6)
+        )
+    };
     for origin in file_origins {
         for format in &selected_formats {
             let mut statement = conn.prepare(&format!(
@@ -2036,21 +2053,24 @@ fn exact_vector_search(
                    AND v.profile_id=?3
                    AND v.origin=?4
                    AND v.format=?5
+                   {path_filter}
                  ORDER BY v.distance"
             ))?;
-            let rows = statement.query_map(
-                params![
-                    vec_to_blob(vector),
-                    limit.max(1) as i64,
-                    profile.id,
-                    origin,
-                    format,
-                ],
-                |row| {
-                    let distance = row.get::<_, f64>(1)?;
-                    Ok((row.get::<_, i64>(0)?, 1.0 - distance))
-                },
-            )?;
+            let mut parameters = vec![
+                rusqlite::types::Value::Blob(vec_to_blob(vector)),
+                (limit.max(1) as i64).into(),
+                profile.id.into(),
+                origin.clone().into(),
+                (*format).to_string().into(),
+            ];
+            if !path_scope.is_empty() {
+                parameters.push(path_scope.path.clone().into());
+                parameters.push(path_scope.path_prefix.clone().into());
+            }
+            let rows = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+                let distance = row.get::<_, f64>(1)?;
+                Ok((row.get::<_, i64>(0)?, 1.0 - distance))
+            })?;
             scores.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
         }
     }

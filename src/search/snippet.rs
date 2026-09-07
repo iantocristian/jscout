@@ -23,9 +23,9 @@ pub(super) fn select(
 ) -> Result<Snippet> {
     // Exact-tier hits should show their identifier, not a generic prose term.
     let query = if identifiers.is_empty() {
-        super::exhaustive_fts_query(query)
+        super::exhaustive_fts_query(query, super::MatchMode::Any)
     } else {
-        super::exhaustive_fts_query(&identifiers.join(" "))
+        super::exhaustive_fts_query(&identifiers.join(" "), super::MatchMode::Any)
     };
     // One collision-free delimiter can mark both ends: query terms are single
     // FTS tokens, so highlighted regions cannot span source lines.

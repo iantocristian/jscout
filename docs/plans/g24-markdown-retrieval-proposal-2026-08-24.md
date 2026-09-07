@@ -751,7 +751,7 @@ indexed projection. It does not enable, disable, or rebuild that projection.
 ```text
 jscout index <root>          shared local indexing; no provider request
 jscout docs embed <root>     embeds missing current representations
-jscout docs search <root> <query>
+jscout docs search <root> [query] [--path FILE] [--path-prefix DIR]
 jscout docs status <root>
 ```
 
@@ -766,6 +766,17 @@ default          BM25, plus vector fusion when the profile has a usable index
 --no-vector      BM25 only; reranker unaffected
 --rerank / --no-rerank   override the configured reranker
 ```
+
+Exact repository-relative `path` and directory `path_prefix` scope primary
+candidates before both lexical and vector limits. They are literal,
+intersecting filters with component-boundary prefix matching. With a path
+filter, query may be absent or empty for bounded deterministic indexed-chunk
+lookup, with no vector, reranker, or freshness stage. No admission change,
+filesystem traversal, or reindex is implied; selected-source hash verification
+and indexed-content fallback remain unchanged. Textual documentation ranking remains
+unchanged; code's exhaustive operators and broad-OR confirmation do not apply.
+The CLI flags and MCP fields follow the shared path-scope contract in
+[G22](../../PLAN.md#implemented-g22--exhaustive-lexical-search-contract).
 
 `--no-freshness` is added only with phase 3. An effectively enabled search
 against a database whose `documentation_provenance_enabled` marker is missing

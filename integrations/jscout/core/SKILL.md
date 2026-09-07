@@ -5,60 +5,62 @@ description: "Use the jscout repository index to search code before grep or rg w
 
 # jscout core
 
-These are jscout MCP tools, not shell commands.
-Localize first, then verify in source. Responses carry `snapshot` (this
-surface's key) and `publication_snapshot`.
+MCP tools. Localize, then verify in source. Responses carry `snapshot`
+(surface key) and `publication_snapshot`.
 
 ## Tools
 
 | Tool | Required | Optional | Use for |
 |---|---|---|---|
-| `semantic_search` | `query` | `exhaustive`, `cursor`, `limit`, `origins`, `formats`, `file_roles`, `vector`, `rerank`, `response_bytes` | every occurrence (`exhaustive: true`) or a ranked look |
-| `definition` | `anchor`+`snapshot` or `symbol` | `origins`, `formats`, `source_bytes` | one symbol's source |
+| `semantic_search` | query or path | `path`, `path_prefix`, `exhaustive`, `match_mode`, `allow_broad`, `cursor`, `limit`, `origins`, `formats`, `file_roles`, `vector`, `rerank`, `response_bytes` | code |
+| `definition` | `anchor`+`snapshot` or `symbol` | `origins`, `formats`, `source_bytes` | source |
 | `who_uses` | `anchor`+`snapshot` or `symbol` | `origins`, `formats` | callers |
-| `calls` | `method` | `receiver`, `args`, `arg_position` | member-call sites |
-| `file_outline` | `path` | `origins` | one file's symbols |
-| `events` | — | `name` | emit/listen wiring |
-| `documentation_search` | `query` | `vector`, `require_vector`, `limit` | authored Markdown/MDX when asked |
+| `calls` | `method` | `receiver`, `args`, `arg_position` | member calls |
+| `file_outline` | `path` | `origins` | symbols |
+| `events` | — | `name` | emit/listen |
+| `documentation_search` | query or path | `path`, `path_prefix`, `vector`, `require_vector`, `limit` | Markdown/MDX when asked |
 
 ## Flow 1: known identifier
 
-1. `semantic_search` with `exhaustive: true` and the identifier. Read the first
-   page. If it warns `broad_or_query` or the matches are off, abandon it:
-   refine it or use local text search.
-   Never page merely because `next_cursor` exists.
+1. `semantic_search` with `exhaustive: true`. Default `match_mode: "all"`
+   requires all tokens in one chunk; `"any"` is explicit OR. A `broad_or_query`
+   with `confirmation_required: true` delivers counts, no hits/cursor:
+   refine, or retry with `allow_broad: true` if that OR set is intended.
+   Abandon off-target matches.
 2. For a valid traversal, copy `next_cursor` unchanged into `cursor` until
    `truncated: false`; page-local `returned` must sum to
    `total_chunks`. On `response_budget_too_small ... minimum_bytes=N`, retry
    the same page with `response_bytes: N`.
-3. `definition`: one returned `sym:` anchor and its `snapshot`, copied verbatim.
-   Then `who_uses` for callers, `calls` for members, `file_outline` for files.
+3. `definition`: returned `sym:` anchor and `snapshot`, copied verbatim.
 
+Scope transfer: preserve query, match mode, paths, roles, origins, formats.
+Carry explicit origins/formats into `definition` and `who_uses`; keep omitted
+ones omitted, never infer from the echoed `scope`. With a cursor,
+`allow_broad` need not repeat.
 `source_meta.partial` flags incomplete cached source.
-
-Scope transfer: while paging, keep the original `query` and any explicit
-`origins`, `formats`, and `file_roles` unchanged, or the cursor is rejected.
-Carry explicitly supplied `origins` and `formats` into `definition` and
-`who_uses`; if the search omitted them, keep them omitted, and never build
-them from the echoed `scope`.
 
 ## Flow 2: fuzzy query
 
-One ranked `semantic_search` (`vector: true`), then Flow 1 on the identifiers
-it surfaced.
+One ranked `semantic_search` (`vector: true`), then Flow 1 on its identifiers.
+
+## Path lookup
+
+Both searches take literal repo-relative `path` or directory `path_prefix`;
+filters intersect before limits. `src/app/` excludes `src/apple`.
+Omit query for bounded indexed chunks without inference:
+`documentation_search({path: "README.md"})`.
 
 ## Tips
 
-- `limit` is a page size, not a session ceiling; done means
-  `truncated: false`.
+- `limit` is not a session ceiling; done means `truncated: false`.
+- Never page merely because `next_cursor` exists.
 - Do not re-search or expand after localization.
-- Copy anchors verbatim; edited ones resolve to nothing.
-- A matching pattern elsewhere is a convention, not proof a change is safe.
+- A pattern is a convention, not proof.
 - If `snapshot` changes mid-task, restart that surface's traversal.
-- Documentation prose is never runtime proof.
+- Docs prose is never runtime proof.
 
 ## On instruction
 
-- Bug fix or feature: Flow 1 on the named code; docs only when told to.
-- Blast radius: `who_uses` on the anchor, then `calls` for members.
+- Fix/feature: Flow 1 on named code; docs only when told to.
+- Blast radius: `who_uses`, then `calls`.
 - Docs question: `documentation_search`, then verify in code.

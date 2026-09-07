@@ -825,14 +825,14 @@ fn code_vectors_partition_knn_by_format_and_skip_ineligible_only_queries() -> an
     for (id, path, format, hash, vector) in [
         (
             1,
-            "src/nearest.js",
+            "src/scoped-sibling/nearest.js",
             "javascript",
             "javascript-nearest",
             [1.0_f32, 0.0],
         ),
         (
             2,
-            "src/other.js",
+            "src/scoped/other.js",
             "javascript",
             "javascript-other",
             [0.9_f32, 0.1],
@@ -918,23 +918,96 @@ fn code_vectors_partition_knn_by_format_and_skip_ineligible_only_queries() -> an
     let typescript = ["typescript".to_string()];
     let rust = ["rust".to_string()];
     assert_eq!(
-        exact_vector_search(&connection, &profile, &[1.0, 0.0], 1, &origins, &javascript,)?
-            .first()
-            .map(|result| result.0),
+        exact_vector_search(
+            &connection,
+            &profile,
+            &[1.0, 0.0],
+            1,
+            &origins,
+            &javascript,
+            &Default::default()
+        )?
+        .first()
+        .map(|result| result.0),
         Some(chunks["javascript"])
     );
     assert_eq!(
-        exact_vector_search(&connection, &profile, &[1.0, 0.0], 1, &origins, &typescript,)?
-            .first()
-            .map(|result| result.0),
+        exact_vector_search(
+            &connection,
+            &profile,
+            &[1.0, 0.0],
+            1,
+            &origins,
+            &typescript,
+            &Default::default()
+        )?
+        .first()
+        .map(|result| result.0),
         Some(chunks["typescript"]),
         "format must constrain sqlite-vec before k is applied"
     );
+    let scoped_chunk: i64 = connection.query_row(
+        "SELECT c.id FROM chunks c JOIN files f ON f.id=c.file_id WHERE f.path='src/scoped/other.js'",
+        [], |row| row.get(0),
+    )?;
+    for scope in [
+        crate::search_scope::PathScope::new(Some("src/scoped/other.js".into()), None)?,
+        crate::search_scope::PathScope::new(None, Some("src/scoped".into()))?,
+    ] {
+        let result = exact_vector_search(
+            &connection,
+            &profile,
+            &[1.0, 0.0],
+            1,
+            &origins,
+            &javascript,
+            &scope,
+        )?;
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].0, scoped_chunk,
+            "path must constrain KNN before k, even when an outside neighbor is closer"
+        );
+    }
+    let no_match = crate::search_scope::PathScope::new(
+        Some("src/scoped-sibling/nearest.js".into()),
+        Some("src/scoped".into()),
+    )?;
     assert!(
-        exact_vector_search(&connection, &profile, &[1.0, 0.0], 10, &origins, &rust)?.is_empty()
+        exact_vector_search(
+            &connection,
+            &profile,
+            &[1.0, 0.0],
+            1,
+            &origins,
+            &javascript,
+            &no_match
+        )?
+        .is_empty()
+    );
+    assert!(
+        exact_vector_search(
+            &connection,
+            &profile,
+            &[1.0, 0.0],
+            10,
+            &origins,
+            &rust,
+            &Default::default()
+        )?
+        .is_empty()
     );
     assert_eq!(
-        exact_vector_search(&connection, &profile, &[1.0, 0.0], 10, &origins, &[])?.len(),
+        exact_vector_search(
+            &connection,
+            &profile,
+            &[1.0, 0.0],
+            10,
+            &origins,
+            &[],
+            &Default::default()
+        )?
+        .len(),
         3,
         "an omitted format allowlist keeps every vector-capable code format"
     );
@@ -955,6 +1028,7 @@ fn code_vectors_partition_knn_by_format_and_skip_ineligible_only_queries() -> an
         10,
         &origins,
         &rust,
+        &Default::default(),
     )?;
     assert!(skipped.ranking.is_empty());
     assert_eq!(skipped.timings.embedding_query, std::time::Duration::ZERO);
@@ -1138,6 +1212,7 @@ fn rust_chunks_are_not_code_embedding_candidates_or_vector_entries() -> anyhow::
         2,
         &["repository".into()],
         &[],
+        &Default::default(),
     )?;
     assert_eq!(
         surfaced
@@ -1486,6 +1561,7 @@ fn missing_vector_table_search_reports_repair_and_recovers() -> anyhow::Result<(
         1,
         &["repository".into()],
         &[],
+        &Default::default(),
     )
     .expect_err("search must fail closed when the vector table is missing");
     assert!(
@@ -1509,6 +1585,7 @@ fn missing_vector_table_search_reports_repair_and_recovers() -> anyhow::Result<(
         1,
         &["repository".into()],
         &[],
+        &Default::default(),
     )?;
     assert_eq!(results.first().map(|result| result.0), Some(chunk_id));
     Ok(())

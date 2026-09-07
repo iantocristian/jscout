@@ -139,11 +139,15 @@ pub(super) fn cmd_search(
     );
     if let Some(exhaustive) = &result.exhaustive {
         println!(
-            "exhaustive: returned={} total_chunks={} truncated={} page_size={}",
+            "exhaustive: returned={} total_chunks={} truncated={} page_size={} match_mode={}",
             exhaustive.returned,
             exhaustive.total_chunks,
             exhaustive.truncated,
             exhaustive.effective.page_size,
+            match exhaustive.effective.match_mode {
+                search::MatchMode::All => "all",
+                search::MatchMode::Any => "any",
+            },
         );
         println!("scope: {}", serde_json::to_string(&exhaustive.scope)?);
         for warning in &exhaustive.warnings {
@@ -158,6 +162,14 @@ pub(super) fn cmd_search(
         if let Some(cursor) = &exhaustive.next_cursor {
             println!("next cursor: {cursor}");
         }
+        if exhaustive.confirmation_required {
+            println!(
+                "confirmation required: refine the query or scope, or retry with --allow-broad"
+            );
+            return Ok(());
+        }
+    } else if !result.path_scope.is_empty() {
+        println!("scope: {}", serde_json::to_string(&result.path_scope)?);
     }
     if let Some(action) = result.retrieval.vector_action {
         println!("vector action: {action}");

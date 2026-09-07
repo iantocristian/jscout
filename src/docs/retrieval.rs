@@ -16,6 +16,7 @@ use crate::embed::{
 };
 use crate::publication::{Identities, Plane, ResponseIdentity};
 use crate::search::Reranker;
+use crate::search_scope::PathScope;
 
 const RRF_K: f64 = 60.0;
 const MAX_VECTOR_DIMENSIONS: usize = 8_192;
@@ -40,6 +41,7 @@ pub struct EmbedReport {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchOptions {
+    pub path_scope: PathScope,
     pub limit: usize,
     #[serde(skip_serializing)]
     pub response_bytes: usize,
@@ -56,6 +58,7 @@ pub struct SearchOptions {
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
+            path_scope: PathScope::default(),
             limit: 10,
             response_bytes: 24_000,
             output: SearchOutput::Compact,
@@ -162,6 +165,8 @@ impl SourceState {
 pub struct SearchResponse {
     pub snapshot: String,
     pub publication_snapshot: String,
+    #[serde(skip_serializing_if = "PathScope::is_empty")]
+    pub scope: PathScope,
     pub hits: Vec<RetrievalHit>,
     pub diagnostics: RetrievalDiagnostics,
     pub truncated: bool,
@@ -191,7 +196,7 @@ pub fn compact_search_string(result: &SearchResponse) -> Result<String> {
             })
         })
         .collect::<Vec<_>>();
-    Ok(serde_json::to_string(&json!({
+    let mut result_json = json!({
         "snapshot": result.snapshot,
         "publication_snapshot": result.publication_snapshot,
         "hits": hits,
@@ -202,7 +207,11 @@ pub fn compact_search_string(result: &SearchResponse) -> Result<String> {
             "freshness": result.diagnostics.freshness_status,
             "max_rank_movement": result.diagnostics.max_rank_movement,
         },
-    }))?)
+    });
+    if !result.scope.is_empty() {
+        result_json["scope"] = serde_json::to_value(&result.scope)?;
+    }
+    Ok(serde_json::to_string(&result_json)?)
 }
 
 pub fn human_search_string(result: &SearchResponse) -> String {
@@ -218,6 +227,13 @@ pub fn human_search_string(result: &SearchResponse) -> String {
         result.truncated,
         result.diagnostics.budget_dropped,
     );
+    if !result.scope.is_empty() {
+        let _ = writeln!(
+            output,
+            "scope={}",
+            serde_json::to_string(&result.scope).expect("path scope always serializes as JSON")
+        );
+    }
     for hit in &result.hits {
         let tags = serde_json::to_string(&hit.document.tags)
             .expect("documentation string tags always serialize as JSON");
@@ -479,9 +495,12 @@ pub fn search(
     query: &str,
     options: &SearchOptions,
 ) -> Result<SearchResponse> {
+    let mut options = options.clone();
+    options.path_scope = options.path_scope.normalized()?;
+    let path_only = query.trim().is_empty();
     ensure!(
-        !query.trim().is_empty(),
-        "documentation query must not be empty"
+        !path_only || !options.path_scope.is_empty(),
+        "documentation query must not be empty without path or path_prefix"
     );
     ensure!(
         options.limit > 0,
@@ -498,9 +517,15 @@ pub fn search(
     if options.vector_required && !options.vector {
         bail!("vector participation cannot be both required and disabled");
     }
+    if path_only {
+        options.vector = false;
+        options.vector_required = false;
+        options.rerank = false;
+        options.freshness = false;
+    }
 
     crate::store::with_read_snapshot(conn, "jscout_docs_search", || {
-        search_inner(conn, root, provider, query, options)
+        search_inner(conn, root, provider, query, &options)
     })
 }
 
@@ -551,7 +576,11 @@ fn search_inner(
             0
         }))
         .max(options.limit);
-    let lexical_hits = store::lexical_search(conn, query, candidate_limit)?;
+    let lexical_hits = if query.trim().is_empty() {
+        store::path_search(conn, options.limit.saturating_add(1), &options.path_scope)?
+    } else {
+        store::lexical_search(conn, query, candidate_limit, &options.path_scope)?
+    };
     let lexical_ranking = lexical_hits
         .iter()
         .map(|hit| (hit.chunk_id, hit.score))
@@ -573,7 +602,14 @@ fn search_inner(
 
     if options.vector {
         if let Some(provider) = provider {
-            match resolve_vector_ranking(conn, provider, &snapshot, query, candidate_limit) {
+            match resolve_vector_ranking(
+                conn,
+                provider,
+                &snapshot,
+                query,
+                candidate_limit,
+                &options.path_scope,
+            ) {
                 Ok(VectorResolution::Ready { profile, ranking }) => {
                     vector_status = VectorStatus::Active;
                     vector_profile_id = Some(profile.id);
@@ -644,6 +680,7 @@ fn resolve_vector_ranking(
     snapshot: &str,
     query: &str,
     limit: usize,
+    scope: &PathScope,
 ) -> Result<VectorResolution> {
     let profile_spec = provider.profile_for(CHUNK_FORMAT_VERSION)?;
     let Some(profile) = existing_profile(conn, &profile_spec)? else {
@@ -658,7 +695,7 @@ fn resolve_vector_ranking(
             detail: "the current documentation digest has no complete vector generation".into(),
         });
     }
-    let ranking = vector_search(conn, provider, &profile_spec, &profile, query, limit)?;
+    let ranking = vector_search(conn, provider, &profile_spec, &profile, query, limit, scope)?;
     Ok(VectorResolution::Ready { profile, ranking })
 }
 
@@ -669,6 +706,7 @@ fn finish_search(
     identity: ResponseIdentity,
     state: SearchState,
 ) -> Result<SearchResponse> {
+    let path_only = query.trim().is_empty();
     let SearchState {
         mut lexical_ranking,
         mut vector_ranking,
@@ -763,7 +801,11 @@ fn finish_search(
                 source_detail: Some("not_resolved".to_owned()),
                 document,
                 rank: position + 1,
-                lexical_score: lexical_scores.get(&chunk_id).copied(),
+                lexical_score: if path_only {
+                    None
+                } else {
+                    lexical_scores.get(&chunk_id).copied()
+                },
                 vector_score: vector_scores.get(&chunk_id).copied(),
                 freshness_value,
                 freshness_secondary_value,
@@ -775,7 +817,7 @@ fn finish_search(
     resolve_hit_sources(root, &mut hits);
 
     let diagnostics = RetrievalDiagnostics {
-        lexical_candidates: lexical_scores.len(),
+        lexical_candidates: if path_only { 0 } else { lexical_scores.len() },
         vector_status,
         vector_candidates: vector_scores.len(),
         vector_profile_id,
@@ -796,9 +838,10 @@ fn finish_search(
         SearchResponse {
             snapshot: identity.snapshot,
             publication_snapshot: identity.publication_snapshot,
+            scope: options.path_scope.clone(),
+            truncated: path_only && total_candidates > hits.len(),
             hits,
             diagnostics,
-            truncated: false,
         },
         options.response_bytes,
         options.output,
@@ -1226,6 +1269,7 @@ fn vector_search(
     profile: &ResolvedProfile,
     query: &str,
     limit: usize,
+    scope: &PathScope,
 ) -> Result<Vec<(i64, f64)>> {
     let eligible_formats =
         crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationVector);
@@ -1262,25 +1306,32 @@ fn vector_search(
         [profile.id],
         |row| row.get(0),
     )?;
-    let expected: i64 = conn.query_row(
-        "SELECT COUNT(*)
+    let (expected, scoped_count): (i64, i64) = conn.query_row(
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN {} THEN 1 ELSE 0 END), 0)
          FROM doc_chunk_meta m
          JOIN chunks c ON c.id=m.chunk_id
          JOIN files f ON f.id=c.file_id
          WHERE f.corpus='docs'
            AND f.format IN (SELECT value FROM json_each(?1))
            AND m.embedding_identity IS NOT NULL",
-        [&eligible_formats],
-        |row| row.get(0),
+            scope.sql("f.path", 2)
+        ),
+        params![
+            eligible_formats,
+            scope.path.as_deref(),
+            scope.path_prefix.as_deref()
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     ensure!(
         occurrence_count == expected,
         "documentation vector generation is incomplete"
     );
-    if occurrence_count == 0 {
+    if scoped_count == 0 {
         return Ok(Vec::new());
     }
-    let occurrence_count = usize::try_from(occurrence_count)
+    let occurrence_count = usize::try_from(scoped_count)
         .context("documentation vector occurrence count is negative")?;
     let candidates = if occurrence_count <= SQLITE_VEC_MAX_K {
         knn_vector_candidates(
@@ -1290,6 +1341,7 @@ fn vector_search(
             &query_blob,
             occurrence_count,
             &eligible_formats,
+            scope,
         )?
     } else {
         full_distance_vector_search(
@@ -1298,6 +1350,7 @@ fn vector_search(
             &query_blob,
             occurrence_count,
             &eligible_formats,
+            scope,
         )?
     };
     Ok(finalize_vector_ranking(candidates, limit))
@@ -1310,6 +1363,7 @@ fn knn_vector_candidates(
     query_vector: &[u8],
     k: usize,
     eligible_formats: &str,
+    scope: &PathScope,
 ) -> Result<Vec<VectorCandidate>> {
     let mut statement = conn.prepare(&format!(
         "SELECT e.chunk_id, v.distance, f.path, c.start, c.end, docs_fts.body
@@ -1319,9 +1373,18 @@ fn knn_vector_candidates(
          JOIN files f ON f.id=c.file_id
          JOIN docs_fts ON docs_fts.rowid=c.id
          WHERE v.embedding MATCH ?1 AND v.k=?2 AND v.profile_id=?3
+           AND v.rowid IN (
+             SELECT entry.id FROM doc_embedding_index_entries entry
+             JOIN chunks eligible_chunk ON eligible_chunk.id=entry.chunk_id
+             JOIN files eligible_file ON eligible_file.id=eligible_chunk.file_id
+             WHERE entry.profile_id=?3 AND eligible_file.corpus='docs'
+               AND eligible_file.format IN (SELECT value FROM json_each(?4))
+               AND {}
+           )
            AND f.corpus='docs'
            AND f.format IN (SELECT value FROM json_each(?4))
-         ORDER BY v.distance"
+         ORDER BY v.distance",
+        scope.sql("eligible_file.path", 5),
     ))?;
     let rows = statement.query_map(
         params![
@@ -1329,6 +1392,8 @@ fn knn_vector_candidates(
             i64::try_from(k).context("documentation vector K does not fit SQLite")?,
             profile_id,
             eligible_formats,
+            scope.path.as_deref(),
+            scope.path_prefix.as_deref(),
         ],
         vector_candidate_from_row,
     )?;
@@ -1347,8 +1412,9 @@ fn full_distance_vector_search(
     query_vector: &[u8],
     expected: usize,
     eligible_formats: &str,
+    scope: &PathScope,
 ) -> Result<Vec<VectorCandidate>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT entry.chunk_id, vec_distance_cosine(e.vec,?1), f.path,
                 c.start, c.end, docs_fts.body
          FROM doc_embedding_index_entries entry
@@ -1360,10 +1426,18 @@ fn full_distance_vector_search(
          JOIN docs_fts ON docs_fts.rowid=c.id
          WHERE entry.profile_id=?2
            AND f.corpus='docs'
-           AND f.format IN (SELECT value FROM json_each(?3))",
-    )?;
+           AND f.format IN (SELECT value FROM json_each(?3))
+           AND {}",
+        scope.sql("f.path", 4),
+    ))?;
     let rows = statement.query_map(
-        params![query_vector, profile_id, eligible_formats],
+        params![
+            query_vector,
+            profile_id,
+            eligible_formats,
+            scope.path.as_deref(),
+            scope.path_prefix.as_deref()
+        ],
         vector_candidate_from_row,
     )?;
     let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1632,6 +1706,7 @@ mod tests {
         SearchResponse {
             snapshot: "shared-snapshot".into(),
             publication_snapshot: "publication-snapshot".into(),
+            scope: PathScope::default(),
             hits: vec![
                 retrieval_hit(1, "a.md", &"first ".repeat(80)),
                 retrieval_hit(2, "b.md", &"second ".repeat(80)),
@@ -1795,6 +1870,175 @@ mod tests {
         let conn = crate::store::open(root.path())?;
         crate::indexer::index_repo(root.path(), &conn)?;
         Ok((root, conn))
+    }
+
+    #[test]
+    fn path_only_lookup_skips_inference_and_freshness_and_reports_normalized_scope() -> Result<()> {
+        let (root, conn) = indexed_document()?;
+        let provider = test_provider("http://127.0.0.1:1/v1/embeddings".into())?;
+        let options = SearchOptions {
+            path_scope: PathScope {
+                path: Some("./README.md".into()),
+                path_prefix: None,
+            },
+            vector_required: true,
+            freshness: true,
+            ..SearchOptions::default()
+        };
+        let result = search(&conn, root.path(), Some(&provider), "  ", &options)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].document.path, "README.md");
+        assert!(result.hits[0].content.contains("blue release"));
+        assert_eq!(result.hits[0].lexical_score, None);
+        assert_eq!(result.hits[0].vector_score, None);
+        assert_eq!(result.diagnostics.lexical_candidates, 0);
+        assert_eq!(result.diagnostics.vector_status, VectorStatus::Disabled);
+        assert_eq!(result.diagnostics.reranker_status, RerankerStatus::Disabled);
+        assert_eq!(
+            result.diagnostics.freshness_status,
+            FreshnessStatus::Disabled
+        );
+        assert_eq!(result.scope.path.as_deref(), Some("README.md"));
+        for value in [
+            serde_json::to_value(&result)?,
+            serde_json::from_str(&compact_search_string(&result)?)?,
+        ] {
+            assert_eq!(value["scope"], json!({"path": "README.md"}));
+        }
+        assert!(human_search_string(&result).contains("scope={\"path\":\"README.md\"}"));
+        assert!(
+            search(&conn, root.path(), None, "", &SearchOptions::default())
+                .unwrap_err()
+                .to_string()
+                .contains("without path or path_prefix")
+        );
+
+        let mut missing = options;
+        missing.path_scope = PathScope::new(Some("missing.md".into()), None)?;
+        let result = search(&conn, root.path(), Some(&provider), "", &missing)?;
+        assert!(result.hits.is_empty());
+        assert!(!result.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn path_only_prefix_lookup_is_bounded_and_includes_document_stubs() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for (path, body) in [
+            ("docs/a.md", "# Heading only\n"),
+            ("docs/nested/b.mdx", "# Guide\n\nNested prose.\n"),
+            ("docs-other/c.md", "# Outside\n\nOther prose.\n"),
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, body)?;
+        }
+        let conn = crate::store::open(root.path())?;
+        crate::indexer::index_repo(root.path(), &conn)?;
+        let mut options = SearchOptions {
+            path_scope: PathScope::new(None, Some("docs".into()))?,
+            limit: 1,
+            ..SearchOptions::default()
+        };
+        let limited = search(&conn, root.path(), None, "", &options)?;
+        assert_eq!(limited.hits.len(), 1);
+        assert_eq!(limited.hits[0].document.path, "docs/a.md");
+        assert!(limited.hits[0].document.stub);
+        assert!(limited.truncated);
+        assert_eq!(limited.scope.path_prefix.as_deref(), Some("docs/"));
+
+        options.limit = 10;
+        let all = search(&conn, root.path(), None, "", &options)?;
+        assert_eq!(
+            all.hits
+                .iter()
+                .map(|hit| hit.document.path.as_str())
+                .collect::<Vec<_>>(),
+            ["docs/a.md", "docs/nested/b.mdx"]
+        );
+        assert!(!all.truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn documentation_vector_scope_precedes_knn_and_full_distance_limits() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("guides"))?;
+        for index in 0..12 {
+            std::fs::write(
+                root.path().join(format!("outside-{index:02}.md")),
+                format!("# Outside {index}\n\nUnrelated global candidate {index}.\n"),
+            )?;
+        }
+        std::fs::write(
+            root.path().join("guides/target.md"),
+            "# Target\n\nScoped candidate.\n",
+        )?;
+        let conn = crate::store::open(root.path())?;
+        crate::indexer::index_repo(root.path(), &conn)?;
+        let snapshot = store::current_snapshot(&conn)?;
+        let (endpoint, server) = spawn_openai_embedding_server(2)?;
+        let provider = test_provider(endpoint)?;
+        let spec = provider.profile_for(CHUNK_FORMAT_VERSION)?;
+        let profile = ensure_profile(&conn, &spec, 2)?;
+        for document in embedding_documents(&conn)? {
+            let vector = if document.text.starts_with("Target") {
+                [0.0, 1.0]
+            } else {
+                [1.0, 0.0]
+            };
+            conn.execute(
+                "INSERT INTO embeddings(chunk_hash,profile_id,vec) VALUES(?1,?2,?3)",
+                params![document.identity, profile.id, vec_to_blob(&vector)],
+            )?;
+        }
+        assert_eq!(
+            rebuild_profile_generation_from_cache(&conn, &snapshot, &profile)?,
+            Some(13)
+        );
+        let mut options = SearchOptions {
+            limit: 1,
+            vector_required: true,
+            rerank: false,
+            ..SearchOptions::default()
+        };
+        let global = search(
+            &conn,
+            root.path(),
+            Some(&provider),
+            "onlyQueryVectorNeedle",
+            &options,
+        )?;
+        assert!(global.hits[0].document.path.starts_with("outside-"));
+        options.path_scope = PathScope::new(None, Some("guides".into()))?;
+        let scoped = search(
+            &conn,
+            root.path(),
+            Some(&provider),
+            "onlyQueryVectorNeedle",
+            &options,
+        )?;
+        assert_eq!(scoped.diagnostics.vector_status, VectorStatus::Active);
+        assert_eq!(scoped.hits.len(), 1);
+        assert_eq!(scoped.hits[0].document.path, "guides/target.md");
+        assert_eq!(scoped.diagnostics.vector_candidates, 1);
+        let eligible_formats =
+            crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationVector);
+        let full = full_distance_vector_search(
+            &conn,
+            profile.id,
+            &vec_to_blob(&[1.0, 0.0]),
+            1,
+            &eligible_formats,
+            &options.path_scope,
+        )?;
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].source_key.path, "guides/target.md");
+        let requests = server
+            .join()
+            .map_err(|_| anyhow::anyhow!("fake embedding server panicked"))??;
+        assert_eq!(requests.len(), 2);
+        Ok(())
     }
 
     #[test]
@@ -2018,6 +2262,7 @@ mod tests {
             let empty = SearchResponse {
                 snapshot: "shared-snapshot".into(),
                 publication_snapshot: "publication-snapshot".into(),
+                scope: PathScope::default(),
                 hits: Vec::new(),
                 diagnostics: diagnostics(),
                 truncated: false,
@@ -2656,6 +2901,7 @@ mod tests {
             &vec_to_blob(&[1.0, 0.0]),
             1,
             &eligible_formats,
+            &PathScope::default(),
         )?;
         assert_eq!(full.len(), 1);
         assert_eq!(full[0].chunk_id, eligible_chunk_id);
@@ -2666,6 +2912,7 @@ mod tests {
             &vec_to_blob(&[1.0, 0.0]),
             2,
             &eligible_formats,
+            &PathScope::default(),
         )
         .unwrap_err();
         assert!(

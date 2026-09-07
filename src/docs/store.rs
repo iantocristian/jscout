@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::corpus::Decision;
 use crate::publication::{Identities, Plane};
+use crate::search_scope::PathScope;
 
 /// A read-only summary of the documentation plane in the shared database.
 /// Vector generations bind the documentation digest rather than the global
@@ -209,7 +210,12 @@ fn front_matter_status(conn: &Connection) -> Result<Vec<FrontMatterStatus>> {
 /// Weighted documentation BM25. User input is treated as terms rather than
 /// exposed as FTS syntax, and all exact-score ties use the normative source
 /// key before the result is truncated.
-pub fn lexical_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+pub fn lexical_search(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    scope: &PathScope,
+) -> Result<Vec<SearchHit>> {
     if query.trim().is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
@@ -220,7 +226,7 @@ pub fn lexical_search(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 
     let eligible_formats =
         crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationLexical);
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT c.id, f.path, m.title, m.description, m.tags_json,
                 m.breadcrumb, m.nearest_heading, docs_fts.body,
                 c.start, c.end, c.start_line, c.end_line,
@@ -235,17 +241,64 @@ pub fn lexical_search(conn: &Connection, query: &str, limit: usize) -> Result<Ve
          JOIN doc_chunk_meta m ON m.chunk_id=c.id
          WHERE docs_fts MATCH ?1
            AND f.corpus='docs'
-           AND f.format IN (SELECT value FROM json_each(?2))",
+           AND f.format IN (SELECT value FROM json_each(?2))
+           AND {}",
+        scope.sql("f.path", 3),
+    ))?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            query,
+            eligible_formats,
+            scope.path.as_deref(),
+            scope.path_prefix.as_deref()
+        ],
+        |row| row_to_hit(row, 0.0, Some(18)),
     )?;
-    let rows = statement.query_map([query.as_str(), eligible_formats.as_str()], |row| {
-        row_to_hit(row, 0.0, Some(18))
-    })?;
     let mut hits = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .with_context(|| format!("search documentation for `{query}`"))?;
     hits.sort_by(compare_hits);
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// Deterministic indexed-document lookup without a text query or inference.
+pub(crate) fn path_search(
+    conn: &Connection,
+    limit: usize,
+    scope: &PathScope,
+) -> Result<Vec<SearchHit>> {
+    let eligible_formats =
+        crate::formats::eligible_ids_json(crate::formats::Capability::DocumentationLexical);
+    let mut statement = conn.prepare(&format!(
+        "SELECT c.id, f.path, m.title, m.description, m.tags_json,
+                m.breadcrumb, m.nearest_heading, docs_fts.body,
+                c.start, c.end, c.start_line, c.end_line,
+                f.hash, m.embedding_identity, m.freshness_basis,
+                m.freshness_author_time, m.freshness_committer_time,
+                m.freshness_detail, c.kind
+         FROM chunks c
+         JOIN files f ON f.id=c.file_id
+         JOIN doc_chunk_meta m ON m.chunk_id=c.id
+         JOIN docs_fts ON docs_fts.rowid=c.id
+         WHERE f.corpus='docs'
+           AND f.format IN (SELECT value FROM json_each(?1))
+           AND {}
+         ORDER BY f.path COLLATE BINARY, c.start, c.end, c.id
+         LIMIT ?4",
+        scope.sql("f.path", 2),
+    ))?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            eligible_formats,
+            scope.path.as_deref(),
+            scope.path_prefix.as_deref(),
+            i64::try_from(limit).context("documentation path lookup limit does not fit SQLite")?
+        ],
+        |row| row_to_hit(row, 0.0, None),
+    )?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("look up documentation paths")
 }
 
 pub(crate) fn load_hit(conn: &Connection, chunk_id: i64, score: f64) -> Result<SearchHit> {
@@ -465,7 +518,7 @@ mod tests {
         assert_eq!(status.indexed_file_count, 3);
         assert_eq!(status.chunk_count, 2);
 
-        let hits = lexical_search(&conn, "needle", 10)?;
+        let hits = lexical_search(&conn, "needle", 10, &PathScope::default())?;
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|hit| hit.path.ends_with(".md")));
         assert_eq!(hits[0].title, "Needle");
@@ -495,7 +548,7 @@ mod tests {
         )?;
         let conn = crate::store::open(root.path())?;
         crate::indexer::index_repo(root.path(), &conn)?;
-        let lexical = lexical_search(&conn, "recoverable metadata", 10)?;
+        let lexical = lexical_search(&conn, "recoverable metadata", 10, &PathScope::default())?;
         assert_eq!(lexical.len(), 1);
         let hit = &lexical[0];
         assert_eq!(hit.title, "Release Guide");
@@ -515,8 +568,35 @@ mod tests {
     #[test]
     fn fts_input_is_terms_not_query_syntax() -> Result<()> {
         let (_root, conn) = fixture()?;
-        let hits = lexical_search(&conn, "needle OR NOT (", 10)?;
+        let hits = lexical_search(&conn, "needle OR NOT (", 10, &PathScope::default())?;
         assert_eq!(hits.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_scope_precedes_the_limit_and_is_literal_and_component_bounded() -> Result<()> {
+        let (_root, conn) = fixture()?;
+        conn.execute(
+            "UPDATE files SET path='docs_50%/README.md' WHERE path='a.md'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE files SET path='docs_50%-other/README.md' WHERE path='z.md'",
+            [],
+        )?;
+        let global = lexical_search(&conn, "needle", 1, &PathScope::default())?;
+        assert_eq!(global[0].path, "docs_50%-other/README.md");
+
+        let scope = PathScope::new(None, Some("docs_50%".into()))?;
+        let hits = lexical_search(&conn, "needle", 1, &scope)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "docs_50%/README.md");
+        let exact = PathScope::new(Some(hits[0].path.clone()), None)?;
+        assert_eq!(lexical_search(&conn, "needle", 1, &exact)?, hits);
+
+        let conflicting = PathScope::new(exact.path, Some("elsewhere".into()))?;
+        assert!(lexical_search(&conn, "needle", 1, &conflicting)?.is_empty());
+        assert!(path_search(&conn, 1, &conflicting)?.is_empty());
         Ok(())
     }
 }

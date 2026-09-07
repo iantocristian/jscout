@@ -191,7 +191,7 @@ jscout agent-guide --install /path/to/repo --tier full --dest claude   # pair wi
 `--tier core` (the default) teaches the production-selected surface —
 `semantic_search`, `definition`, `who_uses`, `calls`, `file_outline`,
 `events`, and `documentation_search` — with two flows and the recorded
-anti-patterns, in under 3 KB. `--tier full` adds `semantic_memory`,
+anti-patterns. `--tier full` adds `semantic_memory`,
 `repository_overview`, `neighborhood`, `entities`, `paths`, and `annotate`
 with the inquiry and write-back flows. `--dest` selects
 `.agents/skills/jscout/SKILL.md` (default), `.claude/skills/jscout/SKILL.md`,
@@ -292,6 +292,37 @@ without reducing measured client context. Set `text` for universal text-only
 behavior or `structured` for an explicit compatibility probe; errors always
 remain text-only. Transport selection and byte counts are recorded in MCP
 telemetry.
+
+## Search scope and confirmation
+
+`semantic_search` and `documentation_search` accept `path` (one exact
+repository-relative file) and `path_prefix` (a directory subtree).
+They are literal, intersecting filters applied before candidate limits.
+`path_prefix: "src/app/"` does not match `src/apple.ts`. Query may be omitted
+or empty only with a path filter; e.g.
+`documentation_search({"path":"README.md"})` browses bounded indexed chunks
+without inference. Path-only calls do not run ranking, freshness, memory, or
+expansion and do not traverse the filesystem. Documentation still verifies
+selected-source hashes before delivery, falling back to indexed content on
+mismatch. Normal ranked text queries retain their meaning; explicitly
+requested related-context expansion may cross the
+primary result path scope.
+
+With `semantic_search({"query":"cache route","exhaustive":true})`,
+`match_mode` defaults to `"all"`: both terms must occur in the same content
+chunk. Use `"any"` for intentional OR. `match_mode` and `allow_broad` are
+exhaustive-only; documentation search keeps its existing textual ranking.
+There is no automatic OR fallback for an empty AND result.
+
+An unconfirmed multi-token OR set of at least 200 chunks returns
+`confirmation_required: true`, `total_chunks`, `returned: 0`,
+`truncated: true`, `next_cursor: null`, and `broad_or_query`. Refine the query
+or scope, or repeat the initial request with `allow_broad: true` to retrieve
+that set. Do not interpret this counts-only response as no matches or as a
+page to continue. After confirmation, ordinary cursor paging remains
+complete and uncapped. Preserve query, effective match mode, paths, roles,
+origins, and formats on continuation; `allow_broad` need not repeat. A changed
+code snapshot or query scope rejects the cursor.
 
 ## Response budgets
 

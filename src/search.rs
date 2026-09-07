@@ -7,7 +7,9 @@ use rusqlite::Connection;
 use crate::{
     embed, file_role, origin,
     publication::{Identities, Plane},
-    query, semantic, store, structural,
+    query,
+    search_scope::PathScope,
+    semantic, store, structural,
 };
 
 mod snippet;
@@ -100,6 +102,10 @@ impl Default for ExpansionOptions {
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     pub mode: SearchMode,
+    pub path_scope: PathScope,
+    /// Exhaustive token matching only. Ranked retrieval keeps its OR semantics.
+    pub match_mode: Option<MatchMode>,
+    pub allow_broad: bool,
     pub limit: usize,
     pub expand: bool,
     /// Maximum bytes in the serialized JSON search envelope. This covers hits,
@@ -136,6 +142,9 @@ impl Default for SearchOptions {
     fn default() -> Self {
         Self {
             mode: SearchMode::Ranked,
+            path_scope: PathScope::default(),
+            match_mode: None,
+            allow_broad: false,
             limit: DEFAULT_RESULT_LIMIT,
             expand: false,
             response_byte_limit: DEFAULT_RESPONSE_BYTE_LIMIT,
@@ -162,6 +171,24 @@ pub enum SearchMode {
     Exhaustive {
         cursor: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    #[default]
+    All,
+    Any,
+}
+
+impl MatchMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "all" => Ok(Self::All),
+            "any" => Ok(Self::Any),
+            _ => anyhow::bail!("match mode must be one of: all, any"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,10 +233,13 @@ pub struct SearchScope {
     pub file_roles: SearchScopeFileRoles,
     pub origins: Vec<String>,
     pub formats: SearchScopeFormats,
+    #[serde(flatten)]
+    pub path_scope: PathScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct EffectiveSearchPosture {
+    pub match_mode: MatchMode,
     pub vector: bool,
     pub rerank: bool,
     pub expand: bool,
@@ -219,6 +249,7 @@ pub struct EffectiveSearchPosture {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ExhaustiveSearchMetadata {
+    pub confirmation_required: bool,
     pub total_chunks: usize,
     pub returned: usize,
     pub truncated: bool,
@@ -265,6 +296,8 @@ impl std::error::Error for ResponseBudgetTooSmall {}
 pub struct SearchResult {
     pub snapshot: String,
     pub publication_snapshot: String,
+    #[serde(rename = "scope", skip_serializing_if = "PathScope::is_empty")]
+    pub path_scope: PathScope,
     #[serde(flatten)]
     pub exhaustive: Option<ExhaustiveSearchMetadata>,
     pub retrieval: RetrievalStatus,
@@ -483,7 +516,7 @@ fn fts_terms(q: &str) -> Vec<&str> {
         .collect()
 }
 
-fn fts_query_for_column(q: &str, column: Option<&str>) -> String {
+fn fts_query_for_column(q: &str, column: Option<&str>, mode: MatchMode) -> String {
     fts_terms(q)
         .into_iter()
         .map(|term| match column {
@@ -491,19 +524,22 @@ fn fts_query_for_column(q: &str, column: Option<&str>) -> String {
             None => format!("\"{term}\""),
         })
         .collect::<Vec<_>>()
-        .join(" OR ")
+        .join(match mode {
+            MatchMode::All => " AND ",
+            MatchMode::Any => " OR ",
+        })
 }
 
 fn fts_query(q: &str) -> String {
-    fts_query_for_column(q, None)
+    fts_query_for_column(q, None, MatchMode::Any)
 }
 
-fn exhaustive_fts_query(q: &str) -> String {
-    fts_query_for_column(q, Some("content"))
+fn exhaustive_fts_query(q: &str, mode: MatchMode) -> String {
+    fts_query_for_column(q, Some("content"), mode)
 }
 
 const BROAD_OR_QUERY_CHUNK_THRESHOLD: usize = 200;
-const BROAD_OR_QUERY_MESSAGE: &str = "Exhaustive search OR-joins FTS terms. Refine or abandon this traversal if that is not the intended evidence set.";
+const BROAD_OR_QUERY_MESSAGE: &str = "This OR query matches a broad evidence set. Refine the query or path scope, use match_mode=all, or retry with allow_broad=true to retrieve it.";
 
 fn exhaustive_effective_terms(q: &str) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -520,8 +556,9 @@ fn exhaustive_warnings(
     q: &str,
     total_chunks: usize,
     first_page: bool,
+    mode: MatchMode,
 ) -> Vec<ExhaustiveSearchWarning> {
-    if !first_page || total_chunks < BROAD_OR_QUERY_CHUNK_THRESHOLD {
+    if mode != MatchMode::Any || !first_page || total_chunks < BROAD_OR_QUERY_CHUNK_THRESHOLD {
         return Vec::new();
     }
     let terms = exhaustive_effective_terms(q);
@@ -600,6 +637,7 @@ fn exact_intent_candidates(
     file_roles: &[String],
     file_origins: &[String],
     file_formats: &[String],
+    path_scope: &PathScope,
 ) -> Result<ExactIntentCandidates> {
     let identifiers = exact_intent_tokens(query);
     // A pure identifier lookup is an explicit request for every exact usage.
@@ -621,6 +659,7 @@ fn exact_intent_candidates(
             file_roles,
             file_origins,
             file_formats,
+            path_scope,
         )?;
         let definition_set = definition_ids.iter().copied().collect::<HashSet<_>>();
         // Fetch through the normal bounded per-identifier window before
@@ -634,6 +673,7 @@ fn exact_intent_candidates(
             file_roles,
             file_origins,
             file_formats,
+            path_scope,
         )?
         .into_iter()
         .filter(|chunk_id| !definition_set.contains(chunk_id))
@@ -656,6 +696,7 @@ fn exact_definition_chunks(
     file_roles: &[String],
     file_origins: &[String],
     file_formats: &[String],
+    path_scope: &PathScope,
 ) -> Result<Vec<i64>> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
@@ -664,7 +705,8 @@ fn exact_definition_chunks(
     let row_limit = limit.max(1) as i64;
     let mut rows = Vec::<(i64, i64, i64, i64, String, i64)>::new();
 
-    let mut named_chunks = conn.prepare_cached(
+    let path_filter = path_scope.sql("file.path", 9);
+    let mut named_chunks = conn.prepare_cached(&format!(
         "SELECT chunk.id, 0 AS name_priority, 1 AS export_priority,
                 chunk.end-chunk.start AS span, file.path, chunk.start
          FROM code_chunks chunk
@@ -675,9 +717,10 @@ fn exact_definition_chunks(
              OR (?4 AND file.origin='dependency'))
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
            AND file.format IN (SELECT value FROM json_each(?7))
+           AND {path_filter}
          ORDER BY file.path, chunk.start, chunk.id
          LIMIT ?8",
-    )?;
+    ))?;
     let named = named_chunks.query_map(
         rusqlite::params![
             identifier,
@@ -688,6 +731,8 @@ fn exact_definition_chunks(
             roles_json,
             eligible_formats,
             row_limit,
+            path_scope.path.as_deref(),
+            path_scope.path_prefix.as_deref(),
         ],
         |row| {
             Ok((
@@ -707,7 +752,7 @@ fn exact_definition_chunks(
     let roles_json = serde_json::to_string(file_roles)?;
     let eligible_formats =
         format_allowlist_json(file_formats, crate::formats::Capability::ExactDefinition)?;
-    let mut containing_chunks = conn.prepare_cached(
+    let mut containing_chunks = conn.prepare_cached(&format!(
         "SELECT chunk.id,
                 CASE WHEN chunk.name=?1 COLLATE BINARY THEN 0 ELSE 1 END AS name_priority,
                 CASE WHEN symbol.exported=1 THEN 0 ELSE 1 END AS export_priority,
@@ -722,9 +767,10 @@ fn exact_definition_chunks(
              OR (?4 AND file.origin='dependency'))
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
            AND file.format IN (SELECT value FROM json_each(?7))
+           AND {path_filter}
          ORDER BY name_priority, export_priority, span, file.path, chunk.start, chunk.id
          LIMIT ?8",
-    )?;
+    ))?;
     let containing = containing_chunks.query_map(
         rusqlite::params![
             identifier,
@@ -735,6 +781,8 @@ fn exact_definition_chunks(
             roles_json,
             eligible_formats,
             row_limit,
+            path_scope.path.as_deref(),
+            path_scope.path_prefix.as_deref(),
         ],
         |row| {
             Ok((
@@ -780,12 +828,14 @@ fn exact_occurrence_chunks(
     file_roles: &[String],
     file_origins: &[String],
     file_formats: &[String],
+    path_scope: &PathScope,
 ) -> Result<Vec<i64>> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
     let eligible_formats =
         format_allowlist_json(file_formats, crate::formats::Capability::ExactOccurrence)?;
-    let mut statement = conn.prepare_cached(
+    let path_filter = path_scope.sql("file.path", 9);
+    let mut statement = conn.prepare_cached(&format!(
         "SELECT candidate.chunk_id
          FROM (
            SELECT ref.chunk_id AS chunk_id, file.path AS path, ref.start AS position
@@ -798,6 +848,7 @@ fn exact_occurrence_chunks(
                OR (?4 AND file.origin='dependency'))
              AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
              AND file.format IN (SELECT value FROM json_each(?7))
+             AND {path_filter}
            UNION ALL
            SELECT call.chunk_id, file.path, call.start
            FROM member_calls call
@@ -809,6 +860,7 @@ fn exact_occurrence_chunks(
                OR (?4 AND file.origin='dependency'))
              AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
              AND file.format IN (SELECT value FROM json_each(?7))
+             AND {path_filter}
            UNION ALL
            SELECT site.chunk_id, file.path, site.start
            FROM entity_sites site
@@ -820,11 +872,12 @@ fn exact_occurrence_chunks(
                OR (?4 AND file.origin='dependency'))
              AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
              AND file.format IN (SELECT value FROM json_each(?7))
+             AND {path_filter}
          ) candidate
          GROUP BY candidate.chunk_id
          ORDER BY MIN(candidate.path), MIN(candidate.position), candidate.chunk_id
          LIMIT ?8",
-    )?;
+    ))?;
     let rows = statement.query_map(
         rusqlite::params![
             identifier,
@@ -835,6 +888,8 @@ fn exact_occurrence_chunks(
             roles_json,
             eligible_formats,
             limit.max(1) as i64,
+            path_scope.path.as_deref(),
+            path_scope.path_prefix.as_deref(),
         ],
         |row| row.get::<_, i64>(0),
     )?;
@@ -851,7 +906,7 @@ fn exact_occurrence_chunks(
     if result.len() < limit {
         let eligible_formats =
             format_allowlist_json(file_formats, crate::formats::Capability::ExactOccurrence)?;
-        let mut textual = conn.prepare_cached(
+        let mut textual = conn.prepare_cached(&format!(
             "SELECT chunk.id, chunk.content
              FROM chunks_fts
              JOIN chunks chunk ON chunk.id=chunks_fts.rowid
@@ -862,9 +917,10 @@ fn exact_occurrence_chunks(
                  OR (?4 AND file.origin='dependency'))
                AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
                AND file.format IN (SELECT value FROM json_each(?7))
+               AND {path_filter}
              ORDER BY file.path, chunk.start, chunk.id
              LIMIT ?8",
-        )?;
+        ))?;
         let candidate_limit = limit.saturating_mul(32).clamp(32, 4_096) as i64;
         let rows = textual.query_map(
             rusqlite::params![
@@ -876,6 +932,8 @@ fn exact_occurrence_chunks(
                 roles_json,
                 eligible_formats,
                 candidate_limit,
+                path_scope.path.as_deref(),
+                path_scope.path_prefix.as_deref(),
             ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )?;
@@ -1079,6 +1137,7 @@ fn bm25_ranking(
     file_roles: &[String],
     file_origins: &[String],
     file_formats: &[String],
+    path_scope: &PathScope,
 ) -> Result<Vec<(i64, f64)>> {
     let fq = fts_query(q);
     if fq.is_empty() {
@@ -1086,7 +1145,8 @@ fn bm25_ranking(
     }
     let eligible_formats =
         format_allowlist_json(file_formats, crate::formats::Capability::CodeLexical)?;
-    let mut stmt = conn.prepare(
+    let path_filter = path_scope.sql("file.path", 9);
+    let mut stmt = conn.prepare(&format!(
         "SELECT chunks_fts.rowid, bm25(chunks_fts, 2.0, 4.0, 3.0, 1.0) AS r
          FROM chunks_fts
          JOIN chunks chunk ON chunk.id=chunks_fts.rowid
@@ -1097,8 +1157,9 @@ fn bm25_ranking(
              OR (?4 AND file.origin='dependency'))
            AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
            AND file.format IN (SELECT value FROM json_each(?7))
+           AND {path_filter}
          ORDER BY r LIMIT ?8",
-    )?;
+    ))?;
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
     let rows = stmt.query_map(
@@ -1110,7 +1171,9 @@ fn bm25_ranking(
             file_roles.is_empty(),
             &roles_json,
             &eligible_formats,
-            limit as i64
+            limit as i64,
+            path_scope.path.as_deref(),
+            path_scope.path_prefix.as_deref(),
         ],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
     )?;
@@ -1124,8 +1187,17 @@ fn vector_ranking(
     limit: usize,
     file_origins: &[String],
     file_formats: &[String],
+    path_scope: &PathScope,
 ) -> Result<embed::VectorSearchResult> {
-    embed::vector_search(conn, provider, q, limit, file_origins, file_formats)
+    embed::vector_search(
+        conn,
+        provider,
+        q,
+        limit,
+        file_origins,
+        file_formats,
+        path_scope,
+    )
 }
 
 fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
@@ -1136,7 +1208,7 @@ fn origin_flags(origins: &[String]) -> (bool, bool, bool) {
     )
 }
 
-const EXHAUSTIVE_CURSOR_PREFIX: &str = "jscout-exhaustive-v3";
+const EXHAUSTIVE_CURSOR_PREFIX: &str = "jscout-exhaustive-v4";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExhaustiveCursorPosition {
@@ -1147,6 +1219,7 @@ struct ExhaustiveCursorPosition {
 
 #[derive(Debug)]
 struct ExhaustivePageState {
+    confirmation_required: bool,
     total_chunks: usize,
     selected_positions: Vec<ExhaustiveCursorPosition>,
     has_more: bool,
@@ -1332,6 +1405,7 @@ fn exhaustive_scope(options: &SearchOptions) -> (Vec<String>, Vec<String>, Searc
             file_roles,
             origins,
             formats,
+            path_scope: options.path_scope.clone(),
         },
     )
 }
@@ -1341,10 +1415,20 @@ fn exhaustive_request_fingerprint(
     file_roles: &[String],
     origins: &[String],
     formats: &[String],
+    mode: MatchMode,
+    path_scope: &PathScope,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"jscout-exhaustive-request-v2\0");
+    hasher.update(b"jscout-exhaustive-request-v3\0");
     hasher.update(q.as_bytes());
+    hasher.update(match mode {
+        MatchMode::All => b"\0all\0",
+        MatchMode::Any => b"\0any\0",
+    });
+    for path in [&path_scope.path, &path_scope.path_prefix] {
+        hasher.update(path.as_deref().unwrap_or_default().as_bytes());
+        hasher.update(b"\0");
+    }
     hasher.update(b"\0roles\0");
     if file_roles.is_empty() {
         hasher.update(b"all\0");
@@ -1470,6 +1554,34 @@ fn decode_exhaustive_cursor(
     })
 }
 
+/// Shared membership predicate for the count, cursor admission, and page.
+/// An empty FTS query is used only for explicit path-only lookup.
+fn exhaustive_from(query: &str, path_scope: &PathScope) -> String {
+    let (fts_join, text_filter) = if query.is_empty() {
+        ("", "1")
+    } else {
+        (
+            "JOIN chunks_fts ON chunk.id=chunks_fts.rowid",
+            "chunks_fts MATCH ?1",
+        )
+    };
+    let path_filter = path_scope.sql("file.path", 8);
+    format!(
+        "FROM chunks chunk
+         JOIN files file ON file.id=chunk.file_id
+         {fts_join}
+         LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
+         WHERE {text_filter}
+           AND file.corpus='code'
+           AND ((?2 AND file.origin='repository')
+             OR (?3 AND file.origin='workspace')
+             OR (?4 AND file.origin='dependency'))
+           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
+           AND file.format IN (SELECT value FROM json_each(?7))
+           AND {path_filter}"
+    )
+}
+
 fn exhaustive_cursor_position(
     conn: &Connection,
     fts_query: &str,
@@ -1477,34 +1589,31 @@ fn exhaustive_cursor_position(
     file_roles: &[String],
     file_origins: &[String],
     file_formats: &[String],
+    path_scope: &PathScope,
 ) -> Result<i64> {
     let flags = origin_flags(file_origins);
     let roles_json = serde_json::to_string(file_roles)?;
     let eligible_formats =
         format_allowlist_json(file_formats, crate::formats::Capability::CodeLexical)?;
+    let from = exhaustive_from(fts_query, path_scope);
     let (chunk_id, matches): (Option<i64>, i64) = conn.query_row(
-        "SELECT MIN(chunk.id), COUNT(*)
-             FROM chunks_fts
-             JOIN chunks chunk ON chunk.id=chunks_fts.rowid
-             JOIN files file ON file.id=chunk.file_id
-             WHERE chunks_fts MATCH ?1
-               AND file.path=?2 AND chunk.start=?3 AND chunk.hash=?4
-               AND ((?5 AND file.origin='repository')
-                 OR (?6 AND file.origin='workspace')
-                 OR (?7 AND file.origin='dependency'))
-               AND (?8 OR file.role IN (SELECT value FROM json_each(?9)))
-               AND file.format IN (SELECT value FROM json_each(?10))",
+        &format!(
+            "SELECT MIN(chunk.id), COUNT(*) {from}
+                  AND file.path=?10 AND chunk.start=?11 AND chunk.hash=?12"
+        ),
         rusqlite::params![
             fts_query,
-            position.path,
-            position.start,
-            position.hash,
             flags.0,
             flags.1,
             flags.2,
             file_roles.is_empty(),
             roles_json,
             eligible_formats,
+            path_scope.path.as_deref(),
+            path_scope.path_prefix.as_deref(),
+            position.path,
+            position.start,
+            position.hash,
         ],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1522,12 +1631,20 @@ fn exhaustive_hits(
     cursor: Option<&str>,
 ) -> Result<(Vec<Hit>, ExhaustivePageState)> {
     let (file_roles, file_formats, scope) = exhaustive_scope(options);
-    let request_fingerprint =
-        exhaustive_request_fingerprint(q, &file_roles, &scope.origins, &file_formats);
-    let query = exhaustive_fts_query(q);
+    let mode = options.match_mode.unwrap_or_default();
+    let request_fingerprint = exhaustive_request_fingerprint(
+        q,
+        &file_roles,
+        &scope.origins,
+        &file_formats,
+        mode,
+        &options.path_scope,
+    );
+    let query = exhaustive_fts_query(q, mode);
+    let path_only = q.trim().is_empty();
     let cursor_position = if let Some(cursor) = cursor {
         let position = decode_exhaustive_cursor(cursor, snapshot, &request_fingerprint)?;
-        if query.is_empty() {
+        if query.is_empty() && !path_only {
             anyhow::bail!("exhaustive search cursor does not identify a matching chunk in scope");
         }
         let chunk_id = exhaustive_cursor_position(
@@ -1537,15 +1654,17 @@ fn exhaustive_hits(
             &file_roles,
             &scope.origins,
             &file_formats,
+            &options.path_scope,
         )?;
         Some((position.path, position.start, chunk_id))
     } else {
         None
     };
-    if query.is_empty() {
+    if query.is_empty() && !path_only {
         return Ok((
             Vec::new(),
             ExhaustivePageState {
+                confirmation_required: false,
                 total_chunks: 0,
                 selected_positions: Vec::new(),
                 has_more: false,
@@ -1559,17 +1678,9 @@ fn exhaustive_hits(
     let roles_json = serde_json::to_string(&file_roles)?;
     let eligible_formats =
         format_allowlist_json(&file_formats, crate::formats::Capability::CodeLexical)?;
+    let from = exhaustive_from(&query, &options.path_scope);
     let total: i64 = conn.query_row(
-        "SELECT count(*)
-         FROM chunks_fts
-         JOIN chunks chunk ON chunk.id=chunks_fts.rowid
-         JOIN files file ON file.id=chunk.file_id
-         WHERE chunks_fts MATCH ?1
-           AND ((?2 AND file.origin='repository')
-             OR (?3 AND file.origin='workspace')
-             OR (?4 AND file.origin='dependency'))
-           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
-           AND file.format IN (SELECT value FROM json_each(?7))",
+        &format!("SELECT count(*) {from}"),
         rusqlite::params![
             query,
             flags.0,
@@ -1578,34 +1689,42 @@ fn exhaustive_hits(
             file_roles.is_empty(),
             &roles_json,
             &eligible_formats,
+            options.path_scope.path.as_deref(),
+            options.path_scope.path_prefix.as_deref(),
         ],
         |row| row.get(0),
     )?;
     let total_chunks = usize::try_from(total)
         .map_err(|_| anyhow::anyhow!("exhaustive search match count exceeded this platform"))?;
+    if !options.allow_broad
+        && !exhaustive_warnings(q, total_chunks, cursor.is_none(), mode).is_empty()
+    {
+        return Ok((
+            Vec::new(),
+            ExhaustivePageState {
+                confirmation_required: true,
+                total_chunks,
+                selected_positions: Vec::new(),
+                has_more: true,
+                request_fingerprint,
+                scope,
+            },
+        ));
+    }
 
     let cursor_path = cursor_position.as_ref().map(|position| position.0.as_str());
     let cursor_start = cursor_position.as_ref().map_or(0, |position| position.1);
     let cursor_chunk_id = cursor_position.as_ref().map_or(0, |position| position.2);
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT chunk.id, file.path, chunk.start, chunk.hash,
                 file.role, file.origin, chunk.kind, chunk.name,
                 chunk.start_line, chunk.end_line, policy.effective_role,
                 chunk.content, file.format
-         FROM chunks_fts
-         JOIN chunks chunk ON chunk.id=chunks_fts.rowid
-         JOIN files file ON file.id=chunk.file_id
-         LEFT JOIN repository_file_policy policy ON policy.file_id=file.id
-         WHERE chunks_fts MATCH ?1
-           AND ((?2 AND file.origin='repository')
-             OR (?3 AND file.origin='workspace')
-             OR (?4 AND file.origin='dependency'))
-           AND (?5 OR file.role IN (SELECT value FROM json_each(?6)))
-           AND file.format IN (SELECT value FROM json_each(?7))
-           AND (?8 IS NULL OR (file.path,chunk.start,chunk.id)>(?8,?9,?10))
+         {from}
+           AND (?10 IS NULL OR (file.path,chunk.start,chunk.id)>(?10,?11,?12))
          ORDER BY file.path,chunk.start,chunk.id
-         LIMIT ?11",
-    )?;
+         LIMIT ?13",
+    ))?;
     let rows = statement.query_map(
         rusqlite::params![
             query,
@@ -1615,6 +1734,8 @@ fn exhaustive_hits(
             file_roles.is_empty(),
             &roles_json,
             &eligible_formats,
+            options.path_scope.path.as_deref(),
+            options.path_scope.path_prefix.as_deref(),
             cursor_path,
             cursor_start,
             cursor_chunk_id,
@@ -1644,7 +1765,11 @@ fn exhaustive_hits(
     let has_more = selected.len() > options.limit;
     selected.truncate(options.limit);
 
-    let (mut highlighted, start_marker) = exhaustive_highlights(conn, &query, &selected)?;
+    let (mut highlighted, start_marker) = if path_only {
+        (HashMap::new(), String::new())
+    } else {
+        exhaustive_highlights(conn, &query, &selected)?
+    };
     let mut anchors = project_exhaustive_anchors(conn, &selected)?;
     let mut hits = Vec::with_capacity(selected.len());
     let mut selected_positions = Vec::with_capacity(selected.len());
@@ -1652,11 +1777,18 @@ fn exhaustive_hits(
         let structurally_eligible =
             crate::formats::by_id(&row.format).is_some_and(|format| format.structural_eligible());
         let file_anchor = structurally_eligible.then(|| format!("file:{}", row.position.path));
-        let highlighted_content = highlighted
-            .remove(&row.chunk_id)
-            .ok_or_else(|| anyhow::anyhow!("missing exhaustive highlight for selected chunk"))?;
-        let match_lines =
-            exhaustive_match_lines(&highlighted_content, row.start_line, &start_marker);
+        let match_lines = if path_only {
+            None
+        } else {
+            let highlighted_content = highlighted.remove(&row.chunk_id).ok_or_else(|| {
+                anyhow::anyhow!("missing exhaustive highlight for selected chunk")
+            })?;
+            Some(exhaustive_match_lines(
+                &highlighted_content,
+                row.start_line,
+                &start_marker,
+            ))
+        };
         let projected_anchors = anchors.remove(&row.chunk_id).unwrap_or_default();
         hits.push(Hit {
             chunk_id: row.chunk_id,
@@ -1671,7 +1803,7 @@ fn exhaustive_hits(
             score: 0.0,
             match_reason: MatchReason::Lexical,
             matched_identifiers: Vec::new(),
-            match_lines: Some(match_lines),
+            match_lines,
             snippet: String::new(),
             snippet_line: None,
             snippet_truncated: false,
@@ -1685,6 +1817,7 @@ fn exhaustive_hits(
     Ok((
         hits,
         ExhaustivePageState {
+            confirmation_required: false,
             total_chunks,
             selected_positions,
             has_more,
@@ -1808,6 +1941,13 @@ pub fn search(
     q: &str,
     options: &SearchOptions,
 ) -> Result<SearchResult> {
+    let mut normalized_options = options.clone();
+    normalized_options.path_scope = options.path_scope.normalized()?;
+    let options = &normalized_options;
+    let path_only = q.trim().is_empty();
+    if path_only && options.path_scope.is_empty() {
+        anyhow::bail!("search requires a query or a path/path_prefix scope");
+    }
     file_role::validate_all(&options.file_roles)?;
     file_role::validate_all(&options.expansion.file_roles)?;
     origin::validate_all(&options.file_origins)?;
@@ -1827,14 +1967,24 @@ pub fn search(
         anyhow::bail!("memory limit must be between 1 and 100");
     }
     let exhaustive_cursor = match &options.mode {
-        SearchMode::Ranked => None,
+        SearchMode::Ranked => {
+            if options.match_mode.is_some() || options.allow_broad {
+                anyhow::bail!("match_mode and allow_broad require exhaustive search");
+            }
+            None
+        }
         SearchMode::Exhaustive { cursor } => {
             if options.limit == 0 || options.limit > MAX_EXHAUSTIVE_PAGE_SIZE {
                 anyhow::bail!(
                     "exhaustive search page size must be between 1 and {MAX_EXHAUSTIVE_PAGE_SIZE}"
                 );
             }
-            if provider.is_some() || options.rerank || options.expand || options.include_memory {
+            if !path_only
+                && (provider.is_some()
+                    || options.rerank
+                    || options.expand
+                    || options.include_memory)
+            {
                 anyhow::bail!(
                     "exhaustive search requires vector, rerank, expand, and include_memory to be disabled"
                 );
@@ -1849,12 +1999,18 @@ pub fn search(
             if matches!(&options.mode, SearchMode::Exhaustive { .. }) {
                 let (hits, state) = exhaustive_hits(conn, q, options, snapshot, exhaustive_cursor)?;
                 (hits, RetrievalStatus::vector_disabled(), Some(state))
+            } else if path_only {
+                (
+                    path_lookup_hits(conn, options)?,
+                    RetrievalStatus::vector_disabled(),
+                    None,
+                )
             } else {
                 let (hits, retrieval) = ranked_hits(conn, provider, q, options)?;
                 (hits, retrieval, None)
             };
         let (semantic_artifacts, semantic_retrieval, semantic_attachment, semantic_candidates) =
-            if options.include_memory {
+            if options.include_memory && !path_only {
                 let candidate_limit = options.memory_limit.saturating_mul(8).clamp(1, 100);
                 let (artifacts, retrieval, candidates) =
                     semantic::search_with_provider(conn, provider, q, candidate_limit)?;
@@ -1873,19 +2029,25 @@ pub fn search(
                 (Vec::new(), None, None, 0)
             };
         let semantic_selected = semantic_artifacts.len();
-        let expansion = options
-            .expand
+        let expansion = (options.expand && !path_only)
             .then(|| expand_hits(conn, snapshot, &hits, &options.expansion, options.compact))
             .transpose()?;
         let exhaustive = exhaustive_state
             .as_ref()
             .map(|state| ExhaustiveSearchMetadata {
+                confirmation_required: state.confirmation_required,
                 total_chunks: state.total_chunks,
                 returned: hits.len(),
                 truncated: state.has_more,
                 next_cursor: None,
-                warnings: exhaustive_warnings(q, state.total_chunks, exhaustive_cursor.is_none()),
+                warnings: exhaustive_warnings(
+                    q,
+                    state.total_chunks,
+                    exhaustive_cursor.is_none(),
+                    options.match_mode.unwrap_or_default(),
+                ),
                 effective: EffectiveSearchPosture {
+                    match_mode: options.match_mode.unwrap_or_default(),
                     vector: false,
                     rerank: false,
                     expand: false,
@@ -1900,6 +2062,11 @@ pub fn search(
         let mut result = SearchResult {
             snapshot: identity.snapshot,
             publication_snapshot: identity.publication_snapshot,
+            path_scope: if matches!(options.mode, SearchMode::Ranked) {
+                options.path_scope.clone()
+            } else {
+                PathScope::default()
+            },
             exhaustive,
             retrieval,
             hits,
@@ -2247,6 +2414,45 @@ fn memory_graph_distances(
     Ok((distances, truncated))
 }
 
+fn path_lookup_hits(conn: &Connection, options: &SearchOptions) -> Result<Vec<Hit>> {
+    let (roles, formats, scope) = exhaustive_scope(options);
+    let flags = origin_flags(&scope.origins);
+    let eligible_formats =
+        format_allowlist_json(&formats, crate::formats::Capability::CodeLexical)?;
+    let from = exhaustive_from("", &options.path_scope);
+    let mut statement = conn.prepare(&format!(
+        "SELECT chunk.id {from} ORDER BY file.path, chunk.start, chunk.id LIMIT ?10"
+    ))?;
+    let ids = statement.query_map(
+        rusqlite::params![
+            "",
+            flags.0,
+            flags.1,
+            flags.2,
+            roles.is_empty(),
+            serde_json::to_string(&roles)?,
+            eligible_formats,
+            options.path_scope.path.as_deref(),
+            options.path_scope.path_prefix.as_deref(),
+            options.limit as i64,
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut hits = Vec::new();
+    for id in ids {
+        let candidate = RankedHitCandidate {
+            chunk_id: id?,
+            score: 0.0,
+            match_reason: MatchReason::Lexical,
+            matched_identifiers: Vec::new(),
+        };
+        if let Some(hit) = load_hit(conn, candidate, "", &scope.origins, &formats)? {
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
+}
+
 fn ranked_hits(
     conn: &Connection,
     provider: Option<&embed::Provider>,
@@ -2262,6 +2468,7 @@ fn ranked_hits(
         &options.file_roles,
         &options.file_origins,
         &options.formats,
+        &options.path_scope,
     )?;
     let t0 = std::time::Instant::now();
     let mut rankings = vec![bm25_ranking(
@@ -2271,6 +2478,7 @@ fn ranked_hits(
         &options.file_roles,
         &options.file_origins,
         &options.formats,
+        &options.path_scope,
     )?];
     let mut retrieval = RetrievalStatus::vector_disabled();
     if timing {
@@ -2287,6 +2495,7 @@ fn ranked_hits(
                 vector_pool,
                 &options.file_origins,
                 &options.formats,
+                &options.path_scope,
             ),
         );
         if timing {

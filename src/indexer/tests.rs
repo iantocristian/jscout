@@ -825,7 +825,12 @@ fn mdx_uses_the_docs_corpus_without_entering_code_surfaces() -> Result<()> {
         assert_eq!(rows, expected, "docs FTS query {query}");
     }
 
-    let docs_hits = docs::store::lexical_search(&conn, "mdxOnlyNeedle", 10)?;
+    let docs_hits = docs::store::lexical_search(
+        &conn,
+        "mdxOnlyNeedle",
+        10,
+        &crate::search_scope::PathScope::default(),
+    )?;
     assert_eq!(docs_hits.len(), 1);
     assert_eq!(docs_hits[0].path, "guide.mdx");
     assert!(
