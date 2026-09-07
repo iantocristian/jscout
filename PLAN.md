@@ -3130,20 +3130,28 @@ Contract:
    must work on a normal repository. Only an explicitly supplied conflicting
    `true` for one of those fields is rejected. The response echoes the
    effective posture: `effective: { vector: false, rerank: false, expand:
-   false, include_memory: false, page_size }`. The cross-encoder runs over the
+   false, include_memory: false, page_size, match_mode }`. The cross-encoder runs over the
    fused pool independently of vector retrieval today, and expansion and
    attached memory change both membership and latency; forcing them off gives
    the response one meaning — the FTS content-column match set for the query
    terms over indexed chunks in the requested scope. The ranked-only `name`,
    `symbols`, and `path` columns cannot create exhaustive hits with no source
-   line. `vector: false` without `exhaustive` keeps today's ranked behaviour.
+   line. `match_mode: "all"` is the exhaustive default: every effective FTS
+   token must occur in the same content chunk, not necessarily on one line or
+   as a phrase. Explicit `match_mode: "any"` selects OR. Ranked textual
+   matching is unchanged, and there is no automatic OR retry after zero AND
+   matches. `match_mode` and `allow_broad` are exhaustive-only arguments.
+   `vector: false` without `exhaustive` keeps today's ranked behaviour.
 2. **Continuation fields.** In exhaustive mode the integer `limit` is the
    page size, bounded by a hard ceiling, and `cursor` carries the opaque
    continuation token from the previous page. There is no `offset`.
 3. **The unit of completeness is the chunk.** Search returns one hit per
    chunk, so the completeness fields are `total_chunks` (every chunk whose
    content matches in scope, counted before paging and before byte shedding),
-   `returned`, `truncated`, and `next_cursor`. An exhaustive hit carries `match_lines`,
+   `returned`, `truncated`, `next_cursor`, and `confirmation_required`. A broad
+   OR request may return the distinct counts-only state defined by G23 below;
+   `returned: 0` in that state does not mean zero matches or completion.
+   An exhaustive text hit carries `match_lines`,
    the unique lines inside the chunk where a query term matches. The claim is
    chunk coverage plus unique matching-line coverage; match multiplicity
    within a line and match spans are not represented, and the contract does
@@ -3152,8 +3160,9 @@ Contract:
    boundaries so later line offsets remain intact, and highlight delimiters
    are selected against the complete page text so source bytes cannot be
    mistaken for match markers.
-4. **Paging.** `next_cursor` is opaque and binds the query, the normalized
-   scope, and the snapshot; continuation against a changed snapshot fails
+4. **Paging.** `next_cursor` is opaque and binds the query, effective match
+   operator, normalized path/role/origin/format scope, and the snapshot;
+   continuation against a changed snapshot fails
    with a snapshot error rather than skipping or duplicating hits. Whenever
    `next_cursor` is returned it differs from the input cursor and resumes at
    the first unrendered hit. Order is deterministic and unranked — path,
@@ -3168,7 +3177,7 @@ Contract:
    carrying the minimum byte size — never an unchanged cursor.
 6. **Scope is echoed as a normalized object, not raw arrays.**
    `scope: { corpus: "indexed_chunks", file_roles: "all" | [...], origins:
-   [...], snapshot }`, because an empty roles filter means every indexed role
+   [...], formats: "all" | [...], path?, path_prefix? }`, because an empty roles filter means every indexed role
    and default origins mean both first-party classes. Completeness is a claim
    about indexed chunks in the echoed scope: ignored, hidden (`.github/`),
    unsupported, and extensionless files are never indexed and are outside it;
@@ -3181,6 +3190,24 @@ Contract:
    thousands of exact-reference lookups.
 8. No regex or pattern occurrence tool until G22 proves insufficient on a
    real completeness question.
+9. **Indexed path scope, shared with ranked code and documentation search.**
+   `path` selects one exact repository-relative file; `path_prefix` selects a
+   directory subtree on a path-component boundary, normalized to one trailing
+   `/`. Both are literal paths, not globs, and intersect when
+   supplied together. They also intersect existing origin, format, and role
+   filters. Scope applies before each lexical, vector, and exact-identifier
+   candidate limit; post-filtering an already limited global ranking is not
+   sufficient. The query may be omitted or empty only with a path filter:
+   path-only lookup emits bounded indexed chunks in deterministic path/start/id
+   order and runs no vector, reranking, freshness, memory, or expansion stages.
+   Its hits have no textual match-line claim. Filters select from the existing
+   index without filesystem traversal, admission changes, or reindexing.
+   Documentation retains its existing selected-file hash verification when
+   delivering source; mismatch falls back to indexed content. An explicitly
+   expanded ranked text search may include separately
+   labeled related context outside the primary result scope. Documentation
+   text search retains its existing OR lexical/hybrid meaning and has neither
+   exhaustive match operators nor the broad-query guard.
 
 Acceptance: a rare identifier (one page, `truncated: false`,
 `returned == total_chunks`); a high-frequency identifier traversed across
@@ -3191,7 +3218,11 @@ and the counts; an explicit `dependency` origin counted and paged; a small
 `response_bytes` producing `truncated: true`, a cursor that resumes at the
 first unrendered hit, and no repeated handoff; a zero-fit budget producing
 the locator degradation or `response_budget_too_small`; a snapshot change
-between pages failing the continuation. Replay the links-iteration
+between pages failing the continuation; AND versus explicit OR membership;
+path filters applied before candidate limits, including scoped vector KNN;
+path-only code and documentation lookup without inference; path-component
+boundaries and literal wildcard characters; cursors rejected after operator
+or path scope changes. Replay the links-iteration
 investigation against a gold set built with `rg -w` over the indexed files in
 the same scope, as unique `(path, line)` values, compared at the
 representation the API returns — chunk plus `match_lines` — not at raw `rg`
@@ -3217,10 +3248,11 @@ after the agent recognized the query was wrong. Correct exhaustive operation
 therefore needs both a completion contract for an intended evidence set and an
 explicit abandonment contract for a mis-specified one.
 
-Skill and MCP guidance plus one profile-correctness fix: Baseline now forces
+The original guidance plus profile-correctness fix forced Baseline's
 configured expansion off, matching its existing forced-off attached-memory
-posture, while still rejecting an explicitly enabled expansion. There are no
-schema, retrieval-ranking, or product-default changes.
+posture, while still rejecting an explicitly enabled expansion. The subsequent
+search-waste amendment changes exhaustive defaults and the broad-OR response
+contract below; ranked textual meaning is unchanged.
 
 1. Routing precedence is explicit. A usable code identifier, exact anchor, or
    file localizes through the Investigation loop first, even when the eventual
@@ -3239,12 +3271,20 @@ schema, retrieval-ranking, or product-default changes.
 4. A computed-dispatch conclusion requires current-source inspection of both
    the selection predicate and the selected subject's metadata, registry key,
    or equivalent identity.
-5. On the first exhaustive page only, core metadata emits `broad_or_query`
-   when tokenization yields at least two distinct effective FTS terms and the
-   scoped match set contains at least 200 chunks. The warning reports terms,
-   `total_chunks`, and a refine-or-abandon message while preserving every
-   result and cursor; no cap is added. MCP telemetry records exhaustive total,
-   returned, truncated, and warning fields on every successful exhaustive page.
+5. An initial exhaustive `match_mode: "any"` request with at least two
+   distinct effective FTS terms and at least 200 scoped matching chunks
+   requires refinement or explicit confirmation before delivering hits.
+   Unless `allow_broad: true` is supplied, the response reports `broad_or_query`,
+   its terms and `total_chunks`, with `returned: 0`, `truncated: true`,
+   `next_cursor: null`, and `confirmation_required: true`. This is not a
+   completed empty result and does not issue a synthetic cursor. Refine the
+   query/scope, or repeat the initial request with `allow_broad: true` to start
+   ordinary paginated retrieval. No result cap is added. Confirmed continuation
+   uses the returned cursor and need not repeat `allow_broad`; that delivery
+   permission is not part of the query fingerprint. The guard runs after the
+   count and before hit materialization. It never fires for `match_mode: "all"`,
+   one effective term, fewer than 200 chunks, or path-only lookup. MCP telemetry
+   retains exhaustive counts and warning fields for guarded and normal responses.
 6. Completeness answers state the scope object and separate convention from
    correctness. Exhaustive cursor traversal, expansion, and artifact detail
    reads stay sequential; independent small lexical queries may run in
@@ -3258,9 +3298,11 @@ Acceptance: the skill ships with the G22 fields; a replay of the
 links-iteration investigation following the skill reaches the
 `rg -w`-listed occurrences and states scope; recorded before and after:
 missed gold chunks, false completeness claims, calls, bytes, and telemetry's
-exact-anchor definition success rate. A `history.cache`-shaped query over at
-least 200 matching chunks warns only on page one and may be abandoned without
-a completeness claim; telemetry retains its exhaustive counts and warning.
+exact-anchor definition success rate. A `history.cache`-shaped query defaults
+to AND. With explicit OR over at least 200 matching chunks, its initial
+unconfirmed response contains counts but no hits/cursor; confirmation restores
+the complete ordinary traversal. Refinement or abandonment makes no
+completeness claim. Telemetry retains the counts and warning in either case.
 Install refuses an existing guide, while update replaces that exact guide and
 leaves unrelated agent-specific copies untouched.
 
@@ -3923,8 +3965,9 @@ narrowed by the skill; per-task activation lives in the caller's prompt.
    ROOT --tier core|full` installs a compact skill — tool table with required and
    optional arguments, two flows (investigate a known identifier; localize a
    fuzzy description), and tips written from the recorded production
-   anti-patterns: abandon a `broad_or_query` page immediately rather than
-   paging to preserve exhaustive semantics, expansion after localization is
+   anti-patterns: refine a `broad_or_query` counts response unless its OR set
+   is intended and explicitly confirmed, never page a mis-specified evidence
+   set to preserve exhaustive semantics, expansion after localization is
    waste, `limit` is not a session ceiling, copy anchors verbatim, do not
    call `repository_overview` when the task already names the code. The
    installer learns real destinations (`.agents/`, `.claude/skills/`,

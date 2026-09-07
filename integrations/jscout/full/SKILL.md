@@ -14,13 +14,13 @@ carries a top-level `snapshot` (that surface's invalidation key) and
 
 | Tool | Required | Optional | Use for |
 |---|---|---|---|
-| `semantic_search` | `query` | `exhaustive`, `cursor`, `limit`, `origins`, `formats`, `file_roles`, `vector`, `rerank`, `expand`, `include_memory`, `response_bytes` | every occurrence of a known identifier (`exhaustive: true`) or a ranked first look |
+| `semantic_search` | `query` or path filter | `path`, `path_prefix`, `exhaustive`, `match_mode`, `allow_broad`, `cursor`, `limit`, `origins`, `formats`, `file_roles`, `vector`, `rerank`, `expand`, `include_memory`, `response_bytes` | exhaustive chunk coverage or a ranked first look |
 | `definition` | `anchor`+`snapshot` or `symbol` | `origins`, `formats`, `source_bytes` | the source of one symbol |
 | `who_uses` | `anchor`+`snapshot` or `symbol` | `origins`, `formats` | callers and blast radius |
 | `calls` | `method` | `receiver`, `args`, `arg_position` | member-call sites and option arguments |
 | `file_outline` | `path` | `origins` | the symbols and spans of one file |
 | `events` | — | `name` | string-keyed emit/listen wiring |
-| `documentation_search` | `query` | `vector`, `require_vector`, `limit` | authored Markdown/MDX — only when the question is about docs or an instruction says to consult them |
+| `documentation_search` | `query` or path filter | `path`, `path_prefix`, `vector`, `require_vector`, `limit` | authored Markdown/MDX — only when asked about docs or told to consult them |
 
 ## Full-profile tools
 
@@ -35,9 +35,12 @@ carries a top-level `snapshot` (that surface's invalidation key) and
 
 ## Flow 1: investigate a known identifier
 
-1. `semantic_search` with `exhaustive: true` and the identifier. Read the first
-   page. If it warns `broad_or_query` or the matches are off, abandon it
-   immediately: refine the identifier or fall back to local text search.
+1. `semantic_search` with `exhaustive: true` and the identifier. Default
+   `match_mode: "all"` requires every token in the same chunk, not a phrase.
+   Use `match_mode: "any"` only for an intentional OR set. At 200 or more
+   matches, multi-token OR first returns `broad_or_query` counts with
+   `confirmation_required: true`, no hits, and no cursor. Refine, or repeat
+   with `allow_broad: true` if that set is intended. Abandon off-target matches.
    Never page merely because `next_cursor` exists.
 2. For a valid traversal, copy `next_cursor` unchanged into `cursor` until
    `truncated: false`; the sum of page-local `returned` must equal
@@ -50,8 +53,9 @@ carries a top-level `snapshot` (that surface's invalidation key) and
 `source_meta.partial: true` means a cached definition fragment, not full coverage.
 Increasing the byte budget cannot restore missing source.
 
-Scope transfer: while paging, keep the original `query` and any explicit
-`origins`, `formats`, and `file_roles` unchanged, or the cursor is rejected.
+Scope transfer: while paging, preserve the query, effective `match_mode`,
+`path`, `path_prefix`, `origins`, `formats`, and `file_roles`, or the cursor is
+rejected. A confirmed continuation need not repeat `allow_broad`.
 Carry explicitly supplied `origins` and `formats` into `definition` and
 `who_uses`; if the search omitted them, keep them omitted, and never build
 them from the echoed `scope`.
@@ -61,6 +65,16 @@ them from the echoed `scope`.
 One ranked `semantic_search` (`vector: true`, `expand: false`,
 `include_memory: false`); the useful hits are the first few. Then run Flow 1
 on the identifiers it surfaced.
+
+Both search tools accept literal repo-relative `path` for one file and
+`path_prefix` for a directory subtree (`src/app/` excludes `src/apple`).
+Filters intersect and apply before candidate limits. Use
+`{query: "cache", path_prefix: "src", exhaustive: true}` to narrow code;
+`documentation_search({path: "README.md"})` returns bounded indexed chunks
+without a text query or inference. Path-only lookup runs no memory or expansion.
+Explicit ranked text expansion may return separately labeled related context
+outside the primary path scope. Docs textual ranking is unchanged; exhaustive
+`match_mode` and `allow_broad` belong only to code search.
 
 ## Flow 3: inquiry, only when a causal or cross-file question remains
 

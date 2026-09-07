@@ -573,13 +573,13 @@ fn render_tool_result(
 const BASELINE_SERVER_INSTRUCTIONS: &str = concat!(
     "jscout indexes this repository's code and documentation. Before the first repository search, read the installed jscout skill at .agents/skills/jscout/SKILL.md (or the .claude or .codex equivalent; `jscout agent-guide --tier core` prints the guide) and follow its flows; it is the usage contract for these tools. ",
     "Every successful response that observes one atomic index publication reports its plane digest as snapshot and the canonical indexed publication identity as publication_snapshot; only snapshot is an invalidation key. ",
-    "Mechanical contracts: continue an exhaustive search only by copying the returned next_cursor unchanged until truncated=false, and retry a response_budget_too_small error with minimum_bytes=N on the same page and cursor with response_bytes=N."
+    "Mechanical contracts: if confirmation_required=true, refine or retry with allow_broad=true. Otherwise continue exhaustive search with next_cursor unchanged until truncated=false. Retry response_budget_too_small with minimum_bytes=N on the same page and cursor with response_bytes=N."
 );
 
 const STRUCTURAL_SERVER_INSTRUCTIONS: &str = concat!(
     "jscout indexes this repository's code and documentation and keeps evidence-backed semantic memory for it. Before the first repository search, read the installed jscout skill at .agents/skills/jscout/SKILL.md (or the .claude or .codex equivalent; `jscout agent-guide --tier full` prints the guide) and follow its flows; it is the usage contract for these tools. ",
     "Every successful response that observes one atomic index publication reports its plane digest as snapshot and the canonical indexed publication identity as publication_snapshot; only snapshot is an invalidation key. ",
-    "Mechanical contracts: continue an exhaustive search only by copying the returned next_cursor unchanged until truncated=false, and retry a response_budget_too_small error with minimum_bytes=N on the same page and cursor with response_bytes=N."
+    "Mechanical contracts: if confirmation_required=true, refine or retry with allow_broad=true. Otherwise continue exhaustive search with next_cursor unchanged until truncated=false. Retry response_budget_too_small with minimum_bytes=N on the same page and cursor with response_bytes=N."
 );
 
 /// Identity, a directive pointer to the installed skill, and the mechanical
@@ -600,10 +600,14 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Natural language and/or identifiers" },
+                    "query": { "type": "string", "description": "Natural language and/or identifiers; omit for a path-only lookup" },
+                    "path": { "type": "string", "minLength": 1, "description": "Exact repo-relative file; primary candidates only" },
+                    "path_prefix": { "type": "string", "minLength": 1, "description": "Literal repo-relative directory; intersects other scopes" },
                     "exhaustive": { "type": "boolean", "default": false, "description": "Traverse the complete match set in deterministic pages; disables vector, rerank, expansion, and memory" },
                     "limit": { "type": "integer", "minimum": 1, "description": "Ranked hit limit, or exhaustive page size (max 200)" },
                     "cursor": { "type": "string", "description": "Opaque continuation token returned by a previous exhaustive page; valid only with exhaustive=true" },
+                    "match_mode": { "type": "string", "enum": ["all", "any"], "description": "Exhaustive only: all terms in one chunk (default), or any term (OR)" },
+                    "allow_broad": { "type": "boolean", "default": false, "description": "Exhaustive only: confirm hits after confirmation_required" },
                     "file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Primary-hit role allowlist" },
                     "formats": { "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["javascript", "typescript", "rust"] }, "description": "Code-format allowlist; default all registered code formats" },
                     "origins": { "type": "array", "items": { "type": "string", "enum": ["repository", "workspace", "dependency"] }, "description": "Origin allowlist; dependency needs explicit inclusion" },
@@ -626,7 +630,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "expand_min_confidence": { "type": "string", "enum": ["certain", "likely", "possible"] },
                     "expand_file_roles": { "type": "array", "items": { "type": "string", "enum": ["production", "test", "fixture", "generated", "documentation", "unknown"] }, "description": "Expansion role allowlist; [] includes all roles" }
                 },
-                "required": ["query"]
+                "anyOf": [{ "required": ["query"] }, { "required": ["path"] }, { "required": ["path_prefix"] }]
             }
         },
         {
@@ -635,7 +639,9 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Natural-language, heading, path, or identifier query" },
+                    "query": { "type": "string", "description": "Natural-language, heading, or identifier query; omit for a path-only lookup" },
+                    "path": { "type": "string", "minLength": 1, "description": "Exact repo-relative documentation file" },
+                    "path_prefix": { "type": "string", "minLength": 1, "description": "Literal repo-relative directory; intersects path" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum returned documentation chunks" },
                     "vector": { "type": "boolean", "description": "Use ready documentation vectors" },
                     "require_vector": { "type": "boolean", "default": false, "description": "Fail instead of degrading to BM25 when vector retrieval is unavailable" },
@@ -643,7 +649,7 @@ fn tool_defs(profile: ToolProfile, docs_enabled: bool) -> Value {
                     "response_bytes": { "type": "integer", "minimum": 256, "description": "Maximum response bytes" },
                     "debug": { "type": "boolean", "default": false, "description": "Full diagnostic JSON" }
                 },
-                "required": ["query"],
+                "anyOf": [{ "required": ["query"] }, { "required": ["path"] }, { "required": ["path_prefix"] }],
                 "additionalProperties": false
             }
         },
@@ -1027,7 +1033,21 @@ fn search_options_from_args(
     defaults: &config::SearchSettings,
 ) -> Result<(bool, search::SearchOptions)> {
     let formats = code_formats(args)?;
+    let path_scope = search_path_scope(args)?;
+    let query = optional_string(args, "query")?.unwrap_or("");
+    let path_only = query.trim().is_empty() && !path_scope.is_empty();
     let exhaustive = args["exhaustive"].as_bool().unwrap_or(false);
+    let match_mode = optional_string(args, "match_mode")?
+        .map(search::MatchMode::parse)
+        .transpose()?;
+    let allow_broad = match args.get("allow_broad") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => anyhow::bail!("allow_broad must be a boolean"),
+    };
+    if !exhaustive && (match_mode.is_some() || args.get("allow_broad").is_some()) {
+        anyhow::bail!("match_mode and allow_broad require exhaustive=true");
+    }
     let cursor = match args.get("cursor") {
         None => None,
         Some(Value::String(cursor)) => Some(cursor.clone()),
@@ -1049,7 +1069,7 @@ fn search_options_from_args(
     {
         anyhow::bail!("structural expansion is unavailable in the baseline MCP profile");
     }
-    let expand = if exhaustive || profile == ToolProfile::Baseline {
+    let expand = if exhaustive || path_only || profile == ToolProfile::Baseline {
         false
     } else {
         args["expand"]
@@ -1062,7 +1082,7 @@ fn search_options_from_args(
     } else {
         defaults.origins.clone()
     };
-    let use_vector = if exhaustive {
+    let use_vector = if exhaustive || path_only {
         false
     } else {
         args["vector"].as_bool().unwrap_or(defaults.vector)
@@ -1070,6 +1090,9 @@ fn search_options_from_args(
     Ok((
         use_vector,
         search::SearchOptions {
+            path_scope,
+            match_mode,
+            allow_broad,
             mode: if exhaustive {
                 search::SearchMode::Exhaustive { cursor }
             } else {
@@ -1091,6 +1114,7 @@ fn search_options_from_args(
             formats,
             file_origins: file_origins.clone(),
             include_memory: !exhaustive
+                && !path_only
                 && profile == ToolProfile::Structural
                 && args["include_memory"]
                     .as_bool()
@@ -1105,7 +1129,9 @@ fn search_options_from_args(
                 .as_u64()
                 .unwrap_or(defaults.memory_nodes as u64)
                 as usize,
-            rerank: !exhaustive && args["rerank"].as_bool().unwrap_or(defaults.rerank),
+            rerank: !exhaustive
+                && !path_only
+                && args["rerank"].as_bool().unwrap_or(defaults.rerank),
             reranker: None,
             timing: false,
             compact: !debug,
@@ -1220,7 +1246,7 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
     let search_defaults = context.search_defaults;
     match name {
         "semantic_search" => {
-            let q = args["query"].as_str().unwrap_or("");
+            let q = optional_string(args, "query")?.unwrap_or("");
             let debug = args["debug"].as_bool().unwrap_or(false);
             let (use_vector, mut options) =
                 search_options_from_args(profile, args, search_defaults)?;
@@ -1290,6 +1316,12 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
             }
         }
         "documentation_search" => {
+            for field in ["match_mode", "allow_broad"] {
+                anyhow::ensure!(
+                    args.get(field).is_none(),
+                    "`{field}` is only supported by exhaustive semantic_search"
+                );
+            }
             let defaults = context.docs_defaults.context(
                 "documentation_search is unavailable without documentation retrieval configuration",
             )?;
@@ -1297,20 +1329,24 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
                 defaults.enabled,
                 "documentation_search is disabled by repository configuration"
             );
-            let q = args["query"].as_str().unwrap_or("");
+            let q = optional_string(args, "query")?.unwrap_or("");
+            let path_scope = search_path_scope(args)?;
+            let path_only = q.trim().is_empty() && !path_scope.is_empty();
             let require_vector = args["require_vector"].as_bool().unwrap_or(false);
             let configured_vector = args["vector"].as_bool().unwrap_or(defaults.search.vector);
             if require_vector && args["vector"].as_bool() == Some(false) {
                 anyhow::bail!("documentation vector retrieval cannot be required and disabled");
             }
-            let use_vector = require_vector || configured_vector;
-            let use_reranker = args["rerank"].as_bool().unwrap_or(defaults.search.rerank);
+            let use_vector = !path_only && (require_vector || configured_vector);
+            let use_reranker =
+                !path_only && args["rerank"].as_bool().unwrap_or(defaults.search.rerank);
             let result = docs_retrieval::search(
                 conn,
                 root,
                 if use_vector { provider } else { None },
                 q,
                 &docs_retrieval::SearchOptions {
+                    path_scope,
                     limit: args["limit"]
                         .as_u64()
                         .unwrap_or(defaults.search.limit as u64)
@@ -1325,7 +1361,7 @@ fn call_tool_inner(context: &ToolContext<'_>, name: &str, args: &Value) -> Resul
                         docs_retrieval::SearchOutput::Compact
                     },
                     vector: use_vector,
-                    vector_required: require_vector,
+                    vector_required: require_vector && !path_only,
                     rerank: use_reranker,
                     freshness: defaults.search.freshness,
                     max_rank_movement: defaults.search.max_rank_movement,
@@ -1836,6 +1872,21 @@ fn visible_symbol_resolution(
     resolution.filter(|resolution| !resolution.is_exact_current())
 }
 
+fn optional_string<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => anyhow::bail!("`{key}` must be a string"),
+    }
+}
+
+fn search_path_scope(args: &Value) -> Result<crate::search_scope::PathScope> {
+    crate::search_scope::PathScope::new(
+        optional_string(args, "path")?.map(str::to_owned),
+        optional_string(args, "path_prefix")?.map(str::to_owned),
+    )
+}
+
 fn json_string_array(args: &Value, key: &str) -> Vec<String> {
     args[key]
         .as_array()
@@ -2040,6 +2091,7 @@ struct ToolCallTelemetry<'a> {
 
 #[derive(Debug, Default, PartialEq)]
 struct ExhaustiveTelemetryMetrics {
+    confirmation_required: Option<bool>,
     total_chunks: Option<u64>,
     returned: Option<u64>,
     truncated: Option<bool>,
@@ -2055,6 +2107,7 @@ fn exhaustive_telemetry_metrics(result: Option<&Value>) -> ExhaustiveTelemetryMe
         return ExhaustiveTelemetryMetrics::default();
     }
     ExhaustiveTelemetryMetrics {
+        confirmation_required: result.get("confirmation_required").and_then(Value::as_bool),
         total_chunks,
         returned: result.get("returned").and_then(Value::as_u64),
         truncated: result.get("truncated").and_then(Value::as_bool),
@@ -2257,6 +2310,7 @@ fn log_tool_call(telemetry: &mut Option<File>, call: &ToolCallTelemetry<'_>) {
         "retrieval_semantic_vector_action": retrieval_semantic_vector_action,
         "requested_retrieval": requested_retrieval,
         "exhaustive_total_chunks": exhaustive_metrics.total_chunks,
+        "exhaustive_confirmation_required": exhaustive_metrics.confirmation_required,
         "exhaustive_returned": exhaustive_metrics.returned,
         "exhaustive_truncated": exhaustive_metrics.truncated,
         "exhaustive_warnings": exhaustive_metrics.warnings,

@@ -35,6 +35,7 @@ mod rust_lang;
 mod scout;
 mod scouting;
 mod search;
+mod search_scope;
 mod semantic;
 mod semantic_query;
 mod setup;

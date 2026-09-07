@@ -114,6 +114,7 @@ fn compact_search_keeps_localization_and_relation_evidence() -> anyhow::Result<(
     let root = "sym:src/workflow.ts#::start@1";
     let target = "sym:src/workflow.ts#::finish@20";
     let result = SearchResult {
+        path_scope: Default::default(),
         snapshot: "s".repeat(64),
         publication_snapshot: "p".repeat(64),
         exhaustive: None,
@@ -307,6 +308,7 @@ fn ordinary_eight_hit_search_fits_under_four_kibibytes() -> anyhow::Result<()> {
         })
         .collect();
     let result = SearchResult {
+        path_scope: Default::default(),
         snapshot: "s".repeat(64),
         publication_snapshot: "p".repeat(64),
         exhaustive: None,
@@ -332,6 +334,7 @@ fn ordinary_eight_hit_search_fits_under_four_kibibytes() -> anyhow::Result<()> {
 #[test]
 fn search_memory_is_a_small_actionable_preview() -> anyhow::Result<()> {
     let result = SearchResult {
+        path_scope: Default::default(),
         snapshot: "s".repeat(64),
         publication_snapshot: "p".repeat(64),
         exhaustive: None,
@@ -427,6 +430,7 @@ fn annotation_claim_is_visible_in_memory_preview() {
 #[test]
 fn degraded_vector_status_is_visible_without_query_candidates() -> anyhow::Result<()> {
     let result = SearchResult {
+        path_scope: Default::default(),
         snapshot: "s".repeat(64),
         publication_snapshot: "p".repeat(64),
         exhaustive: None,
@@ -469,6 +473,7 @@ fn degraded_vector_status_is_visible_without_query_candidates() -> anyhow::Resul
 #[test]
 fn omitted_memory_keeps_the_follow_up_envelope() -> anyhow::Result<()> {
     let result = SearchResult {
+        path_scope: Default::default(),
         snapshot: "s".repeat(64),
         publication_snapshot: "p".repeat(64),
         exhaustive: None,

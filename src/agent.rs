@@ -189,7 +189,10 @@ mod tests {
     const SHARED_MARKERS: &[&str] = &[
         "`exhaustive: true`",
         "`broad_or_query`",
-        "abandon it",
+        "confirmation_required: true",
+        "allow_broad: true",
+        "match_mode: \"all\"",
+        "path_prefix",
         "Never page merely because `next_cursor` exists",
         "`truncated: false`",
         "`total_chunks`",
@@ -209,8 +212,8 @@ mod tests {
         "prose is never runtime proof",
         "## On instruction",
         "Scope transfer",
-        "or the cursor is rejected",
-        "Carry explicitly supplied `origins` and `formats` into `definition` and",
+        "origins",
+        "formats",
         "from the echoed `scope`",
     ];
 
@@ -228,7 +231,7 @@ mod tests {
             "neighborhood",
             "annotate",
             "entities",
-            "paths",
+            "`paths`",
             "include_memory",
             "`expand",
         ] {

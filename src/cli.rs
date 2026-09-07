@@ -106,8 +106,15 @@ pub(super) enum Command {
     Search {
         /// Repository root (must be indexed)
         root: PathBuf,
-        /// Query: natural language and/or identifiers
-        query: String,
+        /// Natural language and/or identifiers; omit for a path-only lookup
+        #[arg(required_unless_present_any = ["path", "path_prefix"])]
+        query: Option<String>,
+        /// Restrict primary hits to this exact repository-relative file
+        #[arg(long)]
+        path: Option<String>,
+        /// Restrict primary hits to this repository-relative directory
+        #[arg(long)]
+        path_prefix: Option<String>,
         /// Use an index database at this path instead of ROOT/.jscout.db
         #[arg(long)]
         database: Option<PathBuf>,
@@ -120,6 +127,12 @@ pub(super) enum Command {
         /// Opaque continuation token from a previous exhaustive page
         #[arg(long, requires = "exhaustive")]
         cursor: Option<String>,
+        /// Exhaustive terms must all match the same chunk (all), or any may match (any)
+        #[arg(long, value_enum, requires = "exhaustive")]
+        match_mode: Option<crate::search::MatchMode>,
+        /// Confirm delivery of a broad exhaustive OR query instead of counts only
+        #[arg(long, requires = "exhaustive")]
+        allow_broad: bool,
         /// Restrict primary hits to a file role (repeatable)
         #[arg(long = "file-role")]
         file_roles: Vec<String>,
@@ -606,8 +619,15 @@ pub(super) enum DocsCommand {
     Search {
         /// Repository root whose documentation corpus is already indexed
         root: PathBuf,
-        /// Natural-language or identifier query
-        query: String,
+        /// Natural-language or identifier query; omit for a path-only lookup
+        #[arg(required_unless_present_any = ["path", "path_prefix"])]
+        query: Option<String>,
+        /// Restrict hits to this exact repository-relative file
+        #[arg(long)]
+        path: Option<String>,
+        /// Restrict hits to this repository-relative directory
+        #[arg(long)]
+        path_prefix: Option<String>,
         /// Use the main index database at this path instead of the configured path
         #[arg(long)]
         database: Option<PathBuf>,

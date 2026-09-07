@@ -122,6 +122,8 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
         DocsCommand::Search {
             root,
             query,
+            path,
+            path_prefix,
             database,
             limit,
             vector,
@@ -136,8 +138,13 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
         } => {
             ensure_docs_enabled(runtime, "search")?;
             let defaults = &runtime.effective.docs.search;
-            let use_vector = resolve_flag(vector, no_vector || lexical_only, defaults.vector);
-            let use_reranker = resolve_flag(rerank, no_rerank || lexical_only, defaults.rerank);
+            let query = query.as_deref().unwrap_or("");
+            let path_scope = crate::search_scope::PathScope::new(path, path_prefix)?;
+            let path_only = query.trim().is_empty() && !path_scope.is_empty();
+            let use_vector =
+                !path_only && resolve_flag(vector, no_vector || lexical_only, defaults.vector);
+            let use_reranker =
+                !path_only && resolve_flag(rerank, no_rerank || lexical_only, defaults.rerank);
             let provider = if use_vector {
                 match embed::Provider::from_settings(
                     &runtime.effective.embedding,
@@ -170,8 +177,9 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
                 &conn,
                 &root,
                 provider.as_ref(),
-                &query,
+                query,
                 &retrieval::SearchOptions {
+                    path_scope,
                     limit: limit.unwrap_or(defaults.limit),
                     response_bytes: response_bytes.unwrap_or(if debug_json {
                         usize::MAX
@@ -186,7 +194,7 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
                         retrieval::SearchOutput::Human
                     },
                     vector: use_vector,
-                    vector_required: vector,
+                    vector_required: vector && !path_only,
                     rerank: use_reranker,
                     freshness: defaults.freshness && !no_freshness,
                     max_rank_movement: defaults.max_rank_movement,

@@ -44,6 +44,13 @@ jscout docs search /path/to/repo "deployment procedure" --lexical-only
 Keep results current with a separate `jscout watch /path/to/repo` process,
 or rerun `jscout index` after edits. Neither setup nor MCP starts a watcher.
 
+Narrow code or documentation search with `--path FILE` or `--path-prefix DIR`;
+omit the query to browse indexed chunks, e.g.
+`jscout docs search /path/to/repo --path README.md`. Code `--exhaustive`
+defaults to all query terms in the same chunk. Explicit `--match-mode any`
+uses OR; broad OR sets require `--allow-broad` before returning hits.
+See [search scope and paging](docs/commands.md#search-scope-and-exhaustive-results).
+
 npm supports macOS ARM64/x64 and GNU/Linux ARM64/x64 (glibc ≥2.31).
 For source builds, release archives, Node/PATH requirements, authentication
 and upgrades, see [installation](docs/installation.md).
