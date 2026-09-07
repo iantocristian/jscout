@@ -9,6 +9,11 @@ owned-process cleanup and accounting. Historical campaign notes are evidence,
 not interchangeable launch recipes. The runbook distinguishes built-in harness
 checks from the additional operator/supervisor gates still required.
 
+Reuse its verified setup; record any new operational lookup there before
+finishing. When an authorized tool-schema check needs live validation, use the bounded
+[live client check](MATRIX-RUNBOOK.md#live-client-tool-visibility-check-not-a-matrix),
+not another matrix or a `tools/list`-only check.
+
 ## September 7 Next.js search-scope replay
 
 The [query-only product replay](results/next-search-scope-2026-09-07.md) measures
