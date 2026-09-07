@@ -18,6 +18,7 @@ import {
   validateDesignResponse,
   profilePlan,
   promptFor,
+  gradeCommandFor,
   resolveBrowserServerPolicy,
   startBrowserServer,
   validatePreparedDatabaseManifest,
@@ -25,6 +26,37 @@ import {
   scoutPublishedArtifacts,
   countSemanticArtifacts,
 } from "./eval-run-replay.mjs";
+
+test("memory and efficiency instructions are independent treatments", () => {
+  const task = { story: "Fix the reported behavior.", grade_test_command: "hidden-oracle" };
+  const current = promptFor(task, "skill");
+  const memory = promptFor(task, "memory");
+  const efficiency = promptFor(task, "efficiency");
+  const forced = promptFor(task, "forced");
+  assert.ok(memory.includes("use jscout semantic_memory"));
+  assert.ok(memory.includes("verify decisive claims against current"));
+  assert.ok(memory.includes("returns nothing relevant"));
+  assert.ok(!memory.includes("replace redundant repository discovery"));
+  assert.ok(efficiency.includes("replace redundant repository discovery"));
+  assert.ok(efficiency.includes("partial/truncated results, or changed source"));
+  assert.ok(!efficiency.includes("use jscout semantic_memory"));
+  assert.ok(!current.includes("replace redundant repository discovery"));
+  assert.ok(!current.includes("use jscout semantic_memory"));
+  assert.ok(forced.includes("Use jscout exclusively"));
+  for (const prompt of [current, memory, efficiency, forced]) {
+    assert.ok(prompt.includes(task.story));
+    assert.ok(prompt.includes("do not access external network services"));
+    assert.ok(!prompt.includes("hidden-oracle"));
+  }
+});
+
+test("replay honors hidden grading commands without changing the visible prompt", () => {
+  assert.equal(gradeCommandFor({grade_test_command:"task-grade",test_command:"task-visible"}, {grade_test_command:"set-grade"}), "task-grade");
+  assert.equal(gradeCommandFor({test_command:"task-visible"}, {grade_test_command:"set-grade"}), "set-grade");
+  assert.equal(gradeCommandFor({test_command:"task-visible"}, {test_command:"set-visible"}), "task-visible");
+  assert.equal(gradeCommandFor({}, {test_command:"set-visible"}), "set-visible");
+  assert.equal(gradeCommandFor({}), undefined);
+});
 
 test("replay forwards non-secret jscout runtime selectors into the MCP server", () => {
   assert.deepEqual(
@@ -447,6 +479,12 @@ console.log(JSON.stringify({ usage: { input_tokens: 10, output_tokens: 5 } }));
   );
 
   const runDir = path.join(base, "artifacts", "grep-control-replay-fixture-t1");
+  const rawEvents = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim().split("\n");
+  const timings = fs.readFileSync(path.join(runDir, "events.jsonl.timing.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(timings.length, rawEvents.length);
+  assert.deepEqual(timings.map(t => t.line), rawEvents.map((_, i) => i + 1));
+  assert.ok(timings.every(t => Number.isFinite(Date.parse(t.received_at)) && t.elapsed_ms >= 0));
+  assert.ok(timings.every((t, i) => i === 0 || t.elapsed_ms >= timings[i - 1].elapsed_ms));
   const browser = JSON.parse(
     fs.readFileSync(path.join(runDir, "browser-server.json"), "utf8"),
   );
