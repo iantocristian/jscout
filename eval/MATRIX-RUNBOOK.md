@@ -13,6 +13,7 @@ matrix, change product defaults, or authorize additional paid attempts.
 Navigation: [launch gate](#1-the-operating-rule) · [experiment identity](#2-freeze-the-right-experiment) ·
 [permissions](#3-permissions-two-boundaries-not-one) · [setup/config](#4-filesystem-build-and-task-configuration) ·
 [browser/tests](#5-browser-generator-and-native-test-preflight) · [inference/DBs](#6-inference-and-database-reuse) ·
+[live client check](#live-client-tool-visibility-check-not-a-matrix) ·
 [oracle](#7-certify-the-oracle-before-charging-solvers) · [launch](#8-launch-and-observe) ·
 [recovery](#9-recovery-without-corrupting-the-experiment) · [cleanup](#10-cleanup-is-a-completion-gate) ·
 [reporting](#11-report-what-happened-not-what-the-labels-imply) · [incident index](#12-incident-index-and-evidence).
@@ -36,6 +37,23 @@ Do not claim the repository runner automatically enforces the extra campaign
 gates. Do not rerun an old `prepare.mjs`, `run.mjs` or `continue-run.mjs`: they
 contain absolute paths, old readiness names, and one-off recovery assumptions.
 Use their verified mechanisms when preparing a new, reviewed launch record.
+
+### Reuse first; capture every operational lookup
+
+Read this runbook and the relevant harness entry point before reconstructing a
+launch. A new run needs input verification and the relevant preflight, not a new
+search for unchanged Codex/MCP setup. Identify the specific gap first: changed
+client/version, unsupported option, unexpected behavior, or missing procedure.
+If official-documentation lookup is required, keep it scoped to that gap; do not
+treat a mandatory lookup as evidence that the existing procedure was inadequate.
+
+Before finishing work that required an OpenAI documentation lookup, update the
+existing relevant section with the verified command/configuration, gotchas,
+tested version, source link, and evidence. If nothing changed, record a short
+dated confirmation instead. Keep one authoritative procedure, not another
+campaign-specific setup guide. Configuration/preflight checks still apply even
+when no documentation refresh is needed. Do not relaunch paid attempts merely
+to reconfirm a documented recipe.
 
 ### Launch checklist
 
@@ -146,8 +164,10 @@ codex exec --ignore-user-config --ephemeral --skip-git-repo-check
   -c tools.web_search=false
 ```
 
-Let `codexArgs()` construct the actual argv; the block is an audit checklist, not
-a substitute shell invocation. `--ignore-user-config` still uses existing auth;
+For matrices, let `codexArgs()` in [eval-run-replay.mjs](../scripts/eval-run-replay.mjs)
+construct the actual argv; the block is an audit checklist, not a substitute
+shell invocation. The older `eval-run-codex.mjs` hardcodes `read-only`; it is not
+the verified matrix launcher. `--ignore-user-config` still uses existing auth;
 it is not proof that managed requirements, rules, filesystem reads or shared
 caches are isolated. Do not copy credentials or redefine `HOME`/`CODEX_HOME`.
 
@@ -161,6 +181,70 @@ Native preflight must establish `ps` access **before expensive setup**. Spawn a
 disposable owned child and prove observation/teardown with the intended supervisor.
 A missing cleanup log is not evidence of no survivors: the repository helper
 currently treats a failed process listing as an empty list.
+
+### Live client tool-visibility check (not a matrix)
+
+Use this small check when a changed MCP schema needs actual client/model
+validation. `tools/list` and direct server calls do **not** establish that the
+client exposed a tool to its model. This is a separately authorized live-model
+call, not a reason to repeat solvers, scouting, indexing or a whole matrix.
+
+1. Freeze the candidate executable and a closed copy of a compatible existing
+   index using section 6. Use an owned, config-free root and two paths already
+   known to be indexed—one code file, one documentation file. Do not guess that
+   the repository's root `README.md` was admitted. Preserve the database hash.
+2. Use the verified CLI policy above, explicit model/effort, `--json`, and an
+   output-last-message artifact. For this protocol check only, omit the solver
+   output schema and disable shell tools. Pass this additional configuration
+   through CLI `-c` entries, not user/global configuration:
+
+   ```toml
+   features.shell_tool = false
+   mcp_servers.jscout.command = "/absolute/frozen/bin/jscout"
+   mcp_servers.jscout.args = ["mcp", "/absolute/owned/root", "--database", "/absolute/copied.db", "--profile", "core", "--request-log", "/absolute/requests.jsonl", "--telemetry", "/absolute/telemetry.jsonl"]
+   mcp_servers.jscout.required = true
+   mcp_servers.jscout.startup_timeout_sec = 30
+   mcp_servers.jscout.tool_timeout_sec = 30
+   mcp_servers.jscout.enabled_tools = ["semantic_search", "documentation_search"]
+   mcp_servers.jscout.default_tools_approval_mode = "approve"
+   ```
+
+   Replace all paths with owned, absolute paths. Ensure effective
+   `docs.enabled` is true. Leave the server's tool schemas untouched; no adapter
+   or schema rewrite. Retain argv, prompt, client version and both output streams.
+3. Ask the model to make each tool call exactly once with
+   `{"path":"<known indexed file>","limit":1,"response_bytes":4000}`, omitting
+   `query` entirely, not sending an empty string or null. Explicitly scope the
+   prompt to protocol validation: no guide lookup, shell, web, delegation or
+   source investigation. If either tool is absent, report that and stop without
+   simulating a result. Path-only retrieval skips inference; no sidecar is needed.
+4. Launch through the approved native outer supervisor with the nested sandbox
+   intact, stdin closed (`stdio: ["ignore", "pipe", "pipe"]`), and a bounded
+   whole-session deadline. The September 7 check used 180 seconds. Apply the
+   owned-process cleanup rules in section 10 even when the client exits normally.
+5. Require **both** completed `mcp_tool_call` client events: correct server/tool,
+   exact arguments with `query` absent, successful results and at least one hit
+   at the expected path. Corroborate them with `tools/call` request-log records
+   and telemetry `ok: true`; confirm no extra tool/inference activity, exit 0,
+   unchanged DB hashes and no owned survivors. The model's final “PASS” alone is
+   insufficient. Preserve evidence rather than rerunning to regenerate a report.
+
+An intentionally source-less copied index can return cached documentation with
+`source_state: source_mismatch` / `source_detail: missing`; that is not a schema
+failure. Budget errors are also not schema failures. If tools are absent, inspect
+startup, effective configuration and the raw catalogue before blaming a schema;
+compare the previous binary under identical conditions only if further live
+attempts are authorized. A failure on both versions does not isolate the change.
+
+**Verified September 7, 2026:** Codex **0.153.4**, Astra/low, PR #125 product commit
+`409af154` accepted both root-level `anyOf` schemas: code path
+`packages/next/src/server/request/root-params.ts` and docs path
+`apps/docs/README.md` each returned one hit, with `query` absent. No schema change
+or workaround was needed. The official [MCP configuration documentation](https://learn.chatgpt.com/docs/extend/mcp)
+lookup confirmed the existing launch setup; it supplied no new matrix procedure.
+The new evidence was client compatibility with the changed schemas, not a new
+launch mechanism. This proves compatibility for that tested client/version only.
+Raw evidence and exact launch live in the September 7 bundle listed in section 12.
 
 ## 4. Filesystem, build and task configuration
 
@@ -390,6 +474,9 @@ Check all of these before vector writes or timed solvers:
   does not prove the reranker is loaded/usable.
 - Actual `tools/list` and task-independent retrieval through the exact launcher
   and MCP configuration the solver receives; record provider/degradation metrics.
+- For a client/schema visibility concern, the [live client check](#live-client-tool-visibility-check-not-a-matrix)
+  above, not just raw `tools/list`. Do not add another paid probe when existing
+  evidence already covers the same relevant client/schema configuration.
 - Declared warm-up before timed attempts, or explicitly cold timing. Do not warm
   the service during the first measured arm and call that arm equivalent.
 
@@ -744,6 +831,7 @@ each as a new solver failure:
 | Original grade passes `any`-masked declarations | Real consumer typing, loaded strict assertions, lifecycle state | 7 |
 | Archive without Git admits generated code | Initialize synthetic Git before setup/index; hash inventory | 4, 6 |
 | Wrong endpoint only exported to outer shell | Freeze executable MCP launcher and smoke real MCP wiring | 6 |
+| Raw tool catalogue mistaken for model-visible schema acceptance | Check completed live-client calls and corroborating server logs | 3 |
 | Reuse manifest accepted but profile/config stale | Independent closed-DB and full-input readiness gates | 6, 9 |
 | Reporter/audit fails after successful expensive prep | Retry only reporting/read-only verification | 6, 9 |
 | Partial scout publication mistaken for full knowledge | Coverage/freshness/use are explicit measurements | 6, 11 |
@@ -783,6 +871,10 @@ Local historical evidence under `/Users/cristian/git/jscout-replay-runs/`:
 - `next-astra-instructions-2026-09-06.zIALfv/`: `RUN-NOTES.md`,
   `readiness-final.json`, `freeze.json`, launch/amendment/continuation records,
   tasksets, `supplemental/`, final input/typing/definition/treatment audits.
+- `pr125-live-client-2026-09-07.B2JIiT/`: `RESULTS.md`, `launch.json`,
+  `events.jsonl`, `requests.jsonl`, `telemetry.jsonl`, `completion.json`,
+  `verification.json`, and the one-shot runner/verifier; both path-only calls
+  passed without a schema adapter or database change.
 
 Older opening notes may say “not executed” or retain the first timeout; use the
 final status/hash-bearing record and its amendments, not the first paragraph.
