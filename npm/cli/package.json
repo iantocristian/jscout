@@ -1,6 +1,6 @@
 {
   "name": "@jscout/cli",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Fast JavaScript/TypeScript codebase indexer for RAG and agent retrieval, written in Rust on oxc",
   "keywords": [
     "jscout",
@@ -42,9 +42,9 @@
     "typescript": "5.9.3"
   },
   "optionalDependencies": {
-    "@jscout/darwin-arm64": "0.5.1",
-    "@jscout/darwin-x64": "0.5.1",
-    "@jscout/linux-arm64-gnu": "0.5.1",
-    "@jscout/linux-x64-gnu": "0.5.1"
+    "@jscout/darwin-arm64": "0.5.2",
+    "@jscout/darwin-x64": "0.5.2",
+    "@jscout/linux-arm64-gnu": "0.5.2",
+    "@jscout/linux-x64-gnu": "0.5.2"
   }
 }
