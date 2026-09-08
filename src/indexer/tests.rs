@@ -31,6 +31,62 @@ type MarkdownChunkRow = (
     String,
 );
 
+#[test]
+fn progress_counts_processed_files_including_rejections_and_reuse() -> Result<()> {
+    use crate::progress::Event;
+
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("app.ts"), "export const answer = 42;\n")?;
+    fs::write(repo.path().join("invalid.ts"), [0xff])?;
+    fs::write(
+        repo.path().join("README.md"),
+        "# Guide\n\nThe application guide.\n",
+    )?;
+    let conn = store::open(repo.path())?;
+
+    for expected_unchanged in [0, 2] {
+        let (result, events) = crate::progress::capture(|| index_repo(repo.path(), &conn));
+        let outcome = result?;
+        assert_eq!(outcome.unchanged, expected_unchanged);
+        assert_eq!(outcome.rejected, 1);
+        for (phase, total) in [
+            ("processing code files", 2),
+            ("processing documentation files", 1),
+            ("processing dependency files", 0),
+        ] {
+            let start = events
+                .iter()
+                .position(|event| matches!(event, Event::Stage { label, total: Some(count) } if label == phase && *count == total))
+                .unwrap_or_else(|| panic!("missing {phase}: {events:?}"));
+            let processed: usize = events[start + 1..]
+                .iter()
+                .take_while(|event| !matches!(event, Event::Stage { .. }))
+                .filter_map(|event| match event {
+                    Event::Advance(count) => Some(*count),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(processed, total, "{phase}: {events:?}");
+        }
+        let phases = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Stage { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(phases.first(), Some(&"scanning repository"));
+        assert_eq!(phases.last(), Some(&"reconciling repository policy"));
+        assert!(phases.contains(&"validating and committing index publication"));
+    }
+
+    let (result, events) =
+        crate::progress::capture(|| index_repo_with_post_replacement_failure(repo.path(), &conn));
+    assert!(result.is_err());
+    assert!(!events.iter().any(|event| matches!(event, Event::Stage { label, .. } if label == "validating and committing index publication" || label == "reconciling repository policy")));
+    Ok(())
+}
+
 fn git_test_command(root: &std::path::Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git").args(args).current_dir(root).output()?;
     anyhow::ensure!(

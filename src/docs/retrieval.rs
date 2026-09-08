@@ -388,12 +388,15 @@ pub fn embed_current(conn: &Connection, provider: &Provider, batch: usize) -> Re
         batch > 0,
         "documentation embedding batch size must be positive"
     );
+    crate::progress::stage("docs embeddings: validate indexed documents", None);
     crate::store::validate_published_contracts(conn)?;
     let snapshot = Identities::read(conn)?
         .response(Plane::Documentation)
         .snapshot;
+    crate::progress::stage("docs embeddings: resolve provider profile", None);
     let profile_spec = provider.profile_for(CHUNK_FORMAT_VERSION)?;
     let profile_fingerprint = profile_spec.fingerprint.clone();
+    crate::progress::stage("docs embeddings: scan representations and cache", None);
     let documents = embedding_documents(conn)?;
     let embeddable_occurrences = documents.iter().map(|row| row.occurrences).sum();
 
@@ -402,6 +405,10 @@ pub fn embed_current(conn: &Connection, provider: &Provider, batch: usize) -> Re
     let missing_before = missing.len();
     let cached_reused = documents.len().saturating_sub(missing_before);
     let mut embedded = 0usize;
+    crate::progress::stage(
+        format!("docs embeddings: missing representations ({cached_reused} cached)"),
+        Some(missing_before),
+    );
 
     // Stay beneath the local service's request limits even when CLI config is
     // larger; completed batches remain useful content-addressed cache rows.
@@ -455,8 +462,10 @@ pub fn embed_current(conn: &Connection, provider: &Provider, batch: usize) -> Re
             }
         }
         embedded += rows.len();
+        crate::progress::advance(rows.len());
     }
 
+    crate::progress::stage("docs embeddings: materialize and publish occurrences", None);
     let (occurrences_materialized, generation_published, identity) = match profile.as_ref() {
         Some(profile) if !documents.is_empty() => {
             let (count, identity) = materialize_current_generation(conn, &snapshot, profile)?;
@@ -471,6 +480,8 @@ pub fn embed_current(conn: &Connection, provider: &Provider, batch: usize) -> Re
             (0, false, identity)
         }
     };
+    crate::progress::set_total(occurrences_materialized);
+    crate::progress::advance(occurrences_materialized);
 
     Ok(EmbedReport {
         snapshot: identity.snapshot,
@@ -2652,6 +2663,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_embedding_pass_reports_no_provider_work_or_publication() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("README.md"), "# Heading only\n")?;
+        let conn = crate::store::open(root.path())?;
+        crate::indexer::index_repo(root.path(), &conn)?;
+        let provider = test_provider("http://127.0.0.1:1/v1/embeddings".into())?;
+
+        let (report, progress) = crate::progress::capture(|| embed_current(&conn, &provider, 16));
+        let report = report?;
+        assert_eq!(report.missing_before, 0);
+        assert_eq!(report.embedded, 0);
+        assert_eq!(report.cached_reused, 0);
+        assert_eq!(report.occurrences_materialized, 0);
+        assert!(!report.generation_published);
+        assert!(progress.iter().any(|event| matches!(
+            event,
+            crate::progress::Event::Stage { label, total: Some(0) }
+                if label == "docs embeddings: missing representations (0 cached)"
+        )));
+        assert!(!progress.iter().any(|event| matches!(
+            event,
+            crate::progress::Event::Advance(count) if *count > 0
+        )));
+        Ok(())
+    }
+
+    #[test]
     fn provider_batch_failure_keeps_cache_but_never_publishes_partial_readiness() -> Result<()> {
         let root = tempfile::tempdir()?;
         for index in 0..17 {
@@ -2665,8 +2703,30 @@ mod tests {
         let (endpoint, server) = spawn_transient_embedding_failure_server()?;
         let provider = test_provider(endpoint)?;
 
-        let error = embed_current(&conn, &provider, 16).unwrap_err();
+        let (failed, progress) = crate::progress::capture(|| embed_current(&conn, &provider, 16));
+        let error = failed.unwrap_err();
         assert!(error.to_string().contains("unexpected embedding response"));
+        assert!(progress.iter().any(|event| matches!(
+            event,
+            crate::progress::Event::Stage { label, total: Some(17) }
+                if label == "docs embeddings: missing representations (0 cached)"
+        )));
+        assert_eq!(
+            progress
+                .iter()
+                .filter_map(|event| match event {
+                    crate::progress::Event::Advance(count) => Some(*count),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [16],
+            "only the committed batch is reported, never the failed batch"
+        );
+        assert!(!progress.iter().any(|event| matches!(
+            event,
+            crate::progress::Event::Stage { label, .. }
+                if label == "docs embeddings: materialize and publish occurrences"
+        )));
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM embeddings", [], |row| {
                 row.get::<_, i64>(0)
@@ -2688,7 +2748,25 @@ mod tests {
             0
         );
 
-        let recovered = embed_current(&conn, &provider, 16)?;
+        let (recovered, progress) =
+            crate::progress::capture(|| embed_current(&conn, &provider, 16));
+        let recovered = recovered?;
+        assert!(progress.iter().any(|event| matches!(
+            event,
+            crate::progress::Event::Stage { label, total: Some(1) }
+                if label == "docs embeddings: missing representations (16 cached)"
+        )));
+        assert_eq!(
+            progress
+                .iter()
+                .filter_map(|event| match event {
+                    crate::progress::Event::Advance(count) => Some(*count),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [1, 17],
+            "remaining representations and published occurrences use distinct work units"
+        );
         assert_eq!(recovered.cached_reused, 16);
         assert_eq!(recovered.embedded, 1);
         assert_eq!(recovered.occurrences_materialized, 17);
@@ -3097,7 +3175,13 @@ mod tests {
         assert!(initial.generation_published);
         let profile_id = initial.profile_id.context("missing docs profile")?;
 
-        let cached = embed_current(&conn, &provider, 16)?;
+        let (cached, progress) = crate::progress::capture(|| embed_current(&conn, &provider, 16));
+        let cached = cached?;
+        assert!(progress.iter().any(|event| matches!(
+            event,
+            crate::progress::Event::Stage { label, total: Some(0) }
+                if label == "docs embeddings: missing representations (1 cached)"
+        )));
         assert_eq!(
             cached.publication_snapshot,
             crate::publication::current_publication_snapshot(&conn)?

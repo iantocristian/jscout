@@ -698,6 +698,7 @@ impl ProcessGateway {
         admission: DispatchAdmission,
     ) -> Result<CompletionOutcome, GatewayError> {
         let (id, _active) = self.send_complete(request, admission)?;
+        let _progress = crate::progress::request();
         let wire_timeout = timeout + grace;
         let started = match self.receive_for(&id, wire_timeout)? {
             Inbound::Started {
@@ -933,7 +934,17 @@ done"#
         );
         let mut gateway = spawn_with(&body)?;
         assert_eq!(gateway.versions.node, "22.19.0");
-        let outcome = gateway.complete(&complete_request(), Duration::from_secs(5))?;
+        let (outcome, progress) = crate::progress::capture(|| {
+            gateway.complete(&complete_request(), Duration::from_secs(5))
+        });
+        let outcome = outcome?;
+        assert_eq!(
+            progress,
+            [
+                crate::progress::Event::RequestStarted,
+                crate::progress::Event::RequestFinished
+            ]
+        );
         assert_eq!(outcome.started.billing_path, "api");
         assert_eq!(outcome.tool_call.name, "submit");
         assert_eq!(outcome.tool_call.arguments, json!({"ok": true}));

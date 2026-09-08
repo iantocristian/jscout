@@ -824,7 +824,9 @@ fn embed_missing_for_selection_interruptible(
             ..EmbeddingPassReport::default()
         });
     }
+    crate::progress::stage("code embeddings: resolve provider profile", None);
     let profile = provider.profile()?;
+    crate::progress::stage("code embeddings: scan representations and cache", None);
     let mut resolved = existing_profile(conn, &profile)?;
     let resolved_profile_id = resolved.as_ref().map(|profile| profile.id);
     let rows = missing_embedding_documents(
@@ -839,6 +841,10 @@ fn embed_missing_for_selection_interruptible(
     let total = rows.len();
     let cached_reused = eligible.saturating_sub(total);
     let mut done = 0usize;
+    crate::progress::stage(
+        format!("code embeddings: missing representations ({cached_reused} cached)"),
+        Some(total),
+    );
     // The local HTTP boundary accepts at most 500k characters. Sixteen fully
     // expanded 24k-character chunks remain inside that limit and the 4 MiB
     // request-body cap even for multibyte source.
@@ -893,7 +899,7 @@ fn embed_missing_for_selection_interruptible(
             }
         }
         done += batch.len();
-        eprintln!("embedded {done}/{total}");
+        crate::progress::advance(batch.len());
     }
     if should_cancel() {
         return Ok(EmbeddingPassReport {
@@ -904,12 +910,15 @@ fn embed_missing_for_selection_interruptible(
             canceled: true,
         });
     }
+    crate::progress::stage("code embeddings: synchronize vector occurrences", None);
     let occurrences_synced = if let Some(profile) = resolved {
         synchronize_vector_index(conn, &profile, repair)?;
         selected_embedding_occurrence_count(conn, profile.id, file_origins, product_only)?
     } else {
         0
     };
+    crate::progress::set_total(occurrences_synced);
+    crate::progress::advance(occurrences_synced);
     Ok(EmbeddingPassReport {
         embedded: done,
         missing: total,
@@ -955,7 +964,9 @@ pub fn embed_semantic_missing_interruptible(
             ..EmbeddingPassReport::default()
         });
     }
+    crate::progress::stage("semantic embeddings: resolve provider profile", None);
     let profile = provider.profile()?;
+    crate::progress::stage("semantic embeddings: scan representations and cache", None);
     let mut resolved = existing_profile(conn, &profile)?;
     let documents = semantic_embedding_documents(conn)?;
     let rows = missing_semantic_documents(
@@ -971,6 +982,10 @@ pub fn embed_semantic_missing_interruptible(
     let total = rows.len();
     let cached_reused = unique_documents.saturating_sub(total);
     let mut done = 0usize;
+    crate::progress::stage(
+        format!("semantic embeddings: missing representations ({cached_reused} cached)"),
+        Some(total),
+    );
     let request_batch_size = if provider.protocol == Protocol::Local {
         batch_size.min(16)
     } else {
@@ -1022,7 +1037,7 @@ pub fn embed_semantic_missing_interruptible(
             }
         }
         done += batch.len();
-        eprintln!("embedded semantic memory {done}/{total}");
+        crate::progress::advance(batch.len());
     }
     if should_cancel() {
         return Ok(EmbeddingPassReport {
@@ -1033,11 +1048,14 @@ pub fn embed_semantic_missing_interruptible(
             canceled: true,
         });
     }
+    crate::progress::stage("semantic embeddings: synchronize vector occurrences", None);
     let mut occurrences_synced = 0;
     if let Some(profile) = resolved {
         sync_semantic_vector_index(conn, &profile, &documents)?;
         occurrences_synced = documents.len();
     }
+    crate::progress::set_total(occurrences_synced);
+    crate::progress::advance(occurrences_synced);
     Ok(EmbeddingPassReport {
         embedded: done,
         missing: total,

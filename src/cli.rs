@@ -14,6 +14,9 @@ pub(super) struct Cli {
     /// Explicit configuration file; repository commands otherwise use ROOT/.jscout.toml
     #[arg(long, global = true)]
     pub(super) config: Option<PathBuf>,
+    /// Suppress progress on stderr (warnings and errors are still reported)
+    #[arg(long, global = true)]
+    pub(super) no_progress: bool,
     #[command(subcommand)]
     pub(super) command: Command,
 }

@@ -122,6 +122,7 @@ pub(super) fn cmd_search(
     options: search::SearchOptions,
 ) -> Result<()> {
     let conn = open_database_read_only(root, database)?;
+    crate::progress::stage("searching code", None);
     let result = search::search(&conn, provider, query, &options)?;
     if json {
         println!("{}", compact::search_string(&result)?);
@@ -554,6 +555,7 @@ fn cli_who_uses_for_target(
 mod tests;
 
 pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
+    crate::progress::stage("discovering source files", None);
     let inventory = walk::source_inventory(root)?;
     let editions = crate::rust_lang::resolve_editions(
         root,
@@ -569,6 +571,7 @@ pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
         );
     }
     let files = inventory.files;
+    crate::progress::stage("source files processed", Some(files.len()));
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     use std::io::Write;
@@ -577,12 +580,15 @@ pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
         if let Some(f) = filter
             && !rel.to_string_lossy().contains(f)
         {
+            crate::progress::advance(1);
             continue;
         }
         let Ok(source) = std::fs::read_to_string(file) else {
+            crate::progress::advance(1);
             continue;
         };
         let Some(format) = formats::repository_code_for_path(file) else {
+            crate::progress::advance(1);
             continue;
         };
         let chunks = match format.extractor {
@@ -594,7 +600,10 @@ pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
                 crate::rust_lang::extract(rel, &source, editions.edition_for(file))
                     .map(|extraction| extraction.chunks)
             }
-            formats::Extractor::Documentation => continue,
+            formats::Extractor::Documentation => {
+                crate::progress::advance(1);
+                continue;
+            }
         };
         match chunks {
             Ok(chunks) => {
@@ -605,13 +614,16 @@ pub(super) fn cmd_chunks(root: &Path, filter: Option<&str>) -> Result<()> {
             }
             Err(e) => eprintln!("skip {}: {}", rel.display(), e),
         }
+        crate::progress::advance(1);
     }
     Ok(())
 }
 
 pub(super) fn cmd_stats(root: &Path) -> Result<()> {
     let started = std::time::Instant::now();
+    crate::progress::stage("discovering source files", None);
     let files = walk::source_files(root)?;
+    crate::progress::stage("source files processed", Some(files.len()));
     let mut total = stats::FileStats::default();
     let mut parsed_files = 0usize;
     let mut failed: Vec<(PathBuf, String)> = Vec::new();
@@ -623,12 +635,14 @@ pub(super) fn cmd_stats(root: &Path) -> Result<()> {
             .is_some_and(|format| format.structural == formats::StructuralPolicy::EcmaScript)
         {
             non_ecmascript_files += 1;
+            crate::progress::advance(1);
             continue;
         }
         let source = match std::fs::read_to_string(file) {
             Ok(s) => s,
             Err(e) => {
                 failed.push((file.clone(), e.to_string()));
+                crate::progress::advance(1);
                 continue;
             }
         };
@@ -647,6 +661,7 @@ pub(super) fn cmd_stats(root: &Path) -> Result<()> {
             }
             Err(e) => failed.push((file.clone(), e.to_string())),
         }
+        crate::progress::advance(1);
     }
 
     let elapsed = started.elapsed();

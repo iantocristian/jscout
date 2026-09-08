@@ -86,6 +86,7 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
     let mut targets = Vec::new();
     let mut skipped_fresh = Vec::new();
     let mut unsupported_legacy = Vec::new();
+    crate::progress::stage("scout refresh: checking artifacts", Some(ids.len()));
     for id in ids {
         let row = conn.query_row(
             "SELECT run.provider, run.model, run.reasoning, run.config_json,
@@ -121,10 +122,12 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
             .with_context(|| format!("semantic artifact {id} disappeared"))?;
         if artifact.freshness == "fresh" {
             skipped_fresh.push(id);
+            crate::progress::advance(1);
             continue;
         }
         let Some(config) = replay_config(&scout_kind, &config_json) else {
             unsupported_legacy.push(id);
+            crate::progress::advance(1);
             continue;
         };
         targets.push(RefreshTarget {
@@ -134,6 +137,7 @@ pub fn select(conn: &Connection, requested_ids: &[i64]) -> Result<RefreshSelecti
             reasoning,
             config,
         });
+        crate::progress::advance(1);
     }
     Ok(RefreshSelection {
         summary: RefreshSelectionSummary {

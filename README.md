@@ -44,6 +44,10 @@ jscout docs search /path/to/repo "deployment procedure" --lexical-only
 Keep results current with a separate `jscout watch /path/to/repo` process,
 or rerun `jscout index` after edits. Neither setup nor MCP starts a watcher.
 
+Long-running CLI commands, including `scout` and `docs embed`, show progress on
+stderr without changing JSON/JSONL results on stdout. Use `--no-progress` to
+disable it; see [progress and output](docs/commands.md#progress-and-output).
+
 Narrow code or documentation search with `--path FILE` or `--path-prefix DIR`;
 omit the query to browse indexed chunks, e.g.
 `jscout docs search /path/to/repo --path README.md`. Code `--exhaustive`

@@ -549,16 +549,42 @@ fn resumed_fingerprint_drift_resets_and_reruns_all_occurrences() -> Result<()> {
             },
         ],
     )?;
-    let (result, counters) = execute_with_fake(
-        root.path(),
-        &conn,
-        batch_id,
-        project_id,
-        &occurrences,
-        &occurrences[1..],
-        &executable,
-    );
+    let ((result, counters), progress) = crate::progress::capture(|| {
+        execute_with_fake(
+            root.path(),
+            &conn,
+            batch_id,
+            project_id,
+            &occurrences,
+            &occurrences[1..],
+            &executable,
+        )
+    });
     let execution = result?;
+
+    let attempts = progress
+        .iter()
+        .filter_map(|event| match event {
+            crate::progress::Event::Stage { label, total }
+                if label.starts_with("processing checker occurrences") =>
+            {
+                Some(*total)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(attempts, [Some(2), Some(3)]);
+    assert_eq!(
+        progress
+            .iter()
+            .filter(|event| matches!(event, crate::progress::Event::Detail(detail) if detail == "rss=0 MiB heap=0/0 MiB"))
+            .count(),
+        2,
+        "resource measurements belong to suppressible batch progress"
+    );
+    assert!(
+        matches!(progress.last(), Some(crate::progress::Event::Stage { label, .. }) if label == &format!("validating checker project {project_id}"))
+    );
 
     assert!(execution.staging_occurrences_reset > 0);
     assert_eq!(counters.request_batches, 4);
@@ -1544,7 +1570,12 @@ fn empty_filtered_plan_is_a_successful_noop_without_launching_the_checker() -> R
     crate::indexer::index_repo(repo.path(), &conn)?;
     drop(conn);
 
-    let report = enrich(repo.path(), &options())?;
+    let (result, progress) = crate::progress::capture(|| enrich(repo.path(), &options()));
+    let report = result?;
+    assert_eq!(progress.len(), 1);
+    assert!(
+        matches!(&progress[0], crate::progress::Event::Stage { label, .. } if label == "selecting checker occurrences")
+    );
     assert_eq!(report.occurrences_discovered, 1);
     assert_eq!(report.occurrences_eligible, 0);
     assert_eq!(report.occurrences_selected, 0);
