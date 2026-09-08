@@ -615,6 +615,11 @@ pub fn scout_workflow_plan(
     let duplicate_candidate_sets_skipped = plan.duplicate_candidate_sets_skipped;
     let auto_seed_limit_reached = plan.auto_seed_limit_reached;
     let automatic = plan.mode == "automatic";
+    let subjects = plan.items.len() + skipped_unscoutable;
+    crate::progress::stage(
+        "scout workflows: preparing subjects",
+        Some(plan.items.len()),
+    );
     let mut cache = PreparationCache::default();
     let mut prepared = Vec::new();
     let mut skipped_over_budget = Vec::new();
@@ -630,7 +635,10 @@ pub fn scout_workflow_plan(
             }
             Err(error) => return Err(error),
         }
+        crate::progress::advance(1);
     }
+    crate::progress::stage("scout workflows: subjects processed", Some(subjects));
+    crate::progress::advance(skipped_unscoutable + skipped_over_budget.len());
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
@@ -647,6 +655,7 @@ pub fn scout_workflow_plan(
                 !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
             if !reusable && model_calls >= options.policy.max_calls {
                 skipped += 1;
+                crate::progress::advance(1);
                 continue;
             }
             match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
@@ -692,6 +701,7 @@ pub fn scout_workflow_plan(
                     outcomes.next_or_protocol("workflow"),
                 ),
             };
+            crate::progress::advance(1);
             match result {
                 Ok(report) => {
                     if let Some(run_id) = run_id {
@@ -734,6 +744,8 @@ pub fn scout_card_plan(
     let skipped_unselectable = plan.skipped.len();
     let anchor_limit_reached = plan.anchor_limit_reached;
     let skip_subject_failures = plan.mode != "explicit";
+    let subjects = plan.items.len() + skipped_unselectable;
+    crate::progress::stage("scout cards: preparing subjects", Some(plan.items.len()));
     let mut scope_coverage = plan
         .scope_coverage
         .iter()
@@ -771,7 +783,10 @@ pub fn scout_card_plan(
             }
             Err(error) => return Err(error),
         }
+        crate::progress::advance(1);
     }
+    crate::progress::stage("scout cards: subjects processed", Some(subjects));
+    crate::progress::advance(skipped_unselectable + skipped_over_budget.len());
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
@@ -792,6 +807,7 @@ pub fn scout_card_plan(
                 if let Some(coverage) = scope_coverage.get_mut(&selection_scope) {
                     coverage.skipped_call_budget += 1;
                 }
+                crate::progress::advance(1);
                 continue;
             }
             let item = match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
@@ -841,6 +857,7 @@ pub fn scout_card_plan(
                     outcomes.next_or_protocol("card"),
                 ),
             };
+            crate::progress::advance(1);
             let report = match result {
                 Ok(report) => {
                     if let Some(run_id) = run_id {
@@ -905,6 +922,8 @@ pub fn scout_concept_plan(
     ledger::sweep_orphaned_runs(conn, ORPHAN_SWEEP_MINUTES)?;
     let automatic = plan.mode == "automatic";
     let skipped_unscoutable = plan.skipped.len();
+    let subjects = plan.items.len() + skipped_unscoutable;
+    crate::progress::stage("scout concepts: preparing subjects", Some(plan.items.len()));
     let mut cache = PreparationCache::default();
     let mut prepared = Vec::new();
     let mut skipped_over_budget = Vec::new();
@@ -920,8 +939,11 @@ pub fn scout_concept_plan(
             }
             Err(error) => return Err(error),
         }
+        crate::progress::advance(1);
     }
 
+    crate::progress::stage("scout concepts: subjects processed", Some(subjects));
+    crate::progress::advance(skipped_unscoutable + skipped_over_budget.len());
     let mut reports = Vec::new();
     let mut model_calls = 0;
     let mut skipped = 0;
@@ -938,6 +960,7 @@ pub fn scout_concept_plan(
                 !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
             if !reusable && model_calls >= options.policy.max_calls {
                 skipped += 1;
+                crate::progress::advance(1);
                 continue;
             }
             let item = claim_prepared_concept(conn, options, prepared)?;
@@ -972,6 +995,7 @@ pub fn scout_concept_plan(
                     outcomes.next_or_protocol("concept"),
                 ),
             };
+            crate::progress::advance(1);
             match result {
                 Ok(report) => {
                     if let Some(run_id) = run_id {
@@ -1007,6 +1031,7 @@ pub fn dry_run_report(
     plan: &plan::WorkflowPlan,
     options: &WorkflowScoutOptions,
 ) -> Result<serde_json::Value> {
+    crate::progress::stage("scout workflows: dry-run subjects", Some(plan.items.len()));
     let mut annotated = serde_json::to_value(plan)?;
     let mut eligible = 0_usize;
     let mut over_budget = 0_usize;
@@ -1031,6 +1056,7 @@ pub fn dry_run_report(
             rendered["request_bytes"] = request_bytes.into();
             rendered["over_context_bytes"] = over.into();
             rendered["would_call"] = would_call.into();
+            crate::progress::advance(1);
         }
     }
     Ok(serde_json::json!({
@@ -1054,6 +1080,7 @@ pub fn card_dry_run_report(
     plan: &plan::CardPlan,
     options: &CardScoutOptions,
 ) -> Result<serde_json::Value> {
+    crate::progress::stage("scout cards: dry-run subjects", Some(plan.items.len()));
     #[derive(Default, Serialize)]
     struct ScopePreview {
         discovered: usize,
@@ -1104,6 +1131,7 @@ pub fn card_dry_run_report(
             rendered["request_bytes"] = request_bytes.into();
             rendered["over_context_bytes"] = over.into();
             rendered["would_call"] = would_call.into();
+            crate::progress::advance(1);
         }
     }
     Ok(serde_json::json!({
@@ -1129,6 +1157,7 @@ pub fn concept_dry_run_report(
     plan: &plan::ConceptPlan,
     options: &ConceptScoutOptions,
 ) -> Result<serde_json::Value> {
+    crate::progress::stage("scout concepts: dry-run subjects", Some(plan.items.len()));
     let mut annotated = serde_json::to_value(plan)?;
     let mut eligible = 0_usize;
     let mut over_budget = 0_usize;
@@ -1157,6 +1186,7 @@ pub fn concept_dry_run_report(
             rendered["request_bytes"] = request_bytes.into();
             rendered["over_context_bytes"] = over.into();
             rendered["would_call"] = would_call.into();
+            crate::progress::advance(1);
         }
     }
     Ok(serde_json::json!({
@@ -1181,6 +1211,10 @@ pub fn plan_refresh(
     conn: &Connection,
     selection: &refresh::RefreshSelection,
 ) -> Result<RefreshPlanningReport> {
+    crate::progress::stage(
+        "scout refresh: dry-run artifacts",
+        Some(selection.targets.len()),
+    );
     let mut plans = Vec::new();
     let mut skipped_unresolvable = Vec::new();
     for target in &selection.targets {
@@ -1241,6 +1275,7 @@ pub fn plan_refresh(
                 reason: error.to_string(),
             }),
         }
+        crate::progress::advance(1);
     }
     Ok(RefreshPlanningReport {
         plans,
@@ -1283,6 +1318,18 @@ pub fn scout_refresh(
         {
             rank_targets.push(targets.next().expect("peeked refresh target"));
         }
+        let phase = match rank {
+            0 => "workflows/cards",
+            1 => "file summaries",
+            2 => "module summaries",
+            3 => "repository summaries",
+            _ => "concepts",
+        };
+        let subjects = rank_targets.len();
+        crate::progress::stage(
+            format!("scout refresh {phase}: preparing artifacts"),
+            Some(subjects),
+        );
         let mut prepared_rank = Vec::new();
         for target in rank_targets {
             let artifact_id = target.artifact_id;
@@ -1352,7 +1399,13 @@ pub fn scout_refresh(
                 }
                 Err(error) => return Err(error),
             }
+            crate::progress::advance(1);
         }
+        crate::progress::stage(
+            format!("scout refresh {phase}: artifacts processed"),
+            Some(subjects),
+        );
+        crate::progress::advance(subjects - prepared_rank.len());
         let mut pending = VecDeque::from(prepared_rank);
         while !pending.is_empty() {
             let mut scheduled = Vec::new();
@@ -1371,6 +1424,7 @@ pub fn scout_refresh(
                 let reusable = ledger::reusable_run(conn, spec)?.is_some();
                 if !reusable && model_calls >= policy.max_calls {
                     skipped += 1;
+                    crate::progress::advance(1);
                     continue;
                 }
                 let item = claim_prepared_refresh(conn, prepared)?;
@@ -1392,7 +1446,9 @@ pub fn scout_refresh(
                 let outcome = item
                     .calls_model()
                     .then(|| outcomes.next_or_protocol("refresh"));
-                match finish_scheduled_refresh(root, conn, item, outcome) {
+                let result = finish_scheduled_refresh(root, conn, item, outcome);
+                crate::progress::advance(1);
+                match result {
                     Ok(report) => {
                         if let Some(run_id) = run_id {
                             staged_runs.resolve(run_id);
@@ -2715,9 +2771,15 @@ pub fn scout_summaries(
     let mut batch = ScoutBatchReport::default();
     let mut model_calls = 0_usize;
     for level in levels {
+        crate::progress::stage(format!("scout summaries {level}: planning"), None);
         let plan = plan::summaries(root, conn, level, &options.scopes)?;
         let automatic = plan.mode == "automatic";
         batch.skipped_unscoutable += plan.skipped.len();
+        let subjects = plan.items.len() + plan.skipped.len();
+        crate::progress::stage(
+            format!("scout summaries {level}: preparing subjects"),
+            Some(plan.items.len()),
+        );
         let mut prepared_level = Vec::new();
         for item in plan.items {
             let subject = item.scope.clone();
@@ -2730,12 +2792,19 @@ pub fn scout_summaries(
                         subject,
                         reason: error.to_string(),
                     });
+                    crate::progress::advance(1);
                     continue;
                 }
                 Err(error) => return Err(error),
             };
             prepared_level.push(prepared);
+            crate::progress::advance(1);
         }
+        crate::progress::stage(
+            format!("scout summaries {level}: subjects processed"),
+            Some(subjects),
+        );
+        crate::progress::advance(subjects - prepared_level.len());
         let mut pending = VecDeque::from(prepared_level);
         while !pending.is_empty() {
             let mut scheduled = Vec::new();
@@ -2749,6 +2818,7 @@ pub fn scout_summaries(
                     !options.rebuild && ledger::reusable_run(conn, &prepared.spec)?.is_some();
                 if !reusable && model_calls >= options.policy.max_calls {
                     batch.skipped_for_call_budget += 1;
+                    crate::progress::advance(1);
                     continue;
                 }
                 match ledger::claim_run(conn, &prepared.spec, options.rebuild)? {
@@ -2801,6 +2871,7 @@ pub fn scout_summaries(
                         outcomes.next_or_protocol("summary"),
                     ),
                 };
+                crate::progress::advance(1);
                 match result {
                     Ok(report) => {
                         if let Some(run_id) = run_id {
@@ -2841,7 +2912,12 @@ pub fn summary_dry_run_report(
     let mut over_budget = 0_usize;
     let mut rendered_levels = Vec::new();
     for level in levels {
+        crate::progress::stage(format!("scout summaries {level}: planning dry-run"), None);
         let plan = plan::summaries(root, conn, level, &options.scopes)?;
+        crate::progress::stage(
+            format!("scout summaries {level}: dry-run subjects"),
+            Some(plan.items.len()),
+        );
         let mut annotated = serde_json::to_value(&plan)?;
         if let Some(items) = annotated
             .get_mut("items")
@@ -2866,6 +2942,7 @@ pub fn summary_dry_run_report(
                 rendered["request_bytes"] = request_bytes.into();
                 rendered["over_context_bytes"] = over.into();
                 rendered["would_call"] = would_call.into();
+                crate::progress::advance(1);
             }
         }
         rendered_levels.push(annotated);

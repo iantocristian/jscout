@@ -17,7 +17,7 @@ use crate::formats::{self, Capability, Extractor};
 use crate::fs_ops::{FileSystem, OsFileSystem};
 use crate::graph::{self, FileGraph};
 use crate::package_exports::RESOLVE_CONDITIONS;
-use crate::{file_role, io_policy, parse, store};
+use crate::{file_role, io_policy, parse, progress, store};
 
 const DOC_CHUNK_FORMAT_META_KEY: &str = "documentation_chunk_format_version";
 const DOC_PROVENANCE_FORMAT_META_KEY: &str = "documentation_provenance_format_version";
@@ -491,6 +491,13 @@ fn index_repo_impl<F: FileSystem>(
                     .is_some()
                     && attempt < MAX_PROVENANCE_ATTEMPTS =>
             {
+                progress::stage(
+                    format!(
+                        "retrying index capture ({}/{MAX_PROVENANCE_ATTEMPTS})",
+                        attempt + 1
+                    ),
+                    None,
+                );
                 if options.debug {
                     eprintln!(
                         "documentation provenance changed during indexing; retrying immutable capture ({}/{})",
@@ -524,6 +531,7 @@ fn index_repo_attempt<F: FileSystem>(
     checker_retention: CheckerRetention,
     operation: IndexOperation<'_, F>,
 ) -> Result<IndexOutcome> {
+    progress::stage("scanning repository", None);
     let root = root.canonicalize()?;
     // Git state is recorded before the immutable documentation capture only
     // when freshness is opted in. Every blame and final drift check then
@@ -547,6 +555,7 @@ fn index_repo_attempt<F: FileSystem>(
             inventory_started.elapsed()
         );
     }
+    progress::stage("resolving format configuration", None);
     let rust_editions = crate::rust_lang::resolve_editions(
         &root,
         &inventory.files,
@@ -555,10 +564,12 @@ fn index_repo_attempt<F: FileSystem>(
     )?;
     let documentation_provenance = match provenance_repository.as_ref() {
         Some(repository) => {
+            progress::stage("resolving documentation provenance", None);
             provenance_store::resolve_document_provenance(conn, repository, &inventory.documents)?
         }
         None => provenance_store::disabled_document_provenance(&inventory.documents),
     };
+    progress::stage("discovering workspace", None);
     let workspace_discovery =
         crate::workspace::WorkspaceMap::discover_with_fs(&root, &inventory.files, operation.fs)?;
     let workspace = workspace_discovery.map;
@@ -691,6 +702,7 @@ fn index_repo_attempt<F: FileSystem>(
         let mut seen = std::collections::HashSet::new();
         let mut published = std::collections::HashSet::new();
         let mut repository_code_inserted = false;
+        progress::stage("processing code files", Some(inventory.files.len()));
         for file in &inventory.files {
             let rel = display_repository_path(&root, file);
             let format = formats::repository_code_for_path(file).ok_or_else(|| {
@@ -704,7 +716,10 @@ fn index_repo_attempt<F: FileSystem>(
                     seen.insert(rel.clone());
                     source
                 }
-                Err(error) if io_policy::is_inventory_race(&error) => continue,
+                Err(error) if io_policy::is_inventory_race(&error) => {
+                    progress::advance(1);
+                    continue;
+                }
                 Err(error) if io_policy::is_retryable(&error) => {
                     return Err(retryable_read_failure(&rel, error));
                 }
@@ -714,6 +729,7 @@ fn index_repo_attempt<F: FileSystem>(
                         store::delete_file(conn, *old_id)?;
                     }
                     outcome.record_rejection(rel, "read", error);
+                    progress::advance(1);
                     continue;
                 }
             };
@@ -734,6 +750,7 @@ fn index_repo_attempt<F: FileSystem>(
                 }
                 outcome.unchanged += 1;
                 published.insert(rel);
+                progress::advance(1);
                 continue;
             }
             if options.debug {
@@ -775,8 +792,13 @@ fn index_repo_attempt<F: FileSystem>(
                     outcome.record_rejection(rel, "extract", error);
                 }
             }
+            progress::advance(1);
         }
         let documentation_projection_started = std::time::Instant::now();
+        progress::stage(
+            "processing documentation files",
+            Some(inventory.documents.len()),
+        );
         for document in &inventory.documents {
             let rel = document.file.path.clone();
             let provenance = documentation_provenance_by_path
@@ -806,6 +828,7 @@ fn index_repo_attempt<F: FileSystem>(
                     outcome.indexed += 1;
                 }
                 published.insert(rel);
+                progress::advance(1);
                 continue;
             }
             if options.debug {
@@ -828,6 +851,7 @@ fn index_repo_attempt<F: FileSystem>(
             outcome.indexed += 1;
             outcome.chunks += chunks;
             published.insert(rel);
+            progress::advance(1);
         }
         if options.docs_freshness {
             provenance_store::upsert_blame_cache(conn, &documentation_provenance.cache_updates)?;
@@ -865,6 +889,7 @@ fn index_repo_attempt<F: FileSystem>(
         // rows. Reading and parsing the selected corpus inside the outer
         // transaction ensures a transient dependency failure restores the
         // previous canonical rows and publication markers together.
+        progress::stage("planning dependency files", None);
         let discovered =
             dependency::discover(&root, conn, &options.dependencies, &workspace, operation.fs)?;
         let plans =
@@ -917,15 +942,18 @@ fn index_repo_attempt<F: FileSystem>(
         }
 
         if repository_code_inserted || dependency_code_inserted {
+            progress::stage("restoring cached code vectors", None);
             crate::embed::materialize_cached_embeddings(conn)?;
         }
 
+        progress::stage("resolving module edges", None);
         resolve_module_edges(&root, conn, &workspace)?;
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('root', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [root.to_string_lossy()],
         )?;
+        progress::stage("computing publication identities", None);
         let resolution = crate::structural::compute_resolution_hash(conn)?;
         publish_projection_identity(conn, &resolution)?;
         let provenance_digest = provenance_store::compute_documentation_provenance_digest(conn)?;
@@ -944,6 +972,7 @@ fn index_repo_attempt<F: FileSystem>(
         // watch may additionally keep failed predecessors as hidden carry for
         // the following enrichment step. Projection still accepts only the
         // exact current code digest.
+        progress::stage("validating checker publication", None);
         let checker_publication_changed = match checker_retention {
             #[cfg(test)]
             CheckerRetention::Drop => store::clear_checker_batches(conn)?,
@@ -1038,6 +1067,7 @@ fn index_repo_attempt<F: FileSystem>(
                 eprintln!("timing structural-projection=skipped (unchanged)");
             }
         } else {
+            progress::stage("building structural projection", None);
             crate::structural::rebuild_projection_with_timing(
                 conn,
                 &identities.code,
@@ -1050,12 +1080,14 @@ fn index_repo_attempt<F: FileSystem>(
                 );
             }
         }
+        progress::stage("preparing index publication", None);
         identities.publish(conn)?;
         // Documentation readiness is exact-digest state. Rebuild it from the
         // durable shared cache after the new marker exists, but before the outer
         // publication commit. A digest transition must also purge old-contract
         // profiles that current-profile readiness checks intentionally skip.
         // An incomplete cache remains NotReady and never invokes a provider.
+        progress::stage("synchronizing cached documentation vectors", None);
         if outcome.extraction_reset
             || previous.documentation_digest.as_deref() != Some(identities.documentation.as_str())
         {
@@ -1081,6 +1113,7 @@ fn index_repo_attempt<F: FileSystem>(
     })();
     match publication {
         Ok(()) => {
+            progress::stage("validating and committing index publication", None);
             // This is intentionally the last fallible operation before the
             // SQLite commit. A checkout or clone-deepening change during
             // projection must not publish provenance from the earlier state.
@@ -1104,6 +1137,7 @@ fn index_repo_attempt<F: FileSystem>(
             return Err(error);
         }
     }
+    progress::stage("reconciling repository policy", None);
     crate::recon::reconcile_file_policy_after_index(&root, conn);
     Ok(outcome)
 }
@@ -2152,6 +2186,7 @@ fn index_dependency_files(
     instances: &std::collections::BTreeMap<PathBuf, i64>,
     outcome: &mut IndexOutcome,
 ) -> Result<bool> {
+    progress::stage("processing dependency files", Some(prepared.len()));
     conn.execute_batch("SAVEPOINT jscout_dependency_files")?;
     let result = (|| -> Result<bool> {
         let mut inserted_any = false;
@@ -2204,6 +2239,7 @@ fn index_dependency_files(
                 }
                 outcome.unchanged += 1;
                 outcome.dependency_files += 1;
+                progress::advance(1);
                 continue;
             }
             if let Some(old) = existing.get(&file.display) {
@@ -2237,6 +2273,7 @@ fn index_dependency_files(
                 }
                 Err(error) => outcome.record_rejection(file.display.clone(), "extract", error),
             }
+            progress::advance(1);
         }
         for (path, old) in &existing {
             if !seen.contains(path) {

@@ -27,6 +27,7 @@ mod mcp;
 mod origin;
 mod package_exports;
 mod parse;
+mod progress;
 mod publication;
 mod query;
 mod recon;
@@ -58,6 +59,18 @@ use commands::{run_command, run_config_command};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let progress = (!cli.no_progress)
+        .then(|| cli.command.progress_label())
+        .flatten()
+        .and_then(|(label, immediate)| progress::Reporter::start(label, immediate));
+    let result = run(cli);
+    if let Some(progress) = progress {
+        progress.finish(result.is_ok());
+    }
+    result
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Config { command } => run_config_command(command, cli.config.as_deref()),
         command => {

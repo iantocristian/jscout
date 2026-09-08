@@ -14,6 +14,31 @@ use crate::llm::protocol::{CompleteRequest, ModelCapabilities, ProviderSummary, 
 use crate::llm::{CompletionOutcome, CompletionTask, GatewayError, LlmGateway, StartedInfo};
 use crate::{indexer, store};
 
+fn assert_progress_complete(events: &[crate::progress::Event], label: &str, expected: usize) {
+    use crate::progress::Event;
+
+    let start = events
+        .iter()
+        .position(|event| matches!(event, Event::Stage { label: current, .. } if current == label))
+        .unwrap_or_else(|| panic!("missing progress stage {label}: {events:?}"));
+    let Event::Stage { total, .. } = events[start] else {
+        unreachable!();
+    };
+    let mut total = total.expect("subject progress has a known total");
+    let mut processed = 0;
+    for event in &events[start + 1..] {
+        match event {
+            Event::Stage { .. } => break,
+            Event::Advance(amount) => processed += amount,
+            Event::Total(updated) => total = *updated,
+            Event::RequestStarted | Event::RequestFinished | Event::Idle | Event::Detail(_) => {}
+        }
+        assert!(processed <= total, "{label}: {processed} exceeds {total}");
+    }
+    assert_eq!(total, expected, "{label}: final total");
+    assert_eq!(processed, expected, "{label}: all subjects processed");
+}
+
 struct FakeGateway {
     results: VecDeque<Result<CompletionOutcome, GatewayError>>,
     calls: usize,
@@ -242,7 +267,11 @@ fn repository_scout_subdivides_mixed_scopes_and_reuses_every_exact_run() -> Resu
         Ok(repository_outcome("documentation")),
         Ok(repository_outcome("runtime")),
     ]);
-    let report = super::repository::execute(repo.path(), &conn, &mut first, &options, make_plan())?;
+    let (report, progress) = crate::progress::capture(|| {
+        super::repository::execute(repo.path(), &conn, &mut first, &options, make_plan())
+    });
+    let report = report?;
+    assert_progress_complete(&progress, "scout repository: subjects processed", 3);
     assert_eq!(report.model_calls, 3);
     assert_eq!(report.reports.len(), 3);
     assert_eq!(first.calls, 3);
@@ -285,7 +314,11 @@ fn repository_scout_subdivides_mixed_scopes_and_reuses_every_exact_run() -> Resu
     );
 
     let mut dry_gateway = FakeGateway::new(Vec::new());
-    let dry = super::repository::dry_run_report(&conn, &mut dry_gateway, &make_plan(), &options)?;
+    let (dry, progress) = crate::progress::capture(|| {
+        super::repository::dry_run_report(&conn, &mut dry_gateway, &make_plan(), &options)
+    });
+    let dry = dry?;
+    assert_progress_complete(&progress, "scout repository: dry-run subjects", 1);
     assert_eq!(dry["calls_planned"], json!(0));
     assert_eq!(dry["reusable_items"], json!(1));
     assert_eq!(dry["plan"]["items"][0]["reusable"], json!(true));
@@ -308,8 +341,11 @@ fn repository_scout_subdivides_mixed_scopes_and_reuses_every_exact_run() -> Resu
     assert_eq!(rebuild_gateway.calls, 0);
 
     let mut reused = FakeGateway::new(Vec::new());
-    let report =
-        super::repository::execute(repo.path(), &conn, &mut reused, &options, make_plan())?;
+    let (report, progress) = crate::progress::capture(|| {
+        super::repository::execute(repo.path(), &conn, &mut reused, &options, make_plan())
+    });
+    let report = report?;
+    assert_progress_complete(&progress, "scout repository: subjects processed", 3);
     assert_eq!(report.model_calls, 0);
     assert_eq!(report.reports.len(), 3);
     assert!(
@@ -319,6 +355,24 @@ fn repository_scout_subdivides_mixed_scopes_and_reuses_every_exact_run() -> Resu
             .all(|report| report.status == "reused")
     );
     assert_eq!(reused.calls, 0);
+
+    let mut limited_options = options.clone();
+    limited_options.max_subjects = 1;
+    let mut limited_plan = make_plan();
+    limited_plan.max_subjects = 1;
+    let (limited, progress) = crate::progress::capture(|| {
+        super::repository::execute(
+            repo.path(),
+            &conn,
+            &mut reused,
+            &limited_options,
+            limited_plan,
+        )
+    });
+    let limited = limited?;
+    assert_eq!(limited.reports.len(), 1);
+    assert_eq!(limited.skipped_unresolvable.len(), 2);
+    assert_progress_complete(&progress, "scout repository: subjects processed", 3);
     Ok(())
 }
 
@@ -622,20 +676,29 @@ fn automatic_batch_spends_only_for_new_fingerprints() -> Result<()> {
     assert_eq!(first_plan.items.len(), 2);
     let first_submission = defining_submission(&first_plan.items[0].candidate_set);
     let mut first_gateway = FakeGateway::new(vec![Ok(outcome(first_submission))]);
-    let first = scout_workflow_plan(repo.path(), &conn, &mut first_gateway, &options, first_plan)?;
+    let (first, progress) = crate::progress::capture(|| {
+        scout_workflow_plan(repo.path(), &conn, &mut first_gateway, &options, first_plan)
+    });
+    let first = first?;
+    assert_progress_complete(&progress, "scout workflows: preparing subjects", 2);
+    assert_progress_complete(&progress, "scout workflows: subjects processed", 2);
     assert_eq!(first.model_calls, 1);
     assert_eq!(first.skipped_for_call_budget, 1);
 
     let second_plan = super::plan::workflows(repo.path(), &conn, &[], 2, 31)?;
     let second_submission = defining_submission(&second_plan.items[1].candidate_set);
     let mut second_gateway = FakeGateway::new(vec![Ok(outcome(second_submission))]);
-    let second = scout_workflow_plan(
-        repo.path(),
-        &conn,
-        &mut second_gateway,
-        &options,
-        second_plan,
-    )?;
+    let (second, progress) = crate::progress::capture(|| {
+        scout_workflow_plan(
+            repo.path(),
+            &conn,
+            &mut second_gateway,
+            &options,
+            second_plan,
+        )
+    });
+    let second = second?;
+    assert_progress_complete(&progress, "scout workflows: subjects processed", 2);
     assert_eq!(second.model_calls, 1);
     assert_eq!(second.skipped_for_call_budget, 0);
     assert_eq!(second.reports.len(), 2);
@@ -672,7 +735,12 @@ fn automatic_batch_skips_one_oversized_boundary_and_continues() -> Result<()> {
     options.seeds.clear();
     options.policy = RequestPolicy::new(30, 2, 8_000)?;
     let mut gateway = FakeGateway::new(vec![Ok(outcome(submission))]);
-    let batch = scout_workflow_plan(repo.path(), &conn, &mut gateway, &options, plan)?;
+    let (batch, progress) = crate::progress::capture(|| {
+        scout_workflow_plan(repo.path(), &conn, &mut gateway, &options, plan)
+    });
+    let batch = batch?;
+    assert_progress_complete(&progress, "scout workflows: preparing subjects", 2);
+    assert_progress_complete(&progress, "scout workflows: subjects processed", 2);
 
     assert_eq!(batch.skipped_over_budget.len(), 1);
     assert_eq!(batch.reports.len(), 1);
@@ -1058,7 +1126,13 @@ fn dry_run_report_marks_budget_and_call_slots() -> Result<()> {
     let mut options = scout_options();
     options.seeds = Vec::new();
     options.policy = RequestPolicy::new(30, 1, 240_000).expect("policy");
-    let report = super::dry_run_report(&plan, &options)?;
+    let (report, progress) = crate::progress::capture(|| super::dry_run_report(&plan, &options));
+    let report = report?;
+    assert_progress_complete(
+        &progress,
+        "scout workflows: dry-run subjects",
+        plan.items.len(),
+    );
     assert_eq!(report["dry_run"], serde_json::json!(true));
     assert_eq!(report["calls_planned"], serde_json::json!(1));
     assert_eq!(report["over_context_bytes_items"], serde_json::json!(0));
@@ -1214,7 +1288,12 @@ fn remote_timeout_fails_one_subject_and_the_batch_continues() -> Result<()> {
             "every concurrent call is claimed before dispatch"
         );
     }));
-    let batch = scout_card_plan(dir.path(), &conn, &mut gateway, &options, plan)?;
+    let (batch, progress) = crate::progress::capture(|| {
+        scout_card_plan(dir.path(), &conn, &mut gateway, &options, plan)
+    });
+    let batch = batch?;
+    assert_progress_complete(&progress, "scout cards: preparing subjects", 2);
+    assert_progress_complete(&progress, "scout cards: subjects processed", 2);
     assert_eq!(gateway.batch_sizes, vec![2]);
     assert_eq!(batch.reports.len(), 2);
     let failed = batch
@@ -1400,11 +1479,20 @@ fn concept_scout_publishes_exact_links_reuses_and_drills_to_source() -> Result<(
     assert_eq!(plan.items.len(), 1);
     let aliases = plan.items[0].aliases.clone();
     let child_count = plan.items[0].child_count;
+    let (dry, progress) =
+        crate::progress::capture(|| super::concept_dry_run_report(&plan, &options));
+    dry?;
+    assert_progress_complete(&progress, "scout concepts: dry-run subjects", 1);
     let mut gateway = FakeGateway::new(vec![Ok(concept_outcome(concept_submission(
         &aliases,
         child_count,
     )))]);
-    let batch = scout_concept_plan(repo.path(), &conn, &mut gateway, &options, plan)?;
+    let (batch, progress) = crate::progress::capture(|| {
+        scout_concept_plan(repo.path(), &conn, &mut gateway, &options, plan)
+    });
+    let batch = batch?;
+    assert_progress_complete(&progress, "scout concepts: preparing subjects", 1);
+    assert_progress_complete(&progress, "scout concepts: subjects processed", 1);
     assert_eq!(batch.reports.len(), 1);
     assert_eq!(batch.reports[0].status, "completed");
     assert_eq!(batch.reports[0].kind, "concept");
@@ -1426,7 +1514,11 @@ fn concept_scout_publishes_exact_links_reuses_and_drills_to_source() -> Result<(
 
     let second_plan = super::plan::concepts(&conn, &options.terms)?;
     let mut no_call = FakeGateway::new(Vec::new());
-    let second = scout_concept_plan(repo.path(), &conn, &mut no_call, &options, second_plan)?;
+    let (second, progress) = crate::progress::capture(|| {
+        scout_concept_plan(repo.path(), &conn, &mut no_call, &options, second_plan)
+    });
+    let second = second?;
+    assert_progress_complete(&progress, "scout concepts: subjects processed", 1);
     assert_eq!(second.reports[0].status, "reused");
     assert_eq!(no_call.calls, 0);
 
@@ -2228,7 +2320,10 @@ fn card_dry_run_plans_without_calls_ledger_rows_or_byte_drift() -> Result<()> {
         2,
         "both exported symbols are card subjects"
     );
-    let first = super::card_dry_run_report(&plan, &options)?;
+    let (first, progress) =
+        crate::progress::capture(|| super::card_dry_run_report(&plan, &options));
+    let first = first?;
+    assert_progress_complete(&progress, "scout cards: dry-run subjects", 2);
     let repeat_plan = super::plan::cards(repo.path(), &conn, &options.anchors)?;
     let second = super::card_dry_run_report(&repeat_plan, &options)?;
     assert_eq!(
@@ -2908,6 +3003,10 @@ fn mixed_refresh_ends_with_every_current_artifact_fresh() -> Result<()> {
 
     let selection = super::refresh::select(&conn, &[])?;
     assert_eq!(selection.targets.len(), 2, "card and summary both selected");
+    let (dry, progress) =
+        crate::progress::capture(|| super::plan_refresh(repo.path(), &conn, &selection));
+    dry?;
+    assert_progress_complete(&progress, "scout refresh: dry-run artifacts", 2);
 
     // Dependency order guarantees the card successor publishes first, so
     // the summary re-plans against it rather than reusing its own run.
@@ -2918,13 +3017,28 @@ fn mixed_refresh_ends_with_every_current_artifact_fresh() -> Result<()> {
             &["C1"],
         ))),
     ]);
-    let batch = scout_refresh(
-        repo.path(),
-        &conn,
-        &mut refresh_gateway,
-        selection,
-        RequestPolicy::new(30, 2, 240_000)?,
-    )?;
+    let (batch, progress) = crate::progress::capture(|| {
+        scout_refresh(
+            repo.path(),
+            &conn,
+            &mut refresh_gateway,
+            selection,
+            RequestPolicy::new(30, 2, 240_000)?,
+        )
+    });
+    let batch = batch?;
+    for phase in ["workflows/cards", "file summaries"] {
+        assert_progress_complete(
+            &progress,
+            &format!("scout refresh {phase}: preparing artifacts"),
+            1,
+        );
+        assert_progress_complete(
+            &progress,
+            &format!("scout refresh {phase}: artifacts processed"),
+            1,
+        );
+    }
     assert_eq!(batch.model_calls, 2);
     assert_eq!(batch.reports.len(), 2);
     assert_eq!(batch.reports[0].kind, "card", "children refresh first");
@@ -2968,6 +3082,11 @@ fn mixed_refresh_ends_with_every_current_artifact_fresh() -> Result<()> {
             "current {artifact_type} {id} is still not fresh after refresh"
         );
     }
+    let (selection, progress) = crate::progress::capture(|| super::refresh::select(&conn, &[]));
+    let selection = selection?;
+    assert!(selection.targets.is_empty());
+    assert_eq!(selection.summary.skipped_fresh.len(), 2);
+    assert_progress_complete(&progress, "scout refresh: checking artifacts", 2);
     Ok(())
 }
 
@@ -3098,8 +3217,28 @@ fn staged_run_builds_module_summaries_from_file_summaries_it_just_published() ->
             &["C1"],
         ))),
     ]);
-    let batch =
-        super::scout_summaries(repo.path(), &conn, &mut gateway, &summary_options(None, 2))?;
+    let (batch, progress) = crate::progress::capture(|| {
+        super::scout_summaries(repo.path(), &conn, &mut gateway, &summary_options(None, 2))
+    });
+    let batch = batch?;
+    for level in ["file", "module", "repository"] {
+        assert_progress_complete(
+            &progress,
+            &format!("scout summaries {level}: subjects processed"),
+            1,
+        );
+    }
+    let (dry, progress) = crate::progress::capture(|| {
+        super::summary_dry_run_report(repo.path(), &conn, &summary_options(None, 2))
+    });
+    dry?;
+    for level in ["file", "module", "repository"] {
+        assert_progress_complete(
+            &progress,
+            &format!("scout summaries {level}: dry-run subjects"),
+            1,
+        );
+    }
     assert_eq!(batch.model_calls, 2);
     assert_eq!(
         batch.reports.len(),

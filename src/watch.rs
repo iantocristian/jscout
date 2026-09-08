@@ -1111,6 +1111,10 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
         clear_reconciliation_deadline_if_dirty(&coordinator, &mut next_reconcile);
 
         if let Some(work) = coordinator.next_work(started.elapsed()) {
+            crate::progress::stage(
+                format!("generation {}: {}", work.generation, work.phase),
+                None,
+            );
             let phase_started = Instant::now();
             if work.phase == Phase::Refresh {
                 // A lexical config symlink may have been repointed by the
@@ -1501,6 +1505,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
             continue;
         }
 
+        crate::progress::idle();
         let now = started.elapsed();
         let phase_deadline = coordinator.next_deadline();
         let checker_deadline = coordinator

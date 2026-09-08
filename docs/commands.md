@@ -19,6 +19,36 @@ Setup's `--replace` preserves other client settings and refuses remote,
 disabled, unrecognized, or different-root registrations. It cannot be combined
 with `--print-config`; see [existing configuration](mcp.md#existing-configuration).
 
+## Progress and output
+
+Long-running CLI commands—including indexing, embedding code/docs/semantic memory,
+all `scout` commands, and checker enrichment—report their current phase, elapsed
+time, and available work counts on **stderr**. Query and diagnostic commands only
+show progress if they take at least two seconds. Results stay on stdout, so JSON
+and JSONL output remain usable in pipes and files:
+
+```bash
+jscout docs embed /path/to/repo --json > embeddings.json
+jscout --no-progress docs embed /path/to/repo --json > embeddings.json
+```
+
+`--no-progress` is global and suppresses progress, including checker batch and
+resource updates. Warnings, errors, explicit diagnostics, and watch lifecycle
+logs remain visible. Progress is plain text, with
+waiting updates about once per second on a terminal and every five seconds
+otherwise. Phase changes and completion can be reported sooner.
+
+Counts apply to the named phase, not an estimated percentage of the whole
+command. Embedding counts distinguish missing representations from cached reuse
+and published occurrences. Scouting counts include processed subjects, including
+reuse and skips; repository subdivision can increase the total. Finished model
+requests are not necessarily successful or published artifacts. Final reports
+and exit status remain authoritative.
+
+Watch reports active work and pauses progress while idle. The MCP stdio server
+and `inference serve` do not use this CLI reporter; their existing protocol and
+service logging are unchanged.
+
 ## Indexing and retrieval
 
 ```

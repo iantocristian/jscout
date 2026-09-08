@@ -55,6 +55,61 @@ pub(super) fn run_config_command(command: ConfigCommand, explicit: Option<&Path>
 }
 
 impl Command {
+    pub(super) fn progress_label(&self) -> Option<(&'static str, bool)> {
+        Some(match self {
+            Self::Mcp { .. }
+            | Self::Inference {
+                command: InferenceCommand::Serve { .. },
+            } => return None,
+            Self::Setup { print_config, .. } => ("setup", !print_config),
+            Self::Config { command } => (
+                match command {
+                    ConfigCommand::Show { .. } => "config show",
+                    ConfigCommand::Validate { .. } => "config validate",
+                    ConfigCommand::Init { .. } => "config init",
+                },
+                false,
+            ),
+            Self::Docs { command } => match command {
+                DocsCommand::Embed { .. } => ("docs embed", true),
+                DocsCommand::Search { .. } => ("docs search", false),
+                DocsCommand::Status { .. } => ("docs status", false),
+            },
+            Self::Scout { command } => (
+                match command {
+                    ScoutCommand::Repository { .. } => "scout repository",
+                    ScoutCommand::Workflows { .. } => "scout workflows",
+                    ScoutCommand::Cards { .. } => "scout cards",
+                    ScoutCommand::Summaries { .. } => "scout summaries",
+                    ScoutCommand::Concepts { .. } => "scout concepts",
+                    ScoutCommand::Refresh { .. } => "scout refresh",
+                },
+                true,
+            ),
+            Self::Stats { .. } => ("stats", true),
+            Self::Chunks { .. } => ("chunks", true),
+            Self::Index { .. } => ("index", true),
+            Self::Embed { .. } => ("embed", true),
+            Self::Enrich { .. } => ("enrich", true),
+            Self::Watch { .. } => ("watch", true),
+            Self::Search { .. } => ("search", false),
+            Self::Events { .. } => ("events", false),
+            Self::Calls { .. } => ("calls", false),
+            Self::Annotate { .. } => ("annotate", false),
+            Self::Memory { .. } => ("memory", false),
+            Self::Overview { .. } => ("overview", false),
+            Self::WorkflowCandidates { .. } => ("workflow-candidates", false),
+            Self::WhoUses { .. } => ("who-uses", false),
+            Self::Neighborhood { .. } => ("neighborhood", false),
+            Self::AgentGuide { .. } => ("agent-guide", false),
+            Self::Checker { .. } => ("checker doctor", false),
+            Self::Llm { .. } => ("llm doctor", false),
+            Self::Inference {
+                command: InferenceCommand::Doctor { .. },
+            } => ("inference doctor", false),
+        })
+    }
+
     pub(super) fn root(&self) -> Option<&Path> {
         match self {
             Self::Stats { root }
@@ -186,6 +241,9 @@ pub(super) fn render_semantic_memory_text(
 }
 
 pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> {
+    if matches!(command.progress_label(), Some((_, false))) {
+        crate::progress::stage("executing command", None);
+    }
     let configured_database = runtime.effective.database.path.as_path();
     match command {
         Command::Config { .. } => unreachable!("configuration commands are dispatched first"),

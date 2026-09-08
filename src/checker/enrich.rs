@@ -477,6 +477,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     if options.max_occurrences == Some(0) {
         bail!("--max-occurrences must be greater than zero");
     }
+    crate::progress::stage("selecting checker occurrences", None);
     let canonical_root = fs::canonicalize(root)
         .with_context(|| format!("repository root does not exist: {}", root.display()))?;
     let conn = match options.database {
@@ -536,11 +537,13 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
 
     let dirty_files = current_dirty_source_files(&conn, &options.dirty_files)?;
     let inventory_files = super::package_gate::inventory_paths(&conn)?;
+    crate::progress::stage("starting checker planner", None);
     let mut planner = super::launch(&canonical_root, options.sidecar, None, options.node)?;
     planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
     let protocol = planner.versions.protocol;
+    crate::progress::stage("planning checker inventory ownership", None);
     let (inventory_ownership, inventory_typescript) =
         plan_inventory_ownership(&mut planner, &inventory_files, options.timeout)?;
     let package_gate = super::package_gate::evaluate(
@@ -572,6 +575,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     // immediately following admitted-scope plan. This makes both views one
     // ownership snapshot while still regrouping the exact admitted roots.
     let planning_files = planning_files.into_iter().collect::<Vec<_>>();
+    crate::progress::stage("planning admitted checker projects", None);
     let mut ownership = planner.plan_members_cached(planning_files.clone(), options.timeout)?;
     if ownership.typescript.version != inventory_typescript.version
         || ownership.typescript.source != inventory_typescript.source
@@ -657,6 +661,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             peak_heap_bytes: 0,
         });
     }
+    crate::progress::stage("validating checker selection", None);
     verify_selected_sources(&canonical_root, &conn, &selected)?;
     let ProjectPlanning {
         projects: project_plan,
@@ -731,6 +736,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         });
     }
 
+    crate::progress::stage("checking reusable checker work", None);
     package_gate.validate_fresh()?;
     let mut input_freshness = InputFreshnessCache::new(&canonical_root);
     if !options.force_full
@@ -799,9 +805,11 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     if !options.carry_forward
         && deactivate_stale_active_batch(&conn, &snapshot, &mut input_freshness)?
     {
+        crate::progress::stage("updating structural projection", None);
         crate::structural::rebuild_projection(&conn, &snapshot)?;
     }
 
+    crate::progress::stage("preparing checker staging", None);
     let batch_id = open_staging_batch(
         &conn,
         &StagingPlan {
@@ -829,14 +837,14 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         CarryOutcome::default()
     };
     if carry.occurrences_carried != 0 {
-        eprintln!(
-            "checker enrichment: carried {}/{} occurrences across {} fully and {} partially carried projects ({} total)",
+        crate::progress::detail(format!(
+            "carried {}/{} occurrences across {} fully and {} partially carried projects ({} total)",
             carry.occurrences_carried,
             selected.len(),
             carry.projects_carried,
             carry.projects_partially_carried,
             project_plan.len()
-        );
+        ));
     }
     let mut priority_projects = dirty_projects;
     priority_projects.extend(carry.projects_requiring_check.iter().cloned());
@@ -899,13 +907,16 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             .partition(|occurrence| dirty_files.contains(&occurrence.file));
         pending.extend(clean);
         mark_project_pending(&conn, batch_id, project_id)?;
-        eprintln!(
-            "checker enrichment: project {}/{} {} ({} pending, {} resumed)",
-            project_index + 1,
-            project_plan.len(),
-            project_id,
-            pending.len(),
-            completed.len()
+        crate::progress::stage(
+            format!(
+                "checker project {}/{} {} ({} pending, {} resumed)",
+                project_index + 1,
+                project_plan.len(),
+                project_id,
+                pending.len(),
+                completed.len()
+            ),
+            None,
         );
         let project_result = execute_project(
             &canonical_root,
@@ -996,6 +1007,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     if super::process::cancellation_pending() {
         bail!("checker enrichment interrupted before activation; staged work retained");
     }
+    crate::progress::stage("revalidating checker package policy", None);
     revalidate_package_gate(
         &canonical_root,
         &conn,
@@ -1007,6 +1019,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     )?;
 
     if !failed_projects.is_empty() {
+        crate::progress::stage("publishing partial checker enrichment", None);
         let activation = activate_staging_batch(
             &canonical_root,
             &conn,
@@ -1016,6 +1029,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             Some(&package_gate),
         )?;
         if activation.publication_changed {
+            crate::progress::stage("updating structural projection", None);
             crate::structural::rebuild_projection(&conn, &snapshot)?;
         }
         return Err(PartialEnrichmentError {
@@ -1036,6 +1050,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         .into());
     }
 
+    crate::progress::stage("publishing checker enrichment", None);
     let activation = activate_staging_batch(
         &canonical_root,
         &conn,
@@ -1045,6 +1060,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         Some(&package_gate),
     )?;
     if activation.publication_changed {
+        crate::progress::stage("updating structural projection", None);
         crate::structural::rebuild_projection(&conn, &snapshot)?;
     }
     let facts_published = activation.facts_published;
@@ -3054,6 +3070,7 @@ fn execute_project(
         execution.staging_occurrences_reset = reset_occurrences;
         return Ok(execution);
     }
+    crate::progress::stage(format!("starting checker project {project_id}"), None);
     let mut checker = super::launch(root, options.sidecar, None, options.node)?;
     if register_interrupts {
         checker
@@ -3069,13 +3086,21 @@ fn execute_project(
     let mut attempt_unmapped_declarations = 0;
     let mut attempt_unmapped_declaration_contexts = BTreeMap::<String, usize>::new();
     let mut offset = 0;
+    crate::progress::stage(
+        format!("processing checker occurrences in {project_id}"),
+        Some(occurrences.len()),
+    );
     while offset < occurrences.len() {
+        let previous_offset = offset;
         while offset < occurrences.len()
             && execution
                 .failed_files
                 .contains_key(&occurrences[offset].file)
         {
             offset += 1;
+        }
+        if offset != previous_offset {
+            crate::progress::advance(offset - previous_offset);
         }
         if offset == occurrences.len() {
             break;
@@ -3253,18 +3278,18 @@ fn execute_project(
                 &projects,
             )?;
         }
-        offset = end;
-        eprintln!(
-            "checker enrichment: {project_id} staged {}/{} occurrences; rss={} MiB heap={}/{} MiB",
-            offset,
-            occurrences.len(),
+        crate::progress::detail(format!(
+            "rss={} MiB heap={}/{} MiB",
             result.resources.rss_bytes / (1024 * 1024),
             result.resources.heap_used_bytes / (1024 * 1024),
             result.resources.heap_total_bytes / (1024 * 1024)
-        );
+        ));
+        crate::progress::advance(end - offset);
+        offset = end;
     }
     let fingerprint =
         project_fingerprint.context("checker project completed without an input fingerprint")?;
+    crate::progress::stage(format!("validating checker project {project_id}"), None);
     let validation =
         checker.validate_project(project_id.to_string(), fingerprint.clone(), options.timeout)?;
     if validation.project_id != project_id

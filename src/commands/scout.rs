@@ -11,6 +11,7 @@ fn launch_scout_gateway(
     runtime: &config::RuntimeConfig,
     call_capacity: usize,
 ) -> Result<llm::process::ProcessGatewayPool> {
+    crate::progress::stage("scout: starting gateway", None);
     llm::process::ProcessGatewayPool::launch(
         gateway_path,
         runtime,
@@ -30,6 +31,7 @@ pub(super) fn cmd_scout_workflows(
     dry_run: bool,
     options: scouting::WorkflowScoutOptions,
 ) -> Result<()> {
+    crate::progress::stage("scout workflows: planning", None);
     let conn = open_database_for_write(root, database)?;
     let plan = scouting::plan::workflows(
         root,
@@ -66,6 +68,7 @@ pub(super) fn cmd_scout_repository(
     runtime: &config::RuntimeConfig,
     options: RepositoryScoutCommandOptions<'_>,
 ) -> Result<()> {
+    crate::progress::stage("scout repository: planning", None);
     let conn = open_database_for_write(root, database)?;
     let plan = scouting::repository::plan(root, &conn, &options.planning)?;
     let initial_subjects = plan.items.len();
@@ -76,6 +79,7 @@ pub(super) fn cmd_scout_repository(
         );
     }
     if options.dry_run {
+        crate::progress::stage("scout repository: starting dry-run gateway", None);
         let mut gateway = llm::process::ProcessGateway::launch(gateway_path, runtime)?;
         println!(
             "{}",
@@ -111,6 +115,7 @@ pub(super) fn cmd_scout_summaries(
     dry_run: bool,
     options: scouting::SummaryScoutOptions,
 ) -> Result<()> {
+    crate::progress::stage("scout summaries: planning", None);
     let conn = open_database_for_write(root, database)?;
     if dry_run {
         println!(
@@ -133,6 +138,7 @@ pub(super) fn cmd_scout_cards(
     dry_run: bool,
     options: scouting::CardScoutOptions,
 ) -> Result<()> {
+    crate::progress::stage("scout cards: planning", None);
     let conn = open_database_for_write(root, database)?;
     let plan = scouting::plan::cards_with_selectors(
         root,
@@ -165,6 +171,7 @@ pub(super) fn cmd_scout_concepts(
     dry_run: bool,
     options: scouting::ConceptScoutOptions,
 ) -> Result<()> {
+    crate::progress::stage("scout concepts: planning", None);
     let conn = open_database_for_write(root, database)?;
     let plan = scouting::plan::concepts(&conn, &options.terms)?;
     if dry_run {
@@ -190,6 +197,7 @@ pub(super) fn cmd_scout_refresh(
     dry_run: bool,
     policy: llm::config::RequestPolicy,
 ) -> Result<()> {
+    crate::progress::stage("scout refresh: selecting artifacts", None);
     let conn = open_database_for_write(root, database)?;
     let selection = scouting::refresh::select(&conn, artifacts)?;
     if dry_run {

@@ -173,6 +173,7 @@ pub(super) fn run(command: DocsCommand, runtime: &config::RuntimeConfig) -> Resu
                 &root,
                 Some(database.as_deref().unwrap_or(configured_database)),
             )?;
+            crate::progress::stage("searching documentation", None);
             let result = retrieval::search(
                 &conn,
                 &root,

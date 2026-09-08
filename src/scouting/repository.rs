@@ -310,8 +310,10 @@ pub fn plan(
         }
     }
     let mut items = Vec::new();
+    crate::progress::stage("scout repository: planning subjects", Some(subjects.len()));
     for discovered in subjects {
         items.push(complete_plan_item(root, conn, discovered)?);
+        crate::progress::advance(1);
     }
     Ok(RepositoryPlan {
         snapshot,
@@ -985,6 +987,7 @@ pub fn dry_run_report(
     plan: &RepositoryPlan,
     options: &RepositoryScoutOptions,
 ) -> Result<Value> {
+    crate::progress::stage("scout repository: dry-run subjects", Some(plan.items.len()));
     let mut rendered = serde_json::to_value(plan)?;
     rendered["max_subjects"] = rendered_limit(options.max_subjects);
     let mut calls_planned = 0;
@@ -1033,6 +1036,7 @@ pub fn dry_run_report(
                 _ => "projects do not subdivide",
             }
             .into();
+            crate::progress::advance(1);
         }
     }
     Ok(json!({
@@ -1084,6 +1088,11 @@ pub fn execute(
         skipped_unresolvable: plan.omitted_subjects,
         ..ScoutBatchReport::default()
     };
+    crate::progress::stage(
+        "scout repository: subjects processed",
+        Some(subject_count + report.skipped_unresolvable.len()),
+    );
+    crate::progress::advance(report.skipped_unresolvable.len());
 
     while !queue.is_empty() {
         let mut scheduled = Vec::new();
@@ -1126,6 +1135,7 @@ pub fn execute(
             };
             if !reusable && report.model_calls >= options.policy.max_calls {
                 report.skipped_for_call_budget += 1;
+                crate::progress::advance(1);
                 continue;
             }
             let subdivision_parent = prepared.item.clone();
@@ -1172,6 +1182,7 @@ pub fn execute(
         let mut outcomes = super::BatchOutcomes::dispatch(gateway, &tasks);
         drop(tasks);
         let mut first_error = outcomes.cardinality_error("repository");
+        let processed = scheduled.len();
         let mut completed = Vec::with_capacity(scheduled.len());
         for scheduled in scheduled {
             match scheduled {
@@ -1212,6 +1223,7 @@ pub fn execute(
             }
         }
         if let Some(error) = first_error {
+            crate::progress::advance(processed);
             return Err(error);
         }
         let mut wave_subdivisions = Vec::new();
@@ -1247,6 +1259,7 @@ pub fn execute(
                     )?
                 }
             };
+            let omitted_before = report.skipped_unresolvable.len();
             wave_subdivisions.extend(admit_subdivisions(
                 &mut seen,
                 &mut subject_count,
@@ -1254,9 +1267,12 @@ pub fn execute(
                 options.max_subjects,
                 children,
             ));
+            crate::progress::set_total(subject_count + report.skipped_unresolvable.len());
+            crate::progress::advance(1 + report.skipped_unresolvable.len() - omitted_before);
         }
         prepend_subdivisions(&mut queue, wave_subdivisions);
     }
+    crate::progress::stage("scout repository: reconciling file policy", None);
     recon::reconcile_file_policy(root, conn)?;
     report.subjects_considered = Some(subject_count);
     Ok(report)

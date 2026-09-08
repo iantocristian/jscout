@@ -95,6 +95,7 @@ pub fn run(
         return Ok(());
     }
 
+    crate::progress::stage("checking local setup targets", None);
     let legacy = runtime.legacy_environment_keys();
     ensure!(
         legacy.is_empty(),
@@ -127,6 +128,7 @@ pub fn run(
             skill.display()
         );
     }
+    crate::progress::stage("installing local configuration and agent skill", None);
     if !runtime.config_loaded {
         let path = root.join(config::FILE_NAME);
         client::check_local_target(&root, &path)?;
@@ -161,7 +163,9 @@ pub fn run(
 
     // Start the exact command that will be registered, before publishing client config.
     // This checks local MCP readiness only; it never calls an embedding or LLM provider.
+    crate::progress::stage("verifying local MCP server", None);
     let tools = probe::verify(&launch, client, &registered_entry, &root, &runtime)?;
+    crate::progress::stage("publishing local client registration", None);
     registration.write(&root)?;
     println!(
         "MCP configuration ready: {}",

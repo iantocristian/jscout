@@ -562,14 +562,26 @@ fn fully_cached_pass_reports_reuse_and_synced_occurrences() -> anyhow::Result<()
         )?;
     }
 
-    let code = embed_missing_for_selection_report(
-        &connection,
-        &provider,
-        16,
-        &["repository".into()],
-        false,
-        false,
-    )?;
+    let (code, progress) = crate::progress::capture(|| {
+        embed_missing_for_selection_report(
+            &connection,
+            &provider,
+            16,
+            &["repository".into()],
+            false,
+            false,
+        )
+    });
+    let code = code?;
+    assert!(progress.iter().any(|event| matches!(
+        event,
+        crate::progress::Event::Stage { label, total: Some(0) }
+            if label == "code embeddings: missing representations (2 cached)"
+    )));
+    assert!(matches!(
+        progress.last(),
+        Some(crate::progress::Event::Advance(3))
+    ));
     assert_eq!(code.missing, 0);
     assert_eq!(code.embedded, 0);
     assert_eq!(code.cached_reused, 2);
@@ -596,7 +608,18 @@ fn fully_cached_pass_reports_reuse_and_synced_occurrences() -> anyhow::Result<()
         ],
     )?;
 
-    let semantic = embed_semantic_missing_report(&connection, &provider, 16)?;
+    let (semantic, progress) =
+        crate::progress::capture(|| embed_semantic_missing_report(&connection, &provider, 16));
+    let semantic = semantic?;
+    assert!(progress.iter().any(|event| matches!(
+        event,
+        crate::progress::Event::Stage { label, total: Some(0) }
+            if label == "semantic embeddings: missing representations (1 cached)"
+    )));
+    assert!(matches!(
+        progress.last(),
+        Some(crate::progress::Event::Advance(1))
+    ));
     assert_eq!(semantic.missing, 0);
     assert_eq!(semantic.embedded, 0);
     assert_eq!(semantic.cached_reused, 1);
