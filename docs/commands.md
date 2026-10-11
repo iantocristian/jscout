@@ -83,6 +83,7 @@ jscout checker doctor <root>   # checker version, projects, config problems, rea
 jscout scout repository <root> # classify repository/package/project purpose from evidence
   --max-calls N                #   explicit model budget; --dry-run makes no model calls
 jscout enrich <root>           # explicit occurrence-scoped TypeScript checker pass
+jscout --experimental-tsr enrich <root> # embedded experimental checker; no Node sidecar
                                #   --dry-run plans ownership without building Programs
                                #   --file/--package/--member/--role narrow eligibility
                                #   --max-occurrences N explicitly requests partial coverage

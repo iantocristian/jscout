@@ -17,6 +17,9 @@ pub(super) struct Cli {
     /// Suppress progress on stderr (warnings and errors are still reported)
     #[arg(long, global = true)]
     pub(super) no_progress: bool,
+    /// Use the experimental embedded TSR checker (no checker subprocess; cooperative deadlines)
+    #[arg(long, global = true)]
+    pub(super) experimental_tsr: bool,
     #[command(subcommand)]
     pub(super) command: Command,
 }
@@ -460,7 +463,7 @@ pub(super) enum Command {
         /// Disable watched checker enrichment configured for this repository
         #[arg(long, conflicts_with = "enrich")]
         no_enrich: bool,
-        /// Hard deadline for each checker request in seconds
+        /// Checker request deadline in seconds (cooperative with --experimental-tsr)
         #[arg(long)]
         enrich_timeout: Option<u64>,
         /// Checker sidecar entry file for development and diagnostics
@@ -545,7 +548,7 @@ pub(super) enum Command {
     Enrich {
         /// Repository root (must be indexed)
         root: PathBuf,
-        /// Hard deadline for each checker request in seconds
+        /// Checker request deadline in seconds (cooperative with --experimental-tsr)
         #[arg(long, default_value_t = 300)]
         timeout: u64,
         /// Restrict enrichment to repository-relative file paths or directory prefixes
@@ -706,7 +709,7 @@ pub(super) enum CheckerCommand {
     Doctor {
         /// Repository root whose configured projects are discovered
         root: PathBuf,
-        /// Hard deadline for project discovery in seconds
+        /// Project discovery deadline in seconds (cooperative with --experimental-tsr)
         #[arg(long, default_value_t = 30)]
         timeout: u64,
         /// Checker sidecar entry file for development and diagnostics
@@ -758,7 +761,7 @@ pub(super) enum ScoutCommand {
         /// Print exact subjects, evidence, freshness, and bounds; make no model calls
         #[arg(long)]
         dry_run: bool,
-        /// Hard deadline for each checker inventory request in seconds
+        /// Checker inventory deadline in seconds (cooperative with --experimental-tsr)
         #[arg(long, default_value_t = 30)]
         checker_timeout: u64,
         /// Checker sidecar entry file for development and diagnostics

@@ -246,7 +246,7 @@ pub struct FileOwnership {
     pub tooling_fallback: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemberBatchResult {
     pub project_id: String,
     pub typescript: TypeScriptIdentity,
@@ -255,21 +255,21 @@ pub struct MemberBatchResult {
     pub resources: ResourceUsage,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemberProjectResult {
     pub indexed_hash: String,
     pub source_hash: String,
     pub answer: ProjectAnswer,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ResourceUsage {
     pub rss_bytes: u64,
     pub heap_used_bytes: u64,
     pub heap_total_bytes: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProjectAnswer {
     pub project_id: String,
     pub status: String,
@@ -282,7 +282,7 @@ pub struct ProjectAnswer {
     pub error: Option<RemoteError>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeclarationSite {
     pub file: Option<String>,
     pub outside_root: bool,
@@ -312,7 +312,7 @@ pub struct ProjectValidationResult {
     pub inputs: Vec<CheckerInputFile>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RemoteError {
     pub code: String,
     pub message: String,

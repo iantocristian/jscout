@@ -125,10 +125,11 @@ function buildPlatformPackage(target, version, outputRoot) {
     os: [descriptor.os],
     cpu: [descriptor.cpu],
     ...(descriptor.libc ? { libc: [descriptor.libc] } : {}),
-    files: ["jscout", "LICENSE-MIT", "LICENSE-APACHE"],
+    files: ["jscout", "LICENSE-MIT", "LICENSE-APACHE", "third-party/"],
     preferUnplugged: true,
   };
   writeJson(path.join(stage, "package.json"), manifest);
+  copyInto(path.join(repoRoot, "third-party"), path.join(stage, "third-party"));
 
   const bytes = fs.statSync(path.join(stage, "jscout")).size;
   process.stderr.write(

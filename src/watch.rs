@@ -41,6 +41,7 @@ pub struct WatchOptions<'a> {
     pub enrich_timeout: Duration,
     pub checker_sidecar: Option<&'a Path>,
     pub checker_node: &'a str,
+    pub checker_backend: checker::Backend,
     pub timing: bool,
     pub debug: bool,
     pub debounce: Duration,
@@ -615,6 +616,7 @@ struct EventClassifier {
     config_exact: BTreeSet<PathBuf>,
     external_exact: BTreeSet<PathBuf>,
     external_prefixes: BTreeSet<PathBuf>,
+    checker_directories: BTreeSet<PathBuf>,
     source_policy: RefCell<walk::SourcePathPolicy>,
     documentation_policy: RefCell<docs::corpus::DocumentationPathPolicy>,
     documentation_options: docs::corpus::CorpusOptions,
@@ -649,6 +651,7 @@ impl EventClassifier {
             config_exact: BTreeSet::new(),
             external_exact: BTreeSet::new(),
             external_prefixes: BTreeSet::new(),
+            checker_directories: BTreeSet::new(),
             source_policy: RefCell::new(walk::SourcePathPolicy::new(root)),
             documentation_policy: RefCell::new(docs::corpus::DocumentationPathPolicy::new(
                 root,
@@ -717,6 +720,10 @@ impl EventClassifier {
                 continue;
             }
             if self.external_exact.contains(&path)
+                || self.checker_directories.contains(&path)
+                || path
+                    .parent()
+                    .is_some_and(|parent| self.checker_directories.contains(parent))
                 || self
                     .external_prefixes
                     .iter()
@@ -858,6 +865,7 @@ fn merge_signal(target: &mut Option<DirtySignal>, signal: DirtySignal) {
 enum TargetKind {
     Exact,
     Prefix,
+    Directory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1015,6 +1023,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
     let database = absolute_database_path(&root, options.database);
     let binary_fingerprint = crate::runtime_identity::current_binary_fingerprint();
     let checker_policy_fingerprint = checker::watch_policy_fingerprint(&watch_enrich_options(
+        options.checker_backend,
         &database,
         options.checker_sidecar,
         options.checker_node,
@@ -1614,6 +1623,11 @@ fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
             .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
     );
     field(&mut hasher, "checker_node", options.checker_node);
+    field(
+        &mut hasher,
+        "checker_backend",
+        options.checker_backend.name(),
+    );
     field(&mut hasher, "timing", &options.timing.to_string());
     field(&mut hasher, "debug", &options.debug.to_string());
     field(
@@ -1741,6 +1755,7 @@ fn run_enrichment_interruptible(
     let sidecar = options.checker_sidecar.map(Path::to_path_buf);
     let node = options.checker_node.to_string();
     let timeout = options.enrich_timeout;
+    let backend = options.checker_backend;
     let force_full = monitor.work.force_full_enrichment;
     let dirty_files = monitor
         .coordinator
@@ -1750,6 +1765,7 @@ fn run_enrichment_interruptible(
         .collect();
     let worker = thread::spawn(move || {
         let enrich_options = watch_enrich_options(
+            backend,
             &database,
             sidecar.as_deref(),
             &node,
@@ -1772,6 +1788,7 @@ fn run_enrichment_interruptible(
 }
 
 fn watch_enrich_options<'a>(
+    backend: checker::Backend,
     database: &'a Path,
     sidecar: Option<&'a Path>,
     node: &'a str,
@@ -1780,6 +1797,7 @@ fn watch_enrich_options<'a>(
     dirty_files: Vec<String>,
 ) -> checker::EnrichOptions<'a> {
     checker::EnrichOptions {
+        backend,
         database: Some(database),
         sidecar,
         node,
@@ -2300,22 +2318,36 @@ fn collect_watch_targets(
         ));
     }
     let mut checker_inputs = conn.prepare(
-        "SELECT input.input_kind, input.input_path
+        "SELECT input.input_kind, input.input_path, input.source_hash
          FROM checker_project_inputs input
          JOIN checker_enrichment_batches batch ON batch.id=input.batch_id
          WHERE batch.active=1",
     )?;
     let rows = checker_inputs.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
     for row in rows {
-        let (kind, input) = row?;
+        let (kind, input, signature) = row?;
         let path = if kind == "absolute" {
             PathBuf::from(input)
         } else {
             root.join(input)
         };
-        if !path.starts_with(root) {
+        if checker::embedded::host::observes_directory_entries(&signature) {
+            targets.push(WatchTarget {
+                watch_path: path.clone(),
+                path,
+                mode: RecursiveMode::NonRecursive,
+                kind: TargetKind::Directory,
+                source: TargetSource::Checker,
+            });
+        } else if !path.starts_with(root)
+            || signature.starts_with(checker::embedded::host::INPUT_PREFIX)
+        {
             targets.push(exact_watch_target(path, TargetSource::Checker));
         }
     }
@@ -2355,6 +2387,7 @@ fn update_classifier_targets(classifier: &mut EventClassifier, targets: &[WatchT
     let mut config_exact = BTreeSet::new();
     let mut exact = BTreeSet::new();
     let mut prefixes = BTreeSet::new();
+    let mut directories = BTreeSet::new();
     for target in targets {
         if target.source == TargetSource::Config {
             config_exact.insert(target.path.clone());
@@ -2367,9 +2400,13 @@ fn update_classifier_targets(classifier: &mut EventClassifier, targets: &[WatchT
             TargetKind::Prefix => {
                 prefixes.insert(target.path.clone());
             }
+            TargetKind::Directory => {
+                directories.insert(target.path.clone());
+            }
         }
     }
     classifier.set_external(config_exact, exact, prefixes);
+    classifier.checker_directories = directories;
 }
 
 fn display_path(root: &Path, path: &Path) -> String {

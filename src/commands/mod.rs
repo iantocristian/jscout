@@ -240,7 +240,11 @@ pub(super) fn render_semantic_memory_text(
     core::render_semantic_memory_text(artifacts)
 }
 
-pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> Result<()> {
+pub(super) fn run_command(
+    command: Command,
+    runtime: &config::RuntimeConfig,
+    checker_backend: checker::Backend,
+) -> Result<()> {
     if matches!(command.progress_label(), Some((_, false))) {
         crate::progress::stage("executing command", None);
     }
@@ -727,6 +731,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                         .checker
                         .as_deref()),
                     checker_node: &runtime.effective.sidecars.node,
+                    checker_backend,
                     timing: runtime.effective.diagnostics.timing,
                     debug: runtime.effective.diagnostics.debug,
                     debounce: std::time::Duration::from_millis(debounce_ms),
@@ -813,6 +818,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
             let report = checker::enrich(
                 &root,
                 &checker::EnrichOptions {
+                    backend: checker_backend,
                     database: Some(database.as_deref().unwrap_or(configured_database)),
                     sidecar: sidecar_path.as_deref().or(runtime
                         .effective
@@ -847,6 +853,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                 runtime.effective.sidecars.checker.as_deref(),
                 &runtime.effective.sidecars.node,
                 std::time::Duration::from_secs(timeout),
+                checker_backend,
             ),
         },
         Command::Llm { command } => match command {
@@ -902,6 +909,7 @@ pub(super) fn run_command(command: Command, runtime: &config::RuntimeConfig) -> 
                             .checker
                             .as_deref()),
                         checker_node: &runtime.effective.sidecars.node,
+                        checker_backend,
                     },
                     scout: scouting::repository::RepositoryScoutOptions {
                         model: llm::config::resolve_model_setting(

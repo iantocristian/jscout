@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ const PLAN_FILE_PAYLOAD_BYTES: usize = 900 * 1024;
 static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 static INTERRUPT_CONTROL: Mutex<Option<CheckerControl>> = Mutex::new(None);
 static CANCELLATION_FLAGS: CancellationFlags = CancellationFlags::new();
+static EMBEDDED_CONTROLS: AtomicUsize = AtomicUsize::new(0);
 
 struct CancellationFlags {
     interrupt: AtomicBool,
@@ -245,6 +246,17 @@ fn cancel_active_request() -> bool {
         .as_ref()
         .and_then(|control| control.cancel_active().ok())
         .unwrap_or(false)
+        || EMBEDDED_CONTROLS.load(Ordering::SeqCst) > 0
+}
+
+pub(super) fn register_embedded_interrupts() -> Result<(), CheckerError> {
+    install_interrupt_handler()?;
+    EMBEDDED_CONTROLS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+pub(super) fn unregister_embedded_interrupts() {
+    EMBEDDED_CONTROLS.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Cancel an in-process watcher generation without impersonating operator

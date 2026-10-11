@@ -1,0 +1,33 @@
+ts-rust
+Copyright (c) 2026 Cristian Ianto
+
+This product is a Rust port of the TypeScript compiler. It derives from and
+incorporates software developed by Microsoft Corporation as part of TypeScript
+(https://github.com/microsoft/TypeScript), licensed under the Apache License,
+Version 2.0. The pinned upstream commit is recorded in data/upstream.json and
+.gitmodules; its license and NOTICE texts are at upstream/LICENSE.txt,
+upstream/tsc/LICENSE and upstream/NOTICE.txt.
+
+Third-party attribution notices from the upstream NOTICE.txt that pertain to
+a ported component are copied below as that component is ported.
+
+The source-compatible sorter in crates/tsr_core/src/go_sort.rs derives from
+Go 1.27.1's slices sorting implementation.
+Copyright 2022 The Go Authors. All rights reserved.
+Licensed under the BSD 3-Clause License; see licenses/GO-BSD-3-Clause.txt.
+
+The byte-oriented JSON codec in crates/tsr_json derives from
+Go's go-json-experiment/json at the revision pinned in upstream/tsc/go.mod.
+Copyright 2020 The Go Authors. All rights reserved.
+The locale parser, matcher and generated registry/CLDR tables in crates/tsr_locale
+derive from golang.org/x/text v0.38.0 (CLDR 32).
+Copyright 2009, 2013 The Go Authors. All rights reserved.
+The language-server glob grammar in crates/tsr_glob derives from the Go tools glob
+package as carried by the pinned compiler at tsc/internal/glob.
+Copyright 2023 The Go Authors. All rights reserved.
+All three are licensed under the BSD 3-Clause License; see licenses/GO-BSD-3-Clause.txt.
+
+Paths above identify source files in the ts-rust repository. Distributed Rust
+packages carry this NOTICE and the Apache license locally. The tsr_core, tsr_glob, tsr_json and tsr_locale packages
+also include licenses/GO-BSD-3-Clause.txt; tsr_bundled includes the pinned
+TypeScript library copyright notice beside its library files.
