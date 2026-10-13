@@ -84,6 +84,70 @@ fn embedded_cli_publishes_without_node_reuses_and_invalidates_inputs() {
     }
 }
 
+#[test]
+fn embedded_toml_selection_honors_cli_and_explicit_config_overrides() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"noLib":true},"include":["*.ts"]}"#,
+    )
+    .unwrap();
+    fs::write(repo.path().join("main.ts"), "export class Service { ping() {} } export function run(service: Service) { service.ping(); }").unwrap();
+    let policy = repo.path().join(".jscout.toml");
+    fs::write(&policy, "version = 1\n[experimental]\ntsr = true\n[sidecars]\nnode = \"jscout-test-missing-node\"\n").unwrap();
+    run(repo.path(), &["index"], true);
+    let args = ["enrich", "--all", "--sidecar-path", "/missing-sidecar"];
+    let configured = run(repo.path(), &args, true);
+    assert_eq!(configured["checker_source"], "tsr-embedded");
+    assert_eq!(configured["facts_published"], 1);
+    run(repo.path(), &["checker", "doctor"], true);
+    let shown = run(repo.path(), &["config", "show", "--json"], true);
+    assert_eq!(shown["effective"]["experimental"]["tsr"], true);
+    assert_eq!(shown["sources"]["experimental.tsr"], "config");
+
+    // Disabling TSR must select Node even when TOML enabled it. This fixture
+    // deliberately has no Node executable, so that backend must fail to start.
+    let disabled = Command::new(env!("CARGO_BIN_EXE_jscout"))
+        .args([
+            "--no-progress",
+            "--experimental-tsr=false",
+            "enrich",
+            "--all",
+        ])
+        .arg(repo.path())
+        .env("PATH", "/jscout-test-no-executables")
+        .output()
+        .unwrap();
+    assert!(!disabled.status.success());
+    assert!(String::from_utf8_lossy(&disabled.stderr).contains("jscout-test-missing-node"));
+
+    fs::write(&policy, "version = 1\n[experimental]\ntsr = false\n").unwrap();
+    let enabled = run(
+        repo.path(),
+        &["--experimental-tsr", "enrich", "--all"],
+        true,
+    );
+    assert_eq!(enabled["checker_source"], "tsr-embedded");
+    assert_eq!(enabled["exact_batch_reused"], true);
+
+    // An explicit config replaces the root's policy and still needs no CLI flag.
+    let external = tempfile::tempdir().unwrap();
+    let override_path = external.path().join("policy.toml");
+    fs::write(&override_path, "version = 1\n[experimental]\ntsr = true\n").unwrap();
+    let overridden = run(
+        repo.path(),
+        &[
+            "--config",
+            override_path.to_str().unwrap(),
+            "enrich",
+            "--all",
+        ],
+        true,
+    );
+    assert_eq!(overridden["checker_source"], "tsr-embedded");
+    assert_eq!(overridden["exact_batch_reused"], true);
+}
+
 #[cfg(unix)]
 #[test]
 fn embedded_discovery_honors_sigint() {

@@ -57,7 +57,9 @@ libraries. This checker does not launch Node or a compiler sidecar. The global
 flag also applies to `checker doctor`, `watch --enrich`, and repository scouting's
 checker inventory; the generative gateway still uses Node. Embedded timeouts are
 cooperative, and answers may differ from the default TypeScript backend. The
-native packages include compiler notices under `third-party/tsr/`.
+native packages include compiler notices under `third-party/tsr/`. Set
+`experimental.tsr = true` in `.jscout.toml` for a repository default;
+`--experimental-tsr=false` selects the TypeScript sidecar for one invocation.
 
 Local embeddings/reranking use bundled Python service sources, with uv and
 Python 3.11/3.12. No source checkout is needed. Configure

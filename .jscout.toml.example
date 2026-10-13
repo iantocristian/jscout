@@ -3,6 +3,12 @@
 #   jscout config init <repository>
 version = 1
 
+[experimental]
+# Use the embedded TSR checker for enrich, checker doctor, watch enrichment,
+# and scout repository inventory. Restart watch after changing this setting.
+# CLI --experimental-tsr or --experimental-tsr=false overrides it for one run.
+tsr = false
+
 [database]
 path = ".jscout.db"
 

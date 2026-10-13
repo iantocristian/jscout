@@ -17,9 +17,9 @@ pub(super) struct Cli {
     /// Suppress progress on stderr (warnings and errors are still reported)
     #[arg(long, global = true)]
     pub(super) no_progress: bool,
-    /// Use the experimental embedded TSR checker (no checker subprocess; cooperative deadlines)
-    #[arg(long, global = true)]
-    pub(super) experimental_tsr: bool,
+    /// Enable or disable embedded TSR (overrides experimental.tsr; cooperative deadlines)
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub(super) experimental_tsr: Option<bool>,
     #[command(subcommand)]
     pub(super) command: Command,
 }
