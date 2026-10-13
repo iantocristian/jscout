@@ -1,6 +1,6 @@
 //! Retain each filesystem answer actually used by one compiler project. The
 //! manifest hashes those answers, not a second read made after compilation.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +11,29 @@ use super::{Request, error, path_text};
 use crate::checker::process::CheckerError;
 use crate::checker::protocol::CheckerInputFile;
 
-pub const INPUT_PREFIX: &str = "tsr-observed:v1:";
+pub const INPUT_PREFIX: &str = "tsr-observed:v2:";
+
+/// File names relevant to compiler directory enumeration. Explicit reads and
+/// failed lookups are still recorded regardless of extension. Include JSON for
+/// package/config discovery and resolveJsonModule; keep every directory below.
+pub fn compiler_file_name(name: &[u8]) -> bool {
+    [
+        b".ts".as_slice(),
+        b".tsx",
+        b".mts",
+        b".cts",
+        b".js",
+        b".jsx",
+        b".mjs",
+        b".cjs",
+        b".json",
+    ]
+    .iter()
+    .any(|extension| {
+        name.len() >= extension.len()
+            && name[name.len() - extension.len()..].eq_ignore_ascii_case(extension)
+    })
+}
 
 pub fn observes_directory_entries(signature: &str) -> bool {
     signature
@@ -95,16 +117,19 @@ impl Observation {
         if let Some(value) = &self.entries {
             mask |= 4;
             record(&mut hasher, value, |hash, entries| {
-                for names in [&entries.files, &entries.directories] {
+                let mut relevant = BTreeSet::new();
+                for (names, files) in [(&entries.files, true), (&entries.directories, false)] {
                     let mut names = names
                         .as_deref()
                         .unwrap_or_default()
                         .iter()
                         .map(JsString::as_bytes)
+                        .filter(|name| !files || compiler_file_name(name))
                         .collect::<Vec<_>>();
                     names.sort_unstable();
                     part(hash, &(names.len() as u64).to_le_bytes());
                     for name in names {
+                        relevant.insert(name);
                         part(hash, name);
                     }
                 }
@@ -113,6 +138,7 @@ impl Observation {
                     .iter()
                     .flatten()
                     .map(JsString::as_bytes)
+                    .filter(|name| relevant.contains(name))
                     .collect::<Vec<_>>();
                 symlinks.sort_unstable();
                 for name in symlinks {

@@ -171,3 +171,61 @@ Final-run databases, stdout/stderr, commands, metrics and SQL comparisons are at
 `/Users/cristian/git/js-rag/target/embedded-tsr-pr-next-2026-10-11/`.
 The `run.py` and `compare.py` procedures from the initial experiment were reused.
 All captures and databases remain build output outside the Next.js checkout.
+
+## PR #130 watch and cache review
+
+The review follow-up starts from main `569b486d51f8dd605108366c1ae359e25e1300b4`.
+Regression tests first reproduced repository paths becoming external watch
+targets, unselected outside events scheduling work, README creation invalidating
+exact checker reuse, and an unreadable discovery directory aborting the command.
+
+The fix separates cache observations from watcher coverage. Visible repository
+sources/directories retain normal incremental classification; ignored or
+unindexed compiler inputs and explicitly selected external inputs remain
+covered. Ancestor directory probes are not broad event targets. Missing lookup
+chains subscribe through an existing parent to their first absent child, avoiding
+failed registrations while still detecting creation. Directory-listing events
+request incremental refreshes. Directory fingerprints now hash subdirectories
+and TS/JS/JSON names, including relevant symlinks; exact reads, missing paths and
+symlink targets remain validated. The observation format changes to v2 so old
+checker batches are recomputed once. Discovery skips unreadable or disappearing
+subdirectories without swallowing cancellation or discovered config errors.
+
+Live macOS watch validation with enrichment enabled on a three-source fixture:
+
+- Editing `src/main.ts` produced `refresh_scope=incremental`, `indexed=1`,
+  `unchanged=2`, and successful enrichment.
+- Creating `src/notes.txt` and `src/.DS_Store` caused zero refreshes.
+- Five parent/grandparent/sibling creation or deletion events caused zero
+  refreshes.
+
+On the same Next.js revision and 24,309-file index, the final release compiler
+pass selected **12,077 calls** and published **1,462 facts**. Compared with the
+previous TSR run, selection, target/confidence tuples, receiver text and coverage
+statuses all match. The pass ran without Node or a usable sidecar. Adding four
+unrelated MD, Finder-style metadata, PNG and BIN files to an observed source
+directory retained **exact batch reuse**.
+
+The Next.js notification probe used the active **13,504-row checker input
+manifest** with enrichment disabled to isolate structural refresh behavior.
+Creating/deleting an unrelated file beside the repository caused zero refreshes.
+Appending a temporary comment to `packages/next/src/shared/lib/is-plain-object.ts`
+produced `refresh_scope=incremental`, **1 indexed / 24,308 unchanged**, and the
+same 11 parser-fixture rejections. There were **zero degraded watch coverage
+warnings**. All temporary Next.js changes were restored and Git status is clean.
+The three-source live probe separately verifies the enrichment phase.
+
+Final validation passed: **829 Rust unit tests, 19 CLI integration tests**, Clippy
+with warnings denied, formatting and whitespace checks, release compilation,
+and **18 documentation tests**. Regression coverage retains new TS/JS/JSON and
+directory invalidation, exact file reads, missing inputs, symlink retargeting,
+ignored/unindexed inputs, explicit external inputs and Git controls. The Unix
+permission test runs `checker doctor` and enrichment with an unreadable subtree
+under a wildcard include (and skips when the user can bypass mode bits).
+
+Commands, before-fix failures, test/build logs, comparisons and live-watch
+captures are retained at
+`/Users/cristian/git/js-rag/target/embedded-tsr-watch-review-2026-10-13/`.
+The existing `run.py` and `compare.py` procedures were reused; `watch_probe.py`
+and `next_probe.py` record the event tests. `next.db` is a test artifact whose
+last structural snapshot includes the temporary comment; rebuild it before reuse.

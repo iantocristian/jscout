@@ -34,13 +34,17 @@ fn discover_configs(root: &Path, request: &Request) -> Result<Vec<PathBuf>, Chec
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         request.check()?;
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|e| error("config", format!("{}: {e}", directory.display())))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| error("config", e.to_string()))?;
-            let kind = entry
-                .file_type()
-                .map_err(|e| error("config", e.to_string()))?;
+        // Match the sidecar's best-effort discovery: inaccessible or removed
+        // subtrees must not prevent checking the readable projects. Parsing a
+        // discovered config still reports its own read/configuration failures.
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            request.check()?;
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if kind.is_dir() {

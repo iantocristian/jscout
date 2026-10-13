@@ -720,10 +720,6 @@ impl EventClassifier {
                 continue;
             }
             if self.external_exact.contains(&path)
-                || self.checker_directories.contains(&path)
-                || path
-                    .parent()
-                    .is_some_and(|parent| self.checker_directories.contains(parent))
                 || self
                     .external_prefixes
                     .iter()
@@ -733,6 +729,30 @@ impl EventClassifier {
                     &mut signal,
                     DirtySignal::full(format!("external:{}", path.display())),
                 );
+                continue;
+            }
+            if self.checker_directories.contains(&path)
+                || (path
+                    .parent()
+                    .is_some_and(|parent| self.checker_directories.contains(parent))
+                    && (!path.is_file()
+                        || path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                checker::embedded::host::compiler_file_name(name.as_bytes())
+                            })))
+            {
+                merge_signal(
+                    &mut signal,
+                    DirtySignal::inventory(format!("checker-directory:{}", path.display())),
+                );
+                continue;
+            }
+            // Parent-directory subscriptions also report unrelated siblings
+            // and ancestor activity. Only explicitly selected external inputs,
+            // dependencies, configuration, and Git controls can leave the root.
+            if !path.starts_with(&self.root) {
                 continue;
             }
             // Selected external roots were handled above. For repository
@@ -2330,6 +2350,7 @@ fn collect_watch_targets(
             row.get::<_, String>(2)?,
         ))
     })?;
+    let mut source_policy = walk::SourcePathPolicy::new(root);
     for row in rows {
         let (kind, input, signature) = row?;
         let path = if kind == "absolute" {
@@ -2337,19 +2358,56 @@ fn collect_watch_targets(
         } else {
             root.join(input)
         };
-        if checker::embedded::host::observes_directory_entries(&signature) {
-            targets.push(WatchTarget {
+        // Compiler resolution probes every ancestor. These directory
+        // observations belong in cache validation, not broad watch targets.
+        if root.starts_with(&path) {
+            continue;
+        }
+        let directory_entries = checker::embedded::host::observes_directory_entries(&signature);
+        if path.starts_with(root) {
+            let directory = directory_entries || path.is_dir();
+            let covered = directory
+                || is_active_refresh_boundary(&path, docs_freshness)
+                || formats::repository_code_for_path(&path).is_some();
+            if covered
+                && !walk::is_in_skipped_directory(root, &path)
+                && !source_policy.is_ignored(&path, directory)
+            {
+                // The recursive repository subscription and ordinary event
+                // policy already cover visible source/config/directory edits.
+                continue;
+            }
+            // Embedded inputs include ignored sources, failed lookups and
+            // unindexed JSON/config files that still need explicit coverage.
+            if !signature.starts_with(checker::embedded::host::INPUT_PREFIX) {
+                continue;
+            }
+        }
+        let mut target = if directory_entries {
+            WatchTarget {
                 watch_path: path.clone(),
                 path,
                 mode: RecursiveMode::NonRecursive,
                 kind: TargetKind::Directory,
                 source: TargetSource::Checker,
-            });
-        } else if !path.starts_with(root)
-            || signature.starts_with(checker::embedded::host::INPUT_PREFIX)
-        {
-            targets.push(exact_watch_target(path, TargetSource::Checker));
+            }
+        } else {
+            exact_watch_target(path, TargetSource::Checker)
+        };
+        // Failed resolution often probes whole missing directory chains. Watch
+        // their first absent child from an existing parent so creation can be
+        // detected without hundreds of failing subscriptions. Classification
+        // stays limited to that child, even when the parent is outside root.
+        while !target.watch_path.is_dir() {
+            let Some(parent) = target.watch_path.parent() else {
+                break;
+            };
+            let parent = parent.to_path_buf();
+            target.path = target.watch_path;
+            target.watch_path = parent;
+            target.kind = TargetKind::Directory;
         }
+        targets.push(target);
     }
     normalize_targets(&mut targets);
     Ok(targets)

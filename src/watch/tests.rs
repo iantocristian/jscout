@@ -702,8 +702,10 @@ fn git_controls_cover_symbolic_head_history_and_shallow_state() -> Result<()> {
 #[test]
 fn disabled_docs_freshness_gates_only_provenance_git_controls() -> Result<()> {
     let repository = tempfile::tempdir()?;
+    // Ancestor attributes must be explicitly discovered from a real Git root;
+    // arbitrary outside paths no longer reach repository boundary handling.
+    git(repository.path(), &["init"])?;
     fs::create_dir_all(repository.path().join(".git/logs"))?;
-    fs::write(repository.path().join(".git/HEAD"), "detached\n")?;
     fs::write(repository.path().join(".gitattributes"), "*.md text\n")?;
     fs::write(repository.path().join(".gitignore"), "dist/\n")?;
     fs::write(repository.path().join(".gitmodules"), "")?;
@@ -1298,7 +1300,8 @@ fn embedded_directory_inputs_watch_children_without_watching_entire_subtrees() {
     assert!(
         classifier
             .classify(&[directory.join("new-package")])
-            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+            .is_some_and(|signal| signal.scope == RefreshScope::Incremental
+                && signal.checker_refresh_required)
     );
     assert!(
         classifier
@@ -2319,5 +2322,189 @@ fn incremental_refresh_reuses_unchanged_source_rows() -> Result<()> {
     );
     assert_eq!(refreshed.outcome.removed, 0);
     assert!(refreshed.outcome.projection_rebuilt);
+    Ok(())
+}
+
+#[test]
+fn embedded_watch_targets_leave_repository_sources_incremental() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let root = repo.path().canonicalize()?;
+    fs::create_dir_all(root.join("src"))?;
+    fs::create_dir_all(root.join("node_modules/pkg"))?;
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"noLib":true,"resolveJsonModule":true,"module":"commonjs"},"include":["src"]}"#,
+    )?;
+    fs::write(
+        root.join("src/main.ts"),
+        "import { Service } from './service'; import data from './data.json'; export function run(service: Service) { service.ping(); }\n",
+    )?;
+    fs::write(
+        root.join("src/service.ts"),
+        "/// <reference path=\"../node_modules/pkg/index.d.ts\" />\nexport class Service { ping() {} }\n",
+    )?;
+    fs::write(root.join("src/data.json"), "{\"value\":1}")?;
+    fs::write(
+        root.join("node_modules/pkg/index.d.ts"),
+        "interface Dependency { value: string }\n",
+    )?;
+    let database = root.join("watch.db");
+    run_refresh(
+        &root,
+        &database,
+        &Default::default(),
+        RefreshScope::Full,
+        false,
+    )?;
+    // Query the actual embedded compiler without installing a process-wide
+    // signal handler in the unit-test process (the gateway tests own one).
+    let source = fs::read_to_string(root.join("src/main.ts"))?;
+    let start = source.find("service.ping()").unwrap() as i64;
+    let mut checker = crate::checker::embedded::EmbeddedChecker::new(&root)?;
+    let result = checker.resolve_members(
+        "tsconfig.json".into(),
+        vec![],
+        vec![crate::checker::protocol::MemberQuery {
+            file: "src/main.ts".into(),
+            indexed_hash: blake3::hash(source.as_bytes()).to_hex().to_string(),
+            call_start: start,
+            call_end: start + 14,
+            receiver_start: start,
+            receiver_end: start + 7,
+            property_start: start + 8,
+            property_end: start + 12,
+        }],
+        seconds(60),
+    )?;
+    assert_eq!(result.results[0].answer.declarations.len(), 1);
+    let validation = checker.validate_project(
+        "tsconfig.json".into(),
+        result.checker_input_fingerprint,
+        seconds(60),
+    )?;
+    assert!(validation.valid);
+    let conn = crate::store::open_path(&database)?;
+    conn.execute_batch("INSERT INTO checker_enrichment_batches
+        (id, source_snapshot, checker_version, checker_source, checker_input_fingerprint, sidecar_protocol, created_at)
+        VALUES(1, 'fixture', 'fixture', 'tsr-embedded', 'fixture', 1, 'fixture');
+        INSERT INTO checker_project_runs(batch_id, project_id, status, selected_occurrences, updated_at)
+        VALUES(1, 'tsconfig.json', 'completed', 1, 'fixture');")?;
+    for input in validation.inputs {
+        let path = Path::new(&input.path);
+        let (kind, path) = path
+            .strip_prefix(&root)
+            .map_or(("absolute", path), |path| ("repository", path));
+        conn.execute("INSERT INTO checker_project_inputs(batch_id, project_id, input_kind, input_path, source_hash)
+            VALUES(1, 'tsconfig.json', ?1, ?2, ?3)", rusqlite::params![kind, path.to_string_lossy(), input.source_hash])?;
+    }
+    let targets = super::collect_watch_targets(&root, &database, false)?;
+    let checker_targets = targets
+        .iter()
+        .filter(|target| target.source == TargetSource::Checker)
+        .collect::<Vec<_>>();
+    assert!(
+        checker_targets
+            .iter()
+            .all(|target| target.watch_path.is_dir()),
+        "missing compiler lookups must subscribe through an existing directory"
+    );
+    for path in [
+        root.clone(),
+        root.join("src"),
+        root.join("src/main.ts"),
+        root.join("src/service.ts"),
+    ] {
+        assert!(
+            !checker_targets.iter().any(|target| target.path == path),
+            "ordinary repository path became a checker watch target: {}",
+            path.display()
+        );
+    }
+    assert!(
+        !checker_targets
+            .iter()
+            .any(|target| root.starts_with(&target.path)),
+        "ancestor directory became a checker watch target"
+    );
+    for path in [
+        root.join("node_modules/pkg/index.d.ts"),
+        root.join("src/data.json"),
+    ] {
+        assert!(
+            checker_targets.iter().any(|target| target.path == path),
+            "unindexed compiler input lost watch coverage: {}",
+            path.display()
+        );
+    }
+    let mut classifier = EventClassifier::new(&root, &database, &Default::default())?;
+    update_classifier_targets(&mut classifier, &targets);
+    assert_eq!(
+        classifier.classify(&[root.join("src/main.ts")]),
+        Some(source_signal("src/main.ts"))
+    );
+    assert_eq!(
+        classifier.classify(&[root.join("src")]),
+        Some(DirtySignal::inventory("inventory:directory-event"))
+    );
+    for name in ["notes.txt", ".DS_Store", "image.png", "data.bin"] {
+        let path = root.join("src").join(name);
+        fs::write(&path, "noise")?;
+        assert!(
+            classifier.classify(&[path]).is_none(),
+            "{name} scheduled watch work"
+        );
+    }
+    for path in [
+        root.join("node_modules/pkg/index.d.ts"),
+        root.join("src/data.json"),
+    ] {
+        assert!(
+            classifier.classify(&[path]).is_some(),
+            "unindexed compiler input edit was ignored"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn outside_events_require_an_explicit_watch_target() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let parent = workspace.path().canonicalize()?;
+    let root = parent.join("repo");
+    fs::create_dir(&root)?;
+    let wanted = parent.join("shared/ambient.d.ts");
+    fs::create_dir(wanted.parent().unwrap())?;
+    fs::write(&wanted, "interface External {}")?;
+    let mut classifier = EventClassifier::new(&root, &root.join("watch.db"), &Default::default())?;
+    update_classifier_targets(
+        &mut classifier,
+        &[super::exact_watch_target(
+            wanted.clone(),
+            TargetSource::Checker,
+        )],
+    );
+    for path in [
+        parent.clone(),
+        parent.join("other.ts"),
+        parent.join("package.json"),
+        parent.join("shared/unrelated.ts"),
+        parent.parent().unwrap().join("unrelated.json"),
+    ] {
+        assert!(
+            classifier.classify(std::slice::from_ref(&path)).is_none(),
+            "unselected outside path scheduled watch work: {}",
+            path.display()
+        );
+    }
+    fs::write(parent.join("other.ts"), "export {}")?;
+    assert!(classifier.classify(&[parent.join("other.ts")]).is_none());
+    assert!(
+        classifier.classify(&[wanted]).is_some(),
+        "explicit external input lost watch coverage"
+    );
+    assert_eq!(
+        classifier.classify(&[parent.join("other.ts"), root.join("main.ts")]),
+        Some(source_signal("main.ts"))
+    );
     Ok(())
 }
