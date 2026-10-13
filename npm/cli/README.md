@@ -51,6 +51,14 @@ Node is required for this npm launcher even for Rust-only operations.
 The bundled Node sidecars support optional checker enrichment and model-backed
 scouting; scouting needs separate authentication.
 
+`jscout --experimental-tsr enrich /path/to/repo` selects the experimental Rust
+TypeScript compiler embedded in the native binary, including its standard
+libraries. This checker does not launch Node or a compiler sidecar. The global
+flag also applies to `checker doctor`, `watch --enrich`, and repository scouting's
+checker inventory; the generative gateway still uses Node. Embedded timeouts are
+cooperative, and answers may differ from the default TypeScript backend. The
+native packages include compiler notices under `third-party/tsr/`.
+
 Local embeddings/reranking use bundled Python service sources, with uv and
 Python 3.11/3.12. No source checkout is needed. Configure
 `embedding.provider = "local"`, then explicitly start

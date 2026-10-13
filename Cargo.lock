@@ -80,6 +80,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "ar_archive_writer"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73cd58deff2140a0a8eae87e417bd01db68a33e148aa93d1e8cd837e55e312b6"
+dependencies = [
+ "object",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -703,6 +712,19 @@ dependencies = [
  "tempfile",
  "toml",
  "toml_edit",
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_astnav",
+ "tsr_bundled",
+ "tsr_checker",
+ "tsr_compiler",
+ "tsr_core",
+ "tsr_embed",
+ "tsr_jsstring",
+ "tsr_parser",
+ "tsr_printer",
+ "tsr_tsoptions",
+ "tsr_vfs",
  "unicode-normalization",
  "ureq",
 ]
@@ -913,6 +935,15 @@ name = "objc2-encode"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "once_cell"
@@ -1283,6 +1314,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "psm"
+version = "0.1.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
+dependencies = [
+ "ar_archive_writer",
+ "cc",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1560,6 +1601,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1732,6 +1779,19 @@ dependencies = [
  "js-sys",
  "rsqlite-vfs",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "stacker"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707f49d46706bacf8a2b00d51dace3f9de527c13eec3778f570c411f89e69967"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "psm",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1927,6 +1987,405 @@ name = "triomphe"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b40688ea6389c8171614b25491f71d4a27946e0c7ce2da1c6de27e25abf1a0ae"
+
+[[package]]
+name = "tsr_arena"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "hashbrown 0.17.1",
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_ast"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "hashbrown 0.17.1",
+ "stacker",
+ "tsr_arena",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_jsnum",
+ "tsr_json",
+ "tsr_jsstring",
+ "tsr_locale",
+]
+
+[[package]]
+name = "tsr_astnav"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_scanner",
+]
+
+[[package]]
+name = "tsr_binder"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "stacker",
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_jsstring",
+ "tsr_parser",
+ "tsr_scanner",
+]
+
+[[package]]
+name = "tsr_bundled"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_jsstring",
+ "tsr_vfs",
+]
+
+[[package]]
+name = "tsr_checker"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "hashbrown 0.17.1",
+ "stacker",
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_astnav",
+ "tsr_binder",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_jsnum",
+ "tsr_jsstring",
+ "tsr_module",
+ "tsr_nodebuilder",
+ "tsr_parser",
+ "tsr_printer",
+ "tsr_pseudochecker",
+ "tsr_scanner",
+ "tsr_tsoptions",
+ "tsr_tspath",
+ "tsr_vfs",
+]
+
+[[package]]
+name = "tsr_compiler"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "stacker",
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_binder",
+ "tsr_bundled",
+ "tsr_checker",
+ "tsr_contentmapper",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_jsstring",
+ "tsr_locale",
+ "tsr_module",
+ "tsr_parser",
+ "tsr_printer",
+ "tsr_scanner",
+ "tsr_sourcemap",
+ "tsr_transformers",
+ "tsr_tsoptions",
+ "tsr_tspath",
+ "tsr_vfs",
+]
+
+[[package]]
+name = "tsr_contentmapper"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_ipc",
+ "tsr_json",
+ "tsr_jsonrpc",
+ "tsr_jsstring",
+ "tsr_locale",
+ "tsr_parser",
+ "tsr_tsoptions",
+ "tsr_tspath",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tsr_core"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_diagnostics"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_core",
+ "tsr_json",
+ "tsr_locale",
+]
+
+[[package]]
+name = "tsr_embed"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_checker",
+ "tsr_compiler",
+ "tsr_core",
+ "tsr_encoder",
+ "tsr_jsstring",
+ "tsr_parser",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tsr_encoder"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_core",
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_glob"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_ipc"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_json",
+ "tsr_jsonrpc",
+]
+
+[[package]]
+name = "tsr_jsnum"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "ryu-js",
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_json"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "stacker",
+ "tsr_core",
+ "tsr_jsnum",
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_jsonrpc"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_json",
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_jsstring"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+
+[[package]]
+name = "tsr_locale"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+
+[[package]]
+name = "tsr_module"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tsr_ast",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_jsstring",
+ "tsr_semver",
+ "tsr_tsoptions",
+ "tsr_tspath",
+ "tsr_vfs",
+]
+
+[[package]]
+name = "tsr_nodebuilder"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_ast",
+]
+
+[[package]]
+name = "tsr_parser"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "stacker",
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_jsnum",
+ "tsr_jsstring",
+ "tsr_scanner",
+]
+
+[[package]]
+name = "tsr_printer"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "hashbrown 0.17.1",
+ "stacker",
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_core",
+ "tsr_jsnum",
+ "tsr_jsstring",
+ "tsr_nodebuilder",
+ "tsr_scanner",
+ "tsr_sourcemap",
+ "tsr_tspath",
+]
+
+[[package]]
+name = "tsr_pseudochecker"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "stacker",
+ "tsr_arena",
+ "tsr_ast",
+]
+
+[[package]]
+name = "tsr_scanner"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "stacker",
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_jsnum",
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_semver"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_sourcemap"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "hashbrown 0.17.1",
+ "tsr_arena",
+ "tsr_core",
+ "tsr_json",
+ "tsr_jsstring",
+ "tsr_tspath",
+]
+
+[[package]]
+name = "tsr_transformers"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "stacker",
+ "tsr_arena",
+ "tsr_ast",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_jsnum",
+ "tsr_jsstring",
+ "tsr_nodebuilder",
+ "tsr_printer",
+ "tsr_scanner",
+ "tsr_tsoptions",
+ "tsr_tspath",
+]
+
+[[package]]
+name = "tsr_tsoptions"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "serde_json",
+ "stacker",
+ "tsr_ast",
+ "tsr_bundled",
+ "tsr_core",
+ "tsr_diagnostics",
+ "tsr_glob",
+ "tsr_jsnum",
+ "tsr_json",
+ "tsr_jsstring",
+ "tsr_locale",
+ "tsr_parser",
+ "tsr_scanner",
+ "tsr_tspath",
+ "tsr_vfs",
+]
+
+[[package]]
+name = "tsr_tspath"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "tsr_core",
+ "tsr_jsstring",
+]
+
+[[package]]
+name = "tsr_vfs"
+version = "0.4.0"
+source = "git+https://github.com/ferrotype/tsr?rev=2009f6ec101358966902698f9ac2a7ff71ed57c3#2009f6ec101358966902698f9ac2a7ff71ed57c3"
+dependencies = [
+ "rustix",
+ "tsr_core",
+ "tsr_jsstring",
+ "tsr_tspath",
+]
 
 [[package]]
 name = "unicase"
@@ -2409,6 +2868,12 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "zeroize"

@@ -168,6 +168,8 @@ impl Provider {
                 Err(error) => panic!("accept embedding request: {error}"),
             }
         };
+        // Poll the listener, then read each accepted request with blocking deadlines.
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(DEADLINE)).unwrap();
         stream.set_write_timeout(Some(DEADLINE)).unwrap();
         let mut reader = BufReader::new(stream);

@@ -24,6 +24,7 @@ pub(super) const INFERRED_ROOT_CAP: usize = 150;
 
 #[derive(Debug, Clone)]
 pub struct EnrichOptions<'a> {
+    pub backend: super::Backend,
     pub database: Option<&'a Path>,
     pub sidecar: Option<&'a Path>,
     pub node: &'a str,
@@ -412,7 +413,7 @@ struct ValidatedInput {
 /// digest avoids re-reading and re-hashing the same bytes for every project.
 struct InputFreshnessCache<'a> {
     root: &'a Path,
-    digests: HashMap<PathBuf, Option<String>>,
+    digests: HashMap<(PathBuf, String), Option<String>>,
 }
 
 impl<'a> InputFreshnessCache<'a> {
@@ -426,15 +427,23 @@ impl<'a> InputFreshnessCache<'a> {
     fn matches(&mut self, input: &ValidatedInput) -> bool {
         let path = input_path(self.root, input);
         self.digests
-            .entry(path.clone())
-            .or_insert_with(|| match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Some(ABSENT_INPUT_HASH.into())
+            .entry((path.clone(), input.source_hash.clone()))
+            .or_insert_with(|| {
+                if input
+                    .source_hash
+                    .starts_with(super::embedded::host::INPUT_PREFIX)
+                {
+                    return super::embedded::host::fresh_signature(&path, &input.source_hash);
                 }
-                Err(_) => None,
-                Ok(_) => fs::read(path)
-                    .ok()
-                    .map(|bytes| blake3::hash(&bytes).to_hex().to_string()),
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Some(ABSENT_INPUT_HASH.into())
+                    }
+                    Err(_) => None,
+                    Ok(_) => fs::read(path)
+                        .ok()
+                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string()),
+                }
             })
             .as_deref()
             .is_some_and(|hash| hash == input.source_hash)
@@ -538,11 +547,17 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let dirty_files = current_dirty_source_files(&conn, &options.dirty_files)?;
     let inventory_files = super::package_gate::inventory_paths(&conn)?;
     crate::progress::stage("starting checker planner", None);
-    let mut planner = super::launch(&canonical_root, options.sidecar, None, options.node)?;
+    let mut planner = super::launch(
+        &canonical_root,
+        options.sidecar,
+        None,
+        options.node,
+        options.backend,
+    )?;
     planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
-    let protocol = planner.versions.protocol;
+    let protocol = planner.protocol_version();
     crate::progress::stage("planning checker inventory ownership", None);
     let (inventory_ownership, inventory_typescript) =
         plan_inventory_ownership(&mut planner, &inventory_files, options.timeout)?;
@@ -1764,7 +1779,7 @@ fn current_dirty_source_files(
 /// as one finish-time snapshot. Rust must not split it into independent calls:
 /// that would make configured ownership and inferred grouping chunk-relative.
 fn plan_inventory_ownership(
-    planner: &mut super::process::ProcessChecker,
+    planner: &mut super::Checker,
     files: &[String],
     timeout: Duration,
 ) -> Result<(Vec<FileOwnership>, TypeScriptIdentity)> {
@@ -1803,13 +1818,13 @@ fn revalidate_package_gate(
     protocol: u32,
     options: &EnrichOptions<'_>,
 ) -> Result<()> {
-    let mut planner = super::launch(root, options.sidecar, None, options.node)?;
+    let mut planner = super::launch(root, options.sidecar, None, options.node, options.backend)?;
     planner
         .register_interrupts()
         .context("failed to install checker Ctrl-C handler")?;
     let (ownership, current_checker) =
         plan_inventory_ownership(&mut planner, inventory_files, options.timeout)?;
-    if planner.versions.protocol != protocol
+    if planner.protocol_version() != protocol
         || current_checker.version != checker.version
         || current_checker.source != checker.source
     {
@@ -3071,13 +3086,22 @@ fn execute_project(
         return Ok(execution);
     }
     crate::progress::stage(format!("starting checker project {project_id}"), None);
-    let mut checker = super::launch(root, options.sidecar, None, options.node)?;
+    let mut checker = super::launch(root, options.sidecar, None, options.node, options.backend)?;
     if register_interrupts {
         checker
             .register_interrupts()
             .context("failed to install checker Ctrl-C handler")?;
     }
     let mut project_fingerprint = staged_fingerprints.into_iter().next();
+    // Embedded queries may consult the host lazily. Resolve the complete
+    // selected set once before publishing batches, fixing their input identity
+    // even when resuming a subset of an interrupted project.
+    checker.prepare_project(
+        project_id,
+        project_files,
+        &all_occurrences.iter().map(member_query).collect::<Vec<_>>(),
+        options.timeout,
+    )?;
     let resumed_fingerprint = project_fingerprint.clone();
     let mut execution = ProjectExecution::default();
     let mut project_peak_rss_bytes = 0;
@@ -3584,7 +3608,10 @@ fn complete_project(
             if let Some(previous) = seen.insert(key, input.source_hash.clone())
                 && previous != input.source_hash
             {
-                bail!("checker returned conflicting hashes for one project input");
+                bail!(
+                    "checker returned conflicting hashes for project input {}",
+                    input.path
+                );
             }
         }
         for ((kind, path), hash) in seen {
@@ -3906,6 +3933,12 @@ fn load_unknown_projects(conn: &Connection, batch_id: i64) -> Result<Vec<String>
 }
 
 fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> {
+    if expected.starts_with(super::embedded::host::INPUT_PREFIX) {
+        if super::embedded::host::fresh_signature(path, expected).as_deref() != Some(expected) {
+            bail!("embedded checker input changed since loading: {display}");
+        }
+        return Ok(());
+    }
     if expected == ABSENT_INPUT_HASH {
         return match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

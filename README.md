@@ -60,6 +60,12 @@ For source builds, release archives, Node/PATH requirements, authentication
 and upgrades, see [installation](docs/installation.md).
 For client-specific configuration and credentials, see [MCP setup](docs/mcp.md).
 
+The experimental `--experimental-tsr` flag runs checker enrichment with TSR
+and its standard libraries embedded in the Rust binary. See the
+[embedded checker guide](docs/advanced.md#experimental-embedded-checker),
+[implementation plan](docs/embedded-tsr-plan.md), and
+[Next.js validation](docs/embedded-tsr-next-results.md).
+
 ## Configuration
 
 Repository policy lives in `<root>/.jscout.toml`; jscout does not search

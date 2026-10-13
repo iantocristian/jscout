@@ -16,6 +16,11 @@ jobs:
           components: clippy, rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.19.0
+      - name: Install checker for embedded parity tests
+        run: npm ci --prefix checker
       - name: Run tests
         run: cargo test --all-targets --all-features
       - name: Run Clippy

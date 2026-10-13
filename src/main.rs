@@ -83,7 +83,15 @@ fn run(cli: Cli) -> Result<()> {
                     config::FILE_NAME,
                 );
             }
-            run_command(command, &runtime)
+            run_command(
+                command,
+                &runtime,
+                if cli.experimental_tsr {
+                    checker::Backend::Tsr
+                } else {
+                    checker::Backend::TypeScript
+                },
+            )
         }
     }
 }

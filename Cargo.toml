@@ -35,6 +35,21 @@ tempfile = "3.23.0"
 ureq = "3.3.0"
 unicode-normalization = "0.1.24"
 
+# Embedded experimental checker; compiler and standard libraries are linked into jscout.
+tsr_arena = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_ast = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_astnav = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_bundled = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_checker = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_compiler = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_core = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_embed = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_jsstring = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_parser = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_printer = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_tsoptions = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+tsr_vfs = { git = "https://github.com/ferrotype/tsr", rev = "2009f6ec101358966902698f9ac2a7ff71ed57c3" }
+
 # Lints the tree already passes, enabled so the cleanups cannot regress.
 #
 # This is deliberately an opt-in list rather than `pedantic = "warn"` with a

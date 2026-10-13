@@ -235,10 +235,50 @@ batch remains the resume target. After every project completes, Rust rechecks
 the code digest, distinct checker inputs, and mapped target
 fingerprints, publishes the complete canonical batch, and drops the superseded
 batch. A code-publication race remains staged and publishes nothing.
-Each request has a hard deadline (`--timeout`, default 300 seconds); timeout
-kills only the current project worker. Progress names the project and reports
+With the default backend, each request has a hard deadline (`--timeout`, default
+300 seconds); timeout kills only the current project worker. Progress names the project and reports
 staged occurrences plus Node RSS and heap usage. Worker crashes return the
 actual Node error/stack in the command error as well as stderr.
+
+### Experimental embedded checker
+
+`--experimental-tsr` selects the in-process [TSR compiler](https://github.com/ferrotype/tsr),
+pinned to revision `2009f6ec101358966902698f9ac2a7ff71ed57c3`. Compiler code and
+standard-library declarations are linked into every jscout binary. No compiler
+executable, language server, Node worker, local TSR checkout, or checker sidecar
+is used by this backend.
+
+```bash
+jscout --experimental-tsr checker doctor /path/to/repo
+jscout --experimental-tsr enrich /path/to/repo --dry-run
+jscout --experimental-tsr enrich /path/to/repo
+jscout --experimental-tsr watch /path/to/repo --enrich
+```
+
+The global flag also selects the checker inventory for `scout repository`;
+generative scouting still needs its Node gateway. Enrichment continues to resolve
+indexed member calls with the existing ownership, package policy, confidence,
+staging, and publication rules. It does not run TypeScript diagnostics or emit.
+Backend identity includes the pinned compiler, libraries, and adapter semantics;
+switching backends invalidates checker reuse.
+
+TSR can defer filesystem lookups until individual queries. The embedded adapter
+therefore resolves the selected project calls once, retains their owned answers,
+and freezes the complete input manifest before handing batches to staging. This
+also makes resumed rows comparable to a freshly checked project. Preparation
+progress is reported every 128 calls; interruptions during preparation restart
+that preparation. Completed batches and projects retain the existing resume rules.
+
+Embedded `--timeout` deadlines and cancellation are **cooperative**: they are
+checked at filesystem and query boundaries. A long compiler operation can exceed
+the deadline before returning; late results are discarded. A second Ctrl-C exits
+the process. Compiler panics become project failures. Native memory use is not
+currently reported in the protocol's Node RSS/heap counters (zero means unmeasured
+for this backend). TSR targets TypeScript 7, so its answers can differ from the
+repository's installed TypeScript. Keep the flag experimental while comparing
+real projects; see the [implementation plan](embedded-tsr-plan.md).
+The [Next.js validation report](embedded-tsr-next-results.md) records the
+tested scope, target parity, remaining coverage differences, and local timings.
 
 ### Checker code-digest lifecycle
 

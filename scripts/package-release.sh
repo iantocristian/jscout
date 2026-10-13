@@ -51,11 +51,12 @@ trap 'rm -rf "$staging"' EXIT
 mkdir -p "$staging/$bundle/gateway" "$staging/$bundle/checker" "$staging/$bundle/inference" "$staging/$bundle/docs"
 cp "$binary" "$staging/$bundle/$binary_name"
 cp README.md "$staging/$bundle/README.md"
+cp -R third-party "$staging/$bundle/third-party"
 cp PLAN.md "$staging/$bundle/PLAN.md"
 cp .env.example "$staging/$bundle/.env.example"
 cp .jscout.toml.example "$staging/$bundle/.jscout.toml.example"
 cp LICENSE-MIT LICENSE-APACHE "$staging/$bundle/"
-for guide in installation mcp inference configuration commands documentation advanced; do
+for guide in installation mcp inference configuration commands documentation advanced embedded-tsr-plan embedded-tsr-next-results; do
   cp "docs/$guide.md" "$staging/$bundle/docs/"
 done
 cp gateway/package.json gateway/package-lock.json "$staging/$bundle/gateway/"

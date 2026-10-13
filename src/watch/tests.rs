@@ -1278,6 +1278,36 @@ fn selected_external_prefix_overrides_node_modules_noise() {
 }
 
 #[test]
+fn embedded_directory_inputs_watch_children_without_watching_entire_subtrees() {
+    use super::{TargetKind, TargetSource, WatchTarget, update_classifier_targets};
+    use notify::RecursiveMode;
+    let root = PathBuf::from("/repo");
+    let directory = root.join("node_modules/@types");
+    let mut classifier =
+        EventClassifier::new(&root, &root.join(".jscout.db"), &Default::default()).unwrap();
+    update_classifier_targets(
+        &mut classifier,
+        &[WatchTarget {
+            watch_path: directory.clone(),
+            path: directory.clone(),
+            mode: RecursiveMode::NonRecursive,
+            kind: TargetKind::Directory,
+            source: TargetSource::Checker,
+        }],
+    );
+    assert!(
+        classifier
+            .classify(&[directory.join("new-package")])
+            .is_some_and(|signal| signal.scope == RefreshScope::Full)
+    );
+    assert!(
+        classifier
+            .classify(&[directory.join("existing/unrelated.js")])
+            .is_none()
+    );
+}
+
+#[test]
 fn a_refresh_boundary_dominates_source_paths_in_one_event() {
     let root = PathBuf::from("/repo");
     let classifier =
@@ -1604,6 +1634,7 @@ fn symlinked_config_watches_lexical_and_external_resolved_paths() -> Result<()> 
         enrich_timeout: seconds(300),
         checker_sidecar: None,
         checker_node: "node",
+        checker_backend: crate::checker::Backend::default(),
         timing: false,
         debug: false,
         debounce: seconds(2),
@@ -1693,6 +1724,7 @@ fn config_reload_toggles_docs_provenance_and_forces_a_full_refresh() -> Result<(
         enrich_timeout: seconds(300),
         checker_sidecar: None,
         checker_node: "node",
+        checker_backend: crate::checker::Backend::default(),
         timing: false,
         debug: false,
         debounce: seconds(2),
@@ -1911,6 +1943,7 @@ fn reconciliation_interval_must_exceed_debounce() {
         enrich_timeout: seconds(300),
         checker_sidecar: None,
         checker_node: "node",
+        checker_backend: crate::checker::Backend::default(),
         timing: false,
         debug: false,
         debounce: seconds(2),
@@ -1939,6 +1972,7 @@ fn product_embedding_requires_embedding_phase() {
         enrich_timeout: seconds(300),
         checker_sidecar: None,
         checker_node: "node",
+        checker_backend: crate::checker::Backend::default(),
         timing: false,
         debug: false,
         debounce: seconds(2),
@@ -1967,6 +2001,7 @@ fn startup_log_records_runtime_identities_and_effective_watch_flags() {
         enrich_timeout: seconds(300),
         checker_sidecar: None,
         checker_node: "node",
+        checker_backend: crate::checker::Backend::default(),
         timing: false,
         debug: false,
         debounce: seconds(2),
@@ -2019,6 +2054,7 @@ fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
         enrich_timeout: seconds(300),
         checker_sidecar: None,
         checker_node: "node",
+        checker_backend: crate::checker::Backend::default(),
         timing: false,
         debug: false,
         debounce: seconds(2),
@@ -2055,6 +2091,7 @@ fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
 fn checker_watch_options_factory_owns_selection_and_generation_overrides() {
     let database = Path::new("/repo/.jscout.db");
     let normal = watch_enrich_options(
+        crate::checker::Backend::default(),
         database,
         Some(Path::new("checker/main.mjs")),
         "node",
@@ -2063,6 +2100,7 @@ fn checker_watch_options_factory_owns_selection_and_generation_overrides() {
         vec!["src/a.ts".into()],
     );
     let flush = watch_enrich_options(
+        crate::checker::Backend::default(),
         database,
         Some(Path::new("checker/main.mjs")),
         "node",

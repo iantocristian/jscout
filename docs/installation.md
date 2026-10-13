@@ -33,8 +33,10 @@ binary is published.
 
 Node is required to launch **every npm-installed command**, even though core
 indexing, lexical retrieval and MCP are implemented in Rust. A directly
-launched release/source binary needs Node only for scouting or checker
-enrichment. The local inference feature separately needs uv and Python;
+launched release/source binary needs Node for scouting and the default checker
+backend. The experimental `--experimental-tsr` checker is embedded and needs
+no Node; see the [embedded checker guide](advanced.md#experimental-embedded-checker).
+The local inference feature separately needs uv and Python;
 see [inference](inference.md).
 
 ## Source checkout
@@ -58,7 +60,7 @@ registration for that repository.
 For CLI-only use, replace the setup command with
 `./target/release/jscout index /path/to/repo`.
 
-For optional checker or scouting commands, also install Node ≥22.19.0 and
+For the default checker backend or scouting commands, also install Node ≥22.19.0 and
 the pinned sidecar dependencies from the jscout checkout:
 
 ```bash

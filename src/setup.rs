@@ -159,6 +159,7 @@ pub fn run(
             no_dependencies: false,
         },
         &runtime,
+        crate::checker::Backend::default(),
     )?;
 
     // Start the exact command that will be registered, before publishing client config.

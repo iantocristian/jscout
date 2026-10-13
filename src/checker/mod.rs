@@ -1,8 +1,11 @@
+mod backend;
+pub(crate) mod embedded;
 mod enrich;
 mod package_gate;
 pub mod process;
 pub mod protocol;
 
+pub use backend::{Backend, Checker};
 pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_partial_failure};
 pub(crate) use enrich::{active_batch_inputs_fresh, target_fingerprint};
 
@@ -27,6 +30,7 @@ pub fn watch_policy_fingerprint(options: &EnrichOptions<'_>) -> String {
     }
 
     let mut hasher = blake3::Hasher::new();
+    component(&mut hasher, options.backend.name().as_bytes());
     for value in [
         b"jscout-checker-watch-policy-v2".as_slice(),
         enrich::CHECKER_SEMANTICS_FINGERPRINT,
@@ -113,11 +117,17 @@ pub fn launch(
     sidecar: Option<&Path>,
     configured_sidecar: Option<&Path>,
     node: &str,
-) -> Result<process::ProcessChecker> {
+    backend: Backend,
+) -> Result<Checker> {
+    if backend == Backend::Tsr {
+        return Ok(Checker::embedded(root)?);
+    }
     let node = crate::llm::config::resolve_node_setting(node, "the TypeScript checker sidecar")?;
     crate::llm::config::verify_node_version(&node)?;
     let sidecar = resolve_sidecar(sidecar, configured_sidecar)?;
-    Ok(process::ProcessChecker::spawn(&node, &sidecar, root)?)
+    Ok(Checker::TypeScript(process::ProcessChecker::spawn(
+        &node, &sidecar, root,
+    )?))
 }
 
 pub fn doctor(
@@ -126,7 +136,16 @@ pub fn doctor(
     configured_sidecar: Option<&Path>,
     node: &str,
     timeout: std::time::Duration,
+    backend: Backend,
 ) -> Result<()> {
+    if backend == Backend::Tsr {
+        process::begin_interrupt_scope()?;
+        let mut checker = Checker::embedded(root)?;
+        checker.register_interrupts()?;
+        println!("checker: tsr-embedded (experimental, in process)");
+        println!("deadlines: cooperative; a running compiler query cannot be forcibly stopped");
+        return print_capabilities(checker.capabilities(timeout)?);
+    }
     let node = crate::llm::config::resolve_node_setting(node, "the TypeScript checker sidecar")?;
     let node_version = crate::llm::config::verify_node_version(&node)?;
     let sidecar = resolve_sidecar(sidecar, configured_sidecar)?;
@@ -138,6 +157,10 @@ pub fn doctor(
         "checker sidecar version: {} (protocol {}), node {}",
         checker.versions.sidecar, checker.versions.protocol, checker.versions.node
     );
+    print_capabilities(capabilities)
+}
+
+fn print_capabilities(capabilities: protocol::Capabilities) -> Result<()> {
     println!(
         "TypeScript: {} ({})",
         capabilities.typescript.version, capabilities.typescript.source
@@ -176,6 +199,7 @@ mod policy_tests {
 
     fn options() -> EnrichOptions<'static> {
         EnrichOptions {
+            backend: crate::checker::Backend::default(),
             database: None,
             sidecar: None,
             node: "node",
