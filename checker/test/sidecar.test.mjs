@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { createRequire } from "node:module";
 import readline from "node:readline";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
@@ -21,10 +21,13 @@ import {
   takePlanMemberResultPage,
 } from "../src/protocol.mjs";
 import { inferredOptions } from "../src/inferred-options.mjs";
+import { loadRuntime } from "../src/runtime.mjs";
 
 const sidecar = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/main.mjs");
 const bundledTypeScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../node_modules/typescript");
 const ts = createRequire(import.meta.url)(bundledTypeScript);
+const nativeTests = process.env.JSCOUT_TEST_TYPESCRIPT === "7";
+const nativeTypeScript = path.dirname(createRequire(import.meta.url).resolve("typescript7/package.json"));
 
 function sourceHash(text) {
   return bytesToHex(blake3(new TextEncoder().encode(text)));
@@ -59,18 +62,23 @@ test("assigns explicit compiler semantics to each inferred family", () => {
   assert.throws(() => inferredOptions(ts, "unknown"), /unsupported inferred compiler family/u);
 });
 
-function fixture(files) {
+function fixture(files, installCompiler = nativeTests) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jscout-checker-"));
   for (const [relative, content] of Object.entries(files)) {
     const target = path.join(root, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, content);
   }
+  if (installCompiler) {
+    fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
+    fs.symlinkSync(nativeTypeScript, path.join(root, "node_modules/typescript"),
+      process.platform === "win32" ? "junction" : "dir");
+  }
   return root;
 }
 
-function client(root) {
-  const child = spawn(process.execPath, [sidecar, root], { stdio: ["pipe", "pipe", "pipe"] });
+function client(root, nodeArgs = []) {
+  const child = spawn(process.execPath, [...nodeArgs, sidecar, root], { stdio: ["pipe", "pipe", "pipe"] });
   const pending = new Map();
   let stderr = "";
   child.stderr.setEncoding("utf8");
@@ -374,6 +382,7 @@ test("groups declaration-only overloads by their resolved signature", async (con
     'import type { DeclaredService } from "./types";',
     "declare const service: DeclaredService;",
     "service.execute('x');",
+    "service.execute(1);",
     "",
   ].join("\n");
   const declarations = [
@@ -400,7 +409,10 @@ test("groups declaration-only overloads by their resolved signature", async (con
 
   const resolved = await checker.request("resolve_members", {
     project_id: "tsconfig.json",
-    queries: [queryFor(source, "service.execute('x')", "service", "execute")],
+    queries: [
+      queryFor(source, "service.execute('x')", "service", "execute"),
+      queryFor(source, "service.execute(1)", "service", "execute"),
+    ],
   });
   assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved));
   const answer = resolved.result.results[0].answer;
@@ -411,6 +423,8 @@ test("groups declaration-only overloads by their resolved signature", async (con
     declarations.indexOf("execute(value: string)"),
   ));
   assert.equal(answer.declarations[0].start, stringSignatureStart);
+  assert.equal(resolved.result.results[1].answer.declarations[0].start,
+    Buffer.byteLength(declarations.slice(0, declarations.indexOf("execute(value: number)"))));
   await checker.close();
 });
 
@@ -1437,7 +1451,7 @@ test("does not borrow a lint signal from a neighboring compound command", async 
 // absolute paths before `ts.createProgram` (normalization belongs to the
 // fingerprint) silently degraded every receiver reached through a `paths`
 // mapping to `any`, disabling enrichment for the monorepo shapes G10 targets.
-test("resolves receivers through a baseUrl/paths mapping and keeps type text repo-relative", async (context) => {
+test("resolves receivers through paths mappings and keeps type text repo-relative", async (context) => {
   const source = [
     'import { makeCard } from "@lib/tables";',
     "const card = makeCard();",
@@ -1452,7 +1466,9 @@ test("resolves receivers through a baseUrl/paths mapping and keeps type text rep
       "",
     ].join("\n"),
     "tsconfig.json": JSON.stringify({
-      compilerOptions: { strict: true, baseUrl: ".", paths: { "@lib/*": ["src/lib/*"] } },
+      compilerOptions: nativeTests
+        ? { strict: true, paths: { "@lib/*": ["./src/lib/*"] } }
+        : { strict: true, baseUrl: ".", paths: { "@lib/*": ["src/lib/*"] } },
       files: ["main.ts", "src/lib/tables.ts"],
     }),
   });
@@ -1649,10 +1665,10 @@ test("prefers a repository TypeScript installation over the bundled fallback", a
     "package.json": JSON.stringify({ private: true }),
     "main.ts": "export const value = 1;\n",
     "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
-  });
+  }, false);
   fs.mkdirSync(path.join(root, "node_modules"), { recursive: true });
   fs.symlinkSync(
-    bundledTypeScript,
+    nativeTests ? nativeTypeScript : bundledTypeScript,
     path.join(root, "node_modules/typescript"),
     process.platform === "win32" ? "junction" : "dir",
   );
@@ -1662,6 +1678,147 @@ test("prefers a repository TypeScript installation over the bundled fallback", a
   await checker.request("hello");
   const capabilities = await checker.request("capabilities");
   assert.equal(capabilities.capabilities.typescript.source, "repository");
-  assert.equal(capabilities.capabilities.typescript.version, "5.9.3");
+  assert.equal(capabilities.capabilities.typescript.version, nativeTests ? "7.0.2" : "5.9.3");
   await checker.close();
+});
+
+test("preserves UTF-8 spans and both union targets after non-ASCII text", async (context) => {
+  const source = [
+    "// café 😀\r",
+    "class Alpha { execute() {} }",
+    "class Beta { execute() {} }",
+    "declare const value: Alpha | Beta;",
+    "value.execute();",
+  ].join("\n");
+  const root = fixture({ "main.ts": source, "tsconfig.json": JSON.stringify({ files: ["main.ts"] }) });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  const result = await checker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [queryFor(source, "value.execute()", "value", "execute")],
+  });
+  assert.equal(result.kind, "resolve_members_result", JSON.stringify(result));
+  assert.deepEqual(result.result.results[0].answer.declarations.map((d) => [d.start, d.end]),
+    [source.indexOf("execute"), source.indexOf("execute", source.indexOf("execute") + 1)]
+      .map((index) => [Buffer.byteLength(source.slice(0, index)), Buffer.byteLength(source.slice(0, index + 7))]));
+  await checker.close();
+});
+
+test("does not substitute TS5 for a broken installed compiler or missing native API", async (context) => {
+  for (const main of ["missing.cjs", "index.cjs"]) {
+    const root = fixture({
+      "main.ts": "export {};\n",
+      "node_modules/typescript/package.json": JSON.stringify({ name: "typescript", version: "7.0.2", main }),
+      "node_modules/typescript/index.cjs": 'module.exports = { version: "7.0.2" };\n',
+    }, false);
+    context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const checker = client(root);
+    context.after(() => checker.child.kill());
+    const result = await checker.request("capabilities");
+    assert.equal(result.kind, "error");
+    assert.match(result.error.message, main === "missing.cjs" ? /missing\.cjs/u : /Cannot load TypeScript 7\.0\.2 native checker/u);
+    await checker.close();
+  }
+});
+
+test("rejects native configuration errors before publishing answers", { skip: !nativeTests }, async (context) => {
+  const source = "class Value { run() {} }\nnew Value().run();\n";
+  const root = fixture({
+    "main.ts": source,
+    "tsconfig.json": JSON.stringify({ compilerOptions: { target: "not-a-target" }, files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  const result = await checker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [queryFor(source, "new Value().run()", "new Value()", "run")],
+  });
+  assert.equal(result.kind, "error");
+  assert.equal(result.error.code, "config");
+  assert.match(result.error.message, /--target/u);
+  await checker.close();
+});
+
+test("native inventory stays configuration-only and fingerprints the actual binary", { skip: !nativeTests }, async (context) => {
+  const source = "class Value { run() {} }\nnew Value().run();\n";
+  const root = fixture({ "main.ts": source, "tsconfig.json": JSON.stringify({ files: ["main.ts"] }) });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const children = [];
+  const runtime = await loadRuntime(root, (child) => children.push(child));
+  context.after(() => runtime.close());
+  const { API } = await import(pathToFileURL(createRequire(path.join(nativeTypeScript, "package.json"))
+    .resolve("typescript/unstable/sync")).href);
+  const updateSnapshot = API.prototype.updateSnapshot;
+  API.prototype.updateSnapshot = () => assert.fail("inventory must not open a native project");
+  context.after(() => { API.prototype.updateSnapshot = updateSnapshot; });
+  const parsed = runtime.parseConfig(path.join(root, "tsconfig.json"));
+  assert.equal(parsed.fileNames.length, 1);
+  assert.equal(children.length, 1);
+  API.prototype.updateSnapshot = updateSnapshot;
+  const executable = runtime.files.at(-1);
+  assert.match(path.basename(executable), /^tsc(?:\.exe)?$/u);
+  assert.ok(fs.statSync(executable).size > 1024 * 1024);
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  const result = await checker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [queryFor(source, "new Value().run()", "new Value()", "run")],
+  });
+  assert.equal(result.kind, "resolve_members_result", JSON.stringify(result));
+  const validation = await checker.request("validate_project", {
+    project_id: "tsconfig.json",
+    fingerprint: result.result.checker_input_fingerprint,
+  });
+  assert.equal(validation.result.valid, true);
+  assert.ok(validation.result.inputs.some((input) => input.path === executable));
+  await checker.close();
+});
+
+test("native compilers stop on cancellation, replacement and shutdown", { skip: !nativeTests }, async (context) => {
+  const source = "class Value { run() {} }\nnew Value().run();\n";
+  const root = fixture({ "main.ts": source, "tsconfig.json": JSON.stringify({ files: ["main.ts"] }) });
+  const log = path.join(root, "compiler-pids");
+  const preload = path.join(root, "record-children.mjs");
+  fs.writeFileSync(preload, `
+    import cp from 'node:child_process';
+    import fs from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    const spawn = cp.spawn;
+    cp.spawn = (...args) => {
+      const child = spawn(...args);
+      if (args[1]?.includes('--api')) fs.appendFileSync(${JSON.stringify(log)}, child.pid + '\\n');
+      return child;
+    };
+    syncBuiltinESMExports();
+  `);
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root, ["--import", pathToFileURL(preload).href]);
+  context.after(() => checker.child.kill());
+  const first = await checker.request("capabilities");
+  assert.equal(first.kind, "capabilities_result");
+  const pending = checker.requestWithId("cancel-me", "resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [queryFor(source, "new Value().run()", "new Value()", "run")],
+  });
+  const canceled = await checker.request("cancel", { target_id: "cancel-me" });
+  assert.equal(canceled.active, true);
+  assert.equal((await pending).kind, "canceled");
+  const replacement = await checker.request("resolve_members", {
+    project_id: "tsconfig.json",
+    queries: [queryFor(source, "new Value().run()", "new Value()", "run")],
+  });
+  assert.equal(replacement.kind, "resolve_members_result", JSON.stringify(replacement));
+  await checker.close();
+  const pids = fs.readFileSync(log, "utf8").trim().split("\n").map(Number);
+  assert.ok(pids.length >= 2);
+  const alive = (pid) => {
+    try { process.kill(pid, 0); return true; }
+    catch (error) { if (error.code === "ESRCH") return false; throw error; }
+  };
+  for (let attempt = 0; attempt < 100 && pids.some(alive); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(pids.filter(alive), [], "checker left native compiler processes running");
 });

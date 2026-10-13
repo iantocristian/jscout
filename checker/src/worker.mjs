@@ -5,25 +5,15 @@ import path from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { inferredOptions } from "./inferred-options.mjs";
+import { loadRuntime } from "./runtime.mjs";
 import { PROTOCOL_VERSION } from "./protocol.mjs";
 
 const root = fs.realpathSync(workerData.root);
-const bundledRequire = createRequire(import.meta.url);
-
-function loadTypeScript() {
-  try {
-    const repositoryRequire = createRequire(path.join(root, "package.json"));
-    const resolved = repositoryRequire.resolve("typescript");
-    return { ts: repositoryRequire(resolved), source: "repository", resolved };
-  } catch {
-    const resolved = bundledRequire.resolve("typescript");
-    return { ts: bundledRequire(resolved), source: "bundled", resolved };
-  }
-}
-
-const runtime = loadTypeScript();
-const ts = runtime.ts;
+const runtime = await loadRuntime(root, (child) => {
+  parentPort.postMessage({ kind: "compiler_child", pid: child.pid });
+  child.once("exit", () => parentPort.postMessage({ kind: "compiler_child_exit", pid: child.pid }));
+});
+const ts = runtime.syntax;
 // Production enrichment dedicates one worker process to one configured
 // project. Keeping more than one Program here made peak memory proportional to
 // every overlapping tsconfig encountered by a repository-wide run.
@@ -36,23 +26,7 @@ const INFERRED_FAMILIES = new Set(["node-esm", "node-cjs", "bundler-jsx"]);
 const ABSENT_INPUT_HASH = "absent:v1";
 
 function runtimeInputs() {
-  const files = [runtime.resolved];
-  let directory = path.dirname(runtime.resolved);
-  while (directory !== path.dirname(directory)) {
-    const packageFile = path.join(directory, "package.json");
-    if (fs.existsSync(packageFile)) {
-      try {
-        if (JSON.parse(fs.readFileSync(packageFile, "utf8")).name === "typescript") {
-          files.push(packageFile);
-          break;
-        }
-      } catch {
-        break;
-      }
-    }
-    directory = path.dirname(directory);
-  }
-  return files.map((file) => {
+  return runtime.files.map((file) => {
     const canonical = fs.realpathSync(file);
     return {
       identity: `typescript:${path.basename(canonical)}`,
@@ -179,7 +153,7 @@ function configProblem(config, error) {
   return {
     project_id: path.relative(root, config).split(path.sep).join("/"),
     code: "config",
-    message: ts.flattenDiagnosticMessageText(error.messageText, " "),
+    message: runtime.diagnosticText(error),
   };
 }
 
@@ -397,7 +371,7 @@ function inferredProject(id, family, packageRecord, records) {
     absentManifests: [...absentManifests].sort(),
     packageDirectory: packageRecord.directory,
     family,
-    options: inferredOptions(ts, family),
+    options: runtime.inferredOptions(family),
     fileNames: records.map((record) => record.file).sort(),
     projectReferences: undefined,
     purpose: "inferred",
@@ -548,7 +522,7 @@ function configuredProjects(force = false) {
   const records = walkConfigs(root).map((config) => ({
     config,
     canonical: fs.realpathSync(config),
-    read: ts.readConfigFile(config, ts.sys.readFile),
+    read: runtime.readConfig(config),
   }));
   const inheritedBases = new Set();
   for (const record of records) {
@@ -571,7 +545,7 @@ function configuredProjects(force = false) {
       || read.config.include !== undefined
       || read.config.references !== undefined;
     if (inheritedBases.has(canonical) && !explicitlySelectsFiles) continue;
-    const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, path.dirname(config), undefined, config);
+    const parsed = runtime.parseConfig(config, read.config);
     if (parsed.errors.length > 0) {
       for (const error of parsed.errors) problems.push(configProblem(config, error));
       continue;
@@ -636,7 +610,7 @@ function configInputs(config, seen = new Set()) {
   }
   if (seen.has(canonical)) return [];
   seen.add(canonical);
-  const read = ts.readConfigFile(canonical, ts.sys.readFile);
+  const read = runtime.readConfig(canonical);
   const own = [{
     identity: relativeIdentity(canonical),
     path: canonical,
@@ -716,17 +690,12 @@ function buildProject(project) {
   // The program gets the EFFECTIVE options: normalizing absolute paths here
   // breaks baseUrl/paths resolution and silently degrades every mapped
   // receiver to `any`. Normalization exists for the fingerprint only.
-  const program = ts.createProgram({
-    rootNames: project.fileNames,
-    options: project.options,
-    projectReferences: project.projectReferences,
-  });
-  const checker = program.getTypeChecker();
+  const { program, checker, sourceFileNames } = runtime.build(project);
   const sourceInputs = [];
-  for (const source of program.getSourceFiles()) {
+  for (const fileName of sourceFileNames) {
     let canonical;
     try {
-      canonical = fs.realpathSync(source.fileName);
+      canonical = fs.realpathSync(fileName);
     } catch {
       continue;
     }
@@ -744,7 +713,7 @@ function buildProject(project) {
     .sort((left, right) => left.path.localeCompare(right.path));
   const fingerprint = digestText(JSON.stringify(stable({
     protocol: PROTOCOL_VERSION,
-    typescript: { version: ts.version, source: runtime.source },
+    typescript: { version: runtime.version, source: runtime.source },
     compiler_inputs: compilerInputs.map(({ identity, source_hash }) => [identity, source_hash]),
     project: project.id,
     configs: configs.map(({ identity, source_hash }) => [identity, source_hash]),
@@ -836,7 +805,7 @@ function overloadDeclaration(declaration) {
 
 function symbolDeclarations(checker, receiverType, member, call) {
   const property = member.name.text;
-  const types = receiverType.isUnion() ? receiverType.types : [receiverType];
+  const types = runtime.unionTypes(receiverType);
   const symbols = [];
   for (const type of types) {
     const symbol = checker.getPropertyOfType(type, property) ?? checker.getSymbolAtLocation(member.name);
@@ -845,17 +814,16 @@ function symbolDeclarations(checker, receiverType, member, call) {
     if (!symbols.includes(resolved)) symbols.push(resolved);
   }
   return symbols.flatMap((symbol) => {
-    const declarations = symbol.getDeclarations() ?? [];
+    const declarations = runtime.declarations(symbol);
     const implementation = declarations.find((declaration) => (
-      ts.isFunctionLike(declaration)
-      && checker.isImplementationOfOverload(declaration) === true
+      runtime.isImplementation(checker, declaration)
     ));
     if (implementation) return [implementation];
     // Interface and declaration-file overloads have no implementation node,
     // but every signature here belongs to the same TypeScript symbol. Keep
     // the signature selected for this call as its one logical candidate.
     if (declarations.length > 1 && declarations.every(overloadDeclaration)) {
-      const resolved = checker.getResolvedSignature(call)?.getDeclaration();
+      const resolved = runtime.signatureDeclaration(checker, call);
       return [resolved && declarations.includes(resolved) ? resolved : declarations[0]];
     }
     return declarations;
@@ -870,7 +838,7 @@ function declarationContext(relative) {
   if (relative === null) return "outside";
   if (!relative.includes("node_modules/")) return "repo";
   if (relative.includes("node_modules/@types/")) return "types";
-  if (/\/typescript\/lib\/lib\.[^/]+\.d\.ts$/u.test(relative)) return "lib";
+  if (/\/(?:typescript|@typescript\/typescript-[^/]+)\/lib\/lib\.[^/]+\.d\.ts$/u.test(relative)) return "lib";
   return "vendored";
 }
 
@@ -922,7 +890,7 @@ function planMembers(files, refreshConfig = true) {
     };
   });
   return {
-    typescript: { version: ts.version, source: runtime.source },
+    typescript: { version: runtime.version, source: runtime.source },
     files: ownership,
     projects: [...discovered.projects, ...inferred.projects]
       .sort((left, right) => left.id.localeCompare(right.id))
@@ -976,10 +944,10 @@ function resolveInProject(built, query, buffers, prepared = sourceRecordForQuery
         .sort((left, right) => (left.file ?? "").localeCompare(right.file ?? "") || left.start - right.start);
       answer = {
         status: declarations.length > 0 ? "resolved" : "unknown",
-        receiver_type: normalizeTypeText(built.checker.typeToString(
+        receiver_type: normalizeTypeText(runtime.typeToString(
+          built.checker,
           receiverType,
           occurrence.member.expression,
-          ts.TypeFormatFlags.NoTruncation,
         )),
         declarations,
       };
@@ -1082,7 +1050,7 @@ function resolveMembers(projectId, projectFiles, queries) {
   }
   const response = {
     project_id: projectId,
-    typescript: { version: ts.version, source: runtime.source },
+    typescript: { version: runtime.version, source: runtime.source },
     checker_input_fingerprint: built.fingerprint,
     results,
     resources: resources(),
@@ -1175,10 +1143,10 @@ function resolveMember(query) {
     answers.push({
       project_id: project.id,
       status: declarations.length > 0 ? "resolved" : "unknown",
-      receiver_type: normalizeTypeText(built.checker.typeToString(
+      receiver_type: normalizeTypeText(runtime.typeToString(
+        built.checker,
         receiverType,
         occurrence.member.expression,
-        ts.TypeFormatFlags.NoTruncation,
       )),
       declarations,
       checker_input_fingerprint: built.fingerprint,
@@ -1188,7 +1156,7 @@ function resolveMember(query) {
   return {
     indexed_hash: query.indexed_hash,
     source_hash: actualHash,
-    typescript: { version: ts.version, source: runtime.source },
+    typescript: { version: runtime.version, source: runtime.source },
     projects: answers,
     configuration_problems: problems,
   };
@@ -1221,7 +1189,7 @@ function validateInputs(entries) {
 function capabilities() {
   const discovered = configuredProjects();
   return {
-    typescript: { version: ts.version, source: runtime.source },
+    typescript: { version: runtime.version, source: runtime.source },
     projects: discovered.projects.map(projectSummary),
     configuration_problems: discovered.problems,
     question: "resolve_statically_named_member_at_indexed_call_occurrence",
