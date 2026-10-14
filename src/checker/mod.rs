@@ -6,7 +6,7 @@ pub mod process;
 pub mod protocol;
 
 pub use backend::{Backend, Checker};
-pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_partial_failure};
+pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_failure};
 pub(crate) use enrich::{active_batch_inputs_fresh, target_fingerprint};
 
 /// Stable identity for the checker semantics and the actual watcher selection

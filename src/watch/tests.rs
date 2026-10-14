@@ -14,10 +14,10 @@ use crate::indexer;
 
 use super::{
     Coordinator, DirtySignal, DocsIndexingPolicy, EventClassifier, FinishState,
-    MAX_INCREMENTAL_SOURCE_PATHS, Phase, RefreshScope, RejectionReportDecision,
-    RejectionReportLatch, TargetKind, TargetSource, WatchOptions, active_git_control_paths,
-    active_git_watch_targets, clear_reconciliation_deadline_if_dirty, config_watch_paths,
-    effective_watch_policy_fingerprint, extend_config_watch_targets,
+    MAX_CHECKER_ATTEMPTS, MAX_INCREMENTAL_SOURCE_PATHS, Phase, RefreshScope,
+    RejectionReportDecision, RejectionReportLatch, TargetKind, TargetSource, WatchOptions,
+    active_git_control_paths, active_git_watch_targets, clear_reconciliation_deadline_if_dirty,
+    config_watch_paths, effective_watch_policy_fingerprint, extend_config_watch_targets,
     extend_configured_watch_targets, git_control_paths, git_path, git_watch_targets,
     is_refresh_boundary, normalize_targets, parse_git_ascii_scalar, prepare_refresh, run_refresh,
     strip_git_record_terminator, update_classifier_targets, validate_options, watch_enrich_options,
@@ -2650,4 +2650,132 @@ fn outside_events_require_an_explicit_watch_target() -> Result<()> {
         Some(source_signal("main.ts"))
     );
     Ok(())
+}
+
+fn paused_checker() -> Coordinator {
+    let mut coordinator = Coordinator::new(Duration::from_millis(10), false, true);
+    let refresh = coordinator.next_work(Duration::ZERO).unwrap();
+    coordinator.observe_checker_snapshot("code-a");
+    assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+    let enrich = coordinator.next_work(Duration::ZERO).unwrap();
+    assert_eq!(
+        coordinator.finish_optional_partial(enrich),
+        FinishState::Partial
+    );
+    assert!(coordinator.checker_paused);
+    coordinator
+}
+
+#[test]
+fn terminal_checker_stays_parked_across_timers_docs_and_inventory_refreshes() {
+    let mut coordinator = paused_checker();
+    for signal in [
+        DirtySignal::reconciliation(),
+        DirtySignal::checker_drift_flush(),
+        DirtySignal::documentation("documentation:README.md"),
+        DirtySignal::inventory("directory:src"),
+        DirtySignal {
+            checker_retry_trigger: false,
+            ..DirtySignal::full("unknown-event")
+        },
+    ] {
+        coordinator.mark_dirty(seconds(1), signal);
+        let refresh = coordinator.next_work(seconds(2)).unwrap();
+        assert_eq!(refresh.phase, Phase::Refresh);
+        assert!(
+            !refresh.rebind_checker,
+            "retain the published partial batch"
+        );
+        coordinator.observe_checker_snapshot("code-a");
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Partial);
+        assert!(coordinator.next_work(seconds(100)).is_none());
+        assert!(coordinator.checker_paused);
+    }
+}
+
+#[test]
+fn failed_checker_resumes_on_source_config_and_dependency_events() {
+    for signal in [
+        source_signal("src/fixed.ts"),
+        DirtySignal::full("boundary:tsconfig.json"),
+        DirtySignal::full("external:/deps/types.d.ts"),
+        DirtySignal::checker_input("config:.jscout.toml"),
+        DirtySignal::checker_input("checker-directory:/deps"),
+    ] {
+        let mut coordinator = paused_checker();
+        coordinator.mark_dirty(seconds(1), signal);
+        let refresh = coordinator.next_work(seconds(2)).unwrap();
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+        let enrich = coordinator.next_work(seconds(2)).unwrap();
+        assert_eq!(enrich.phase, Phase::Enrich);
+        assert_eq!(
+            coordinator.finish_enrichment_success(enrich),
+            FinishState::Complete
+        );
+        assert!(!coordinator.checker_paused);
+    }
+}
+
+#[test]
+fn reconciliation_resumes_failed_checker_when_it_discovers_missed_code_changes() {
+    let mut coordinator = paused_checker();
+    coordinator.mark_reconciliation(seconds(1));
+    let refresh = coordinator.next_work(seconds(1)).unwrap();
+    coordinator.observe_checker_snapshot("code-b");
+    assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+    let enrich = coordinator.next_work(seconds(1)).unwrap();
+    assert_eq!(enrich.phase, Phase::Enrich);
+    assert_eq!(
+        coordinator.finish_enrichment_success(enrich),
+        FinishState::Complete
+    );
+}
+
+#[test]
+fn checker_retry_budget_parks_after_three_attempts_and_input_change_resets_it() {
+    let mut coordinator = Coordinator::new(Duration::from_millis(10), true, true);
+    for run in 0..2 {
+        let now = seconds(run * 100);
+        let refresh = coordinator.next_work(now).unwrap();
+        assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+        let embed = coordinator.next_work(now).unwrap();
+        assert_eq!(coordinator.finish_optional(embed), FinishState::Continue);
+        for attempt in 0..MAX_CHECKER_ATTEMPTS {
+            let at = now + seconds(u64::from(attempt) * 10);
+            let enrich = coordinator.next_work(at).unwrap();
+            assert_eq!(enrich.phase, Phase::Enrich);
+            let state = coordinator.finish_error(at, enrich);
+            if attempt + 1 < MAX_CHECKER_ATTEMPTS {
+                assert!(matches!(state, FinishState::Retry { .. }));
+            } else {
+                assert_eq!(state, FinishState::Continue);
+            }
+        }
+        let semantic = coordinator.next_work(now + seconds(30)).unwrap();
+        assert_eq!(semantic.phase, Phase::SemanticEmbed);
+        assert_eq!(coordinator.finish_optional(semantic), FinishState::Partial);
+        assert!(coordinator.checker_paused);
+        assert!(coordinator.next_work(now + seconds(90)).is_none());
+        coordinator.mark_dirty(now + seconds(99), source_signal("src/fixed.ts"));
+    }
+}
+
+#[test]
+fn superseded_terminal_failure_does_not_pause_newer_checker_work() {
+    let mut coordinator = Coordinator::new(Duration::from_millis(10), false, true);
+    let refresh = coordinator.next_work(Duration::ZERO).unwrap();
+    coordinator.finish_refresh(refresh);
+    let enrich = coordinator.next_work(Duration::ZERO).unwrap();
+    coordinator.mark_dirty(seconds(1), source_signal("src/fixed.ts"));
+    assert_eq!(
+        coordinator.finish_optional_partial(enrich),
+        FinishState::Superseded
+    );
+    assert!(!coordinator.checker_paused);
+    let refresh = coordinator.next_work(seconds(2)).unwrap();
+    assert_eq!(coordinator.finish_refresh(refresh), FinishState::Continue);
+    assert_eq!(
+        coordinator.next_work(seconds(2)).unwrap().phase,
+        Phase::Enrich
+    );
 }
