@@ -1946,6 +1946,15 @@ fn ingest_event(
     now: Duration,
 ) {
     let signal = match event {
+        // Linux/inotify reports opens and reads performed by our own refresh.
+        // Only close-after-write can represent changed contents; feeding other
+        // access events back into the coordinator would supersede every run.
+        Ok(event)
+            if matches!(event.kind, notify::EventKind::Access(kind)
+                if kind != notify::event::AccessKind::Close(notify::event::AccessMode::Write)) =>
+        {
+            None
+        }
         Ok(event) => classifier.classify(&event.paths),
         Err(error) => Some(DirtySignal {
             checker_retry_trigger: false,

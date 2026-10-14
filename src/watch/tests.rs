@@ -2779,3 +2779,83 @@ fn superseded_terminal_failure_does_not_pause_newer_checker_work() {
         Phase::Enrich
     );
 }
+
+#[test]
+fn access_reads_do_not_supersede_enrichment_but_writes_and_changes_do() -> Result<()> {
+    use notify::{
+        Event, EventKind,
+        event::{
+            AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
+        },
+    };
+    let repo = tempfile::tempdir()?;
+    fs::write(repo.path().join("main.ts"), "export const value = 1;")?;
+    fs::write(repo.path().join(".jscout.toml"), "version = 1")?;
+    let mut classifier = EventClassifier::new(
+        repo.path(),
+        &repo.path().join(".jscout.db"),
+        &Default::default(),
+    )?;
+    classifier
+        .config_exact
+        .insert(repo.path().join(".jscout.toml"));
+    for kind in [
+        AccessKind::Any,
+        AccessKind::Read,
+        AccessKind::Open(AccessMode::Read),
+        AccessKind::Open(AccessMode::Write),
+        AccessKind::Open(AccessMode::Any),
+        AccessKind::Close(AccessMode::Read),
+        AccessKind::Close(AccessMode::Any),
+        AccessKind::Other,
+    ] {
+        let mut coordinator = Coordinator::new(seconds(1), false, true);
+        let refresh = coordinator.next_work(Duration::ZERO).unwrap();
+        coordinator.finish_refresh(refresh);
+        let enrich = coordinator.next_work(Duration::ZERO).unwrap();
+        for path in [
+            repo.path().to_path_buf(),
+            repo.path().join("main.ts"),
+            repo.path().join(".jscout.toml"),
+        ] {
+            super::ingest_event(
+                Ok(Event::new(EventKind::Access(kind)).add_path(path)),
+                &classifier,
+                &mut coordinator,
+                seconds(1),
+            );
+        }
+        assert!(
+            !coordinator.is_superseded(enrich),
+            "access {kind:?} superseded enrichment"
+        );
+        assert_eq!(
+            coordinator.finish_enrichment_success(enrich),
+            FinishState::Complete
+        );
+        assert!(coordinator.next_work(seconds(10)).is_none());
+    }
+    for kind in [
+        EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+        EventKind::Create(CreateKind::File),
+        EventKind::Remove(RemoveKind::File),
+    ] {
+        let mut coordinator = Coordinator::new(seconds(1), false, true);
+        let refresh = coordinator.next_work(Duration::ZERO).unwrap();
+        coordinator.finish_refresh(refresh);
+        let enrich = coordinator.next_work(Duration::ZERO).unwrap();
+        super::ingest_event(
+            Ok(Event::new(kind).add_path(repo.path().join("main.ts"))),
+            &classifier,
+            &mut coordinator,
+            seconds(1),
+        );
+        assert!(
+            coordinator.is_superseded(enrich),
+            "change {kind:?} was lost"
+        );
+    }
+    Ok(())
+}
