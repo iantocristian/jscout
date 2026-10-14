@@ -131,8 +131,8 @@ pub fn launch(
     node: &str,
     backend: Backend,
 ) -> Result<Checker> {
-    if backend == Backend::Tsr {
-        return Ok(Checker::embedded(root)?);
+    if let Backend::Tsr { diagnostics } = backend {
+        return Ok(Checker::embedded(root, diagnostics)?);
     }
     let node = crate::llm::config::resolve_node_setting(node, "the TypeScript checker sidecar")?;
     crate::llm::config::verify_node_version(&node)?;
@@ -150,9 +150,9 @@ pub fn doctor(
     timeout: std::time::Duration,
     backend: Backend,
 ) -> Result<()> {
-    if backend == Backend::Tsr {
+    if let Backend::Tsr { diagnostics } = backend {
         process::begin_interrupt_scope()?;
-        let mut checker = Checker::embedded(root)?;
+        let mut checker = Checker::embedded(root, diagnostics)?;
         checker.register_interrupts()?;
         println!("checker: tsr-embedded (experimental, in process)");
         println!("deadlines: cooperative; a running compiler query cannot be forcibly stopped");

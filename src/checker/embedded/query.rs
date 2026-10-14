@@ -37,6 +37,9 @@ pub fn build(
     project: Project,
     request: &Arc<Request>,
 ) -> Result<BuiltProject, CheckerError> {
+    request
+        .diagnostics
+        .project(&project.summary.project_id, "program-load");
     request.check()?;
     project.host.set_request(request.clone());
     let counters = tsr_arena::Counters::new();
@@ -55,9 +58,11 @@ pub fn build(
     .map_err(compiler_error)?;
     request.check()?;
     let session = Session::from_program(Arc::new(program), &counters);
+    request.diagnostics.operation("checker-initialize");
     session.checker().map_err(compiler_error)?;
     // Declaration paths are part of the answer. Observe their symlinks before
     // the first batch so later queries cannot expand the input identity.
+    request.diagnostics.operation("declaration-source-paths");
     for file in session.program().files() {
         request.check()?;
         let source = file.bound().view().source_file().map_err(compiler_error)?;
@@ -69,6 +74,7 @@ pub fn build(
         }
     }
     request.check()?;
+    request.diagnostics.operation("input-manifest");
     let inputs = project.host.inputs()?;
     let fingerprint = fingerprint(&project, &inputs)?;
     Ok(BuiltProject {
@@ -404,6 +410,7 @@ impl BuiltProject {
         query: &MemberQuery,
         request: &Request,
     ) -> Result<MemberProjectResult, CheckerError> {
+        request.diagnostics.query(query, "validate-source");
         request.check()?;
         let path = query_file(root, &query.file)?;
         if !self.project.roots.contains(&path) {
@@ -423,6 +430,7 @@ impl BuiltProject {
                 format!("source changed after indexing or loading: {}", query.file),
             ));
         }
+        request.diagnostics.operation("validate-call-spans");
         let spans = spans(query, &raw)?;
         let mut answer = ProjectAnswer {
             project_id: self.project.summary.project_id.clone(),
@@ -433,6 +441,7 @@ impl BuiltProject {
             error: None,
         };
         {
+            request.diagnostics.operation("call-lookup");
             let file = self
                 .session
                 .program()
@@ -458,16 +467,22 @@ impl BuiltProject {
                     ),
                 )
             })?;
+            request.diagnostics.operation("checker-operation");
             let mut op = self.session.operation().map_err(compiler_error)?;
+            request.diagnostics.operation("receiver-node");
             let receiver = op
                 .node(member)
                 .map_err(compiler_error)?
                 .expression()
                 .ok_or_else(|| error("checker_failure", "missing receiver"))?;
+            request.diagnostics.operation("receiver-type");
             let ty = op.get_type_at_location(receiver).map_err(compiler_error)?;
             request.check()?;
+            request.diagnostics.operation("receiver-type-flags");
             if op.type_flags(ty).map_err(compiler_error)? & type_flags::ANY_OR_UNKNOWN == 0 {
+                request.diagnostics.operation("declaration-resolution");
                 let nodes = declarations(&mut op, ty, member, call)?;
+                request.diagnostics.operation("declaration-site");
                 let mut sites = BTreeMap::new();
                 for node in nodes {
                     let site = declaration(root, self, &op, node)?;
@@ -483,6 +498,7 @@ impl BuiltProject {
                     );
                 }
                 answer.declarations = sites.into_values().collect();
+                request.diagnostics.operation("type-printing");
                 let text = op
                     .type_to_string_at(ty, Some(receiver), type_format_flags::NO_TRUNCATION)
                     .map_err(compiler_error)?;

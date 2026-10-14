@@ -94,6 +94,20 @@ pub fn detail(label: impl Into<String>) {
     emit(Event::Detail(label.into()));
 }
 
+/// Avoid formatting per-query diagnostics when progress is disabled or a
+/// parallel worker delegates progress to its coordinator.
+pub(crate) fn detail_with(label: impl FnOnce() -> String) {
+    if SUPPRESSED.get() {
+        return;
+    }
+    let active = ACTIVE.get().is_some();
+    #[cfg(test)]
+    let active = active || CAPTURE.with(|events| events.borrow().is_some());
+    if active {
+        detail(label());
+    }
+}
+
 /// Stop heartbeat while a daemon is idle; the next stage resumes it.
 pub fn idle() {
     emit(Event::Idle);

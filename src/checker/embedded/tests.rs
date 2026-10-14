@@ -109,7 +109,7 @@ fn embedded_queries_match_typescript_on_shared_fixtures() {
             Some(Path::new("/missing-sidecar")),
             None,
             "/missing-node",
-            Backend::Tsr,
+            Backend::Tsr { diagnostics: false },
         )
         .unwrap();
         let plan = embedded
@@ -186,7 +186,7 @@ fn jsdoc_and_bundled_libraries_work_without_a_sidecar() {
             r#"{{"compilerOptions":{{"allowJs":true,"checkJs":true}},"files":["{file}"]}}"#
         );
         let directory = fixture(&[("tsconfig.json", &config), (file, source)]);
-        let mut checker = EmbeddedChecker::new(directory.path()).unwrap();
+        let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
         let result = checker
             .resolve_members(
                 "tsconfig.json".into(),
@@ -230,7 +230,7 @@ fn ownership_honors_extends_and_tooling_without_building_programs() {
         ("src/main.ts", "export const a = 1;"),
         ("extra.ts", "export const b = 1;"),
     ]);
-    let mut checker = EmbeddedChecker::new(directory.path()).unwrap();
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
     let plan = checker
         .plan_members(vec!["src/main.ts".into(), "extra.ts".into()], TIMEOUT, true)
         .unwrap();
@@ -265,7 +265,7 @@ fn malformed_configs_are_reported_and_orphans_are_bounded() {
             file
         })
         .collect::<Vec<_>>();
-    let mut checker = EmbeddedChecker::new(directory.path()).unwrap();
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
     let plan = checker.plan_members(files, TIMEOUT, true).unwrap();
     assert!(!plan.configuration_problems.is_empty());
     assert_eq!(plan.files.len(), 151);
@@ -286,7 +286,7 @@ fn inherited_include_does_not_turn_an_intermediate_base_into_an_owner() {
         ("tsconfig.json", r#"{"extends":"./tsconfig.middle.json"}"#),
         ("main.ts", "export {};"),
     ]);
-    let mut checker = EmbeddedChecker::new(directory.path()).unwrap();
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
     let plan = checker
         .plan_members(vec!["main.ts".into()], TIMEOUT, true)
         .unwrap();
@@ -310,7 +310,7 @@ fn prepared_batches_share_one_manifest_and_deadlines_retire_loaded_programs() {
     ]);
     let queries = ["first.ts", "second.ts"]
         .map(|file| query(source, file, "receiver.ping()", "receiver", "ping"));
-    let mut checker = EmbeddedChecker::new(directory.path()).unwrap();
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
     checker
         .prepare_project("tsconfig.json", &[], &queries, TIMEOUT)
         .unwrap();
@@ -349,7 +349,7 @@ fn source_edits_new_inputs_and_invalid_spans_are_rejected() {
         ("service.ts", "export interface A { ping(): void }"),
     ]);
     let query = query(source, "main.ts", "receiver.ping()", "receiver", "ping");
-    let mut checker = EmbeddedChecker::new(directory.path()).unwrap();
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
     let first = checker
         .resolve_members("tsconfig.json".into(), vec![], vec![query.clone()], TIMEOUT)
         .unwrap();
@@ -378,7 +378,7 @@ fn source_edits_new_inputs_and_invalid_spans_are_rejected() {
 #[test]
 fn deadlines_and_panics_discard_sessions() {
     let directory = fixture(&[]);
-    let mut checker = EmbeddedChecker::new(directory.path()).unwrap();
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
     assert!(matches!(
         checker.capabilities(Duration::ZERO),
         Err(CheckerError::Timeout(_))
@@ -396,7 +396,7 @@ fn deadlines_and_panics_discard_sessions() {
 fn input_observations_detect_missing_file_creation_and_symlink_retargeting() {
     use tsr_vfs::FileSystem;
     let directory = fixture(&[("a.ts", "a"), ("b.ts", "a")]);
-    let host = host::InputFs::os(Request::new(TIMEOUT).unwrap());
+    let host = host::InputFs::os(Request::new(TIMEOUT, false).unwrap());
     let missing = directory.path().join("missing.ts");
     assert!(
         !host
@@ -438,7 +438,7 @@ fn directory_spelling_variants_share_one_persistable_observation() {
     use tsr_vfs::FileSystem;
     let directory = fixture(&[("main.ts", "export {};")]);
     let path = path_text(directory.path()).unwrap();
-    let host = host::InputFs::os(Request::new(TIMEOUT).unwrap());
+    let host = host::InputFs::os(Request::new(TIMEOUT, false).unwrap());
     host.stat(path.as_bytes()).unwrap();
     host.entries(format!("{path}//./").as_bytes()).unwrap();
     let inputs = host.inputs().unwrap();
@@ -453,7 +453,7 @@ fn directory_spelling_variants_share_one_persistable_observation() {
 fn directory_observations_ignore_noise_but_retain_compiler_inputs() {
     use tsr_vfs::FileSystem;
     let directory = fixture(&[("main.ts", "export {};")]);
-    let host = host::InputFs::os(Request::new(TIMEOUT).unwrap());
+    let host = host::InputFs::os(Request::new(TIMEOUT, false).unwrap());
     host.entries(path_text(directory.path()).unwrap().as_bytes())
         .unwrap();
     let input = host.inputs().unwrap().pop().unwrap();
@@ -529,4 +529,183 @@ fn directory_observations_ignore_noise_but_retain_compiler_inputs() {
         host::fresh_signature(&explicit, &observed.source_hash),
         Some(observed.source_hash)
     );
+}
+
+#[test]
+fn preparation_errors_identify_the_failing_query_and_preserve_the_code() {
+    let source =
+        "/** 😀 */ interface A { ping(): void } declare const receiver: A; receiver.ping();";
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"include":["*.ts"]}"#,
+        ),
+        ("bad.ts", source),
+        ("good.ts", source),
+    ]);
+    let good = query(source, "good.ts", "receiver.ping()", "receiver", "ping");
+    let mut bad = query(source, "bad.ts", "receiver.ping()", "receiver", "ping");
+    bad.receiver_start += 1;
+    let mut checker = EmbeddedChecker::new(directory.path(), true).unwrap();
+    let (result, events) = crate::progress::capture(|| {
+        checker.prepare_project("tsconfig.json", &[], &[bad.clone(), good], TIMEOUT)
+    });
+    let error = result.unwrap_err();
+    let CheckerError::Remote { code, message } = &error else {
+        panic!("expected remote failure: {error}");
+    };
+    assert_eq!(code, "span_mismatch");
+    let context = format!(
+        "embedded TSR project=\"tsconfig.json\" file=\"bad.ts\" call_bytes={}..{} operation=call-lookup",
+        bad.call_start, bad.call_end
+    );
+    assert!(message.starts_with(&context), "{message}");
+    assert!(message.contains("exact indexed member-call occurrence not found"));
+    assert!(!message.contains("good.ts"), "{message}");
+    assert_eq!(message.matches("embedded TSR project=").count(), 1);
+    assert!(events.contains(&crate::progress::Event::Detail(context)));
+    assert!(
+        checker.built.is_none(),
+        "failed sessions must still be retired"
+    );
+    assert!(crate::checker::is_terminal_failure(&error.into()));
+}
+
+#[test]
+fn inferred_file_failures_keep_query_context_in_the_returned_answer() {
+    let source = "interface A { ping(): void } declare const receiver: A; receiver.ping();";
+    let directory = fixture(&[("bad.ts", source), ("good.ts", source)]);
+    let mut checker = EmbeddedChecker::new(directory.path(), true).unwrap();
+    let files = vec!["bad.ts".into(), "good.ts".into()];
+    let plan = checker.plan_members(files.clone(), TIMEOUT, true).unwrap();
+    let project = plan.files[0].project_ids[0].clone();
+    assert!(project.starts_with("inferred:"));
+    let mut bad = query(source, "bad.ts", "receiver.ping()", "receiver", "ping");
+    bad.receiver_start += 1;
+    let good = query(source, "good.ts", "receiver.ping()", "receiver", "ping");
+    let result = checker
+        .resolve_members(project.clone(), files, vec![bad, good], TIMEOUT)
+        .unwrap();
+    let error = result.results[0].answer.error.as_ref().unwrap();
+    assert_eq!(error.code, "span_mismatch");
+    assert!(error.message.contains(&format!("project={project:?}")));
+    assert!(error.message.contains("file=\"bad.ts\""));
+    assert!(error.message.contains("operation=call-lookup"));
+    assert_eq!(result.results[1].answer.status, "resolved");
+    assert!(result.results[1].answer.error.is_none());
+}
+
+#[test]
+fn operation_errors_and_panics_keep_context_without_changing_retry_codes() {
+    let directory = fixture(&[]);
+    let source = "receiver.ping()";
+    let query = query(source, "odd\"name\n.ts", source, "receiver", "ping");
+    let mut checker = EmbeddedChecker::new(directory.path(), true).unwrap();
+    for operation in ["receiver-type", "declaration-resolution", "type-printing"] {
+        for panics in [false, true] {
+            let (result, events) = crate::progress::capture(|| {
+                checker.request::<()>(TIMEOUT, |_, request| {
+                    request.diagnostics.project("tsconfig.json", "program-load");
+                    request.diagnostics.query(&query, "call-lookup");
+                    request.diagnostics.operation(operation);
+                    if panics {
+                        panic!("compiler probe failure");
+                    }
+                    Err(error("EBUSY", "compiler probe failure"))
+                })
+            });
+            let failure = result.unwrap_err();
+            let CheckerError::Remote { code, message } = &failure else {
+                panic!("wrong error type: {failure}");
+            };
+            assert_eq!(code, if panics { "checker_failure" } else { "EBUSY" });
+            assert!(message.contains("compiler probe failure"));
+            assert!(
+                message.contains(&format!("file={:?}", query.file)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("operation={operation}")),
+                "{message}"
+            );
+            assert_eq!(message.lines().count(), 1, "paths must be escaped");
+            assert_eq!(message.matches("embedded TSR project=").count(), 1);
+            assert!(
+                matches!(events.last(), Some(crate::progress::Event::Detail(detail))
+                if detail.ends_with(&format!("operation={operation}")))
+            );
+            assert_eq!(crate::checker::is_terminal_failure(&failure.into()), panics);
+        }
+    }
+    // A later request cannot accidentally reuse a previous query's context.
+    let failure = checker
+        .request::<()>(TIMEOUT, |_, request| {
+            request.diagnostics.project("other.json", "program-load");
+            Err(error("checker_failure", "load failed"))
+        })
+        .unwrap_err();
+    let message = failure.to_string();
+    assert!(message.contains("project=\"other.json\""));
+    assert!(!message.contains("file="));
+    assert!(!message.contains("call_bytes="));
+    let timeout = checker
+        .request::<()>(TIMEOUT, |_, request| {
+            request
+                .diagnostics
+                .project("other.json", "checker-initialize");
+            Err(CheckerError::Timeout(Duration::from_secs(1)))
+        })
+        .unwrap_err();
+    assert!(matches!(timeout, CheckerError::Timeout(_)));
+    let canceled = checker
+        .request::<()>(TIMEOUT, |_, request| {
+            request
+                .diagnostics
+                .project("other.json", "checker-initialize");
+            Err(CheckerError::Canceled("superseded".into()))
+        })
+        .unwrap_err();
+    assert!(
+        matches!(canceled, CheckerError::Canceled(message) if message.contains("project=\"other.json\""))
+    );
+}
+
+#[test]
+fn parallel_error_contexts_are_isolated_even_when_progress_is_suppressed() {
+    let directory = fixture(&[]);
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let workers = ["first", "second"].map(|name| {
+            let root = directory.path();
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let mut checker = EmbeddedChecker::new(root, true).unwrap();
+                let (result, events) = crate::progress::capture(|| {
+                    crate::progress::without_reporting(|| {
+                        checker.request::<()>(TIMEOUT, |_, request| {
+                            request
+                                .diagnostics
+                                .project(&format!("{name}/tsconfig.json"), "program-load");
+                            let query =
+                                query("x.f()", &format!("{name}/main.ts"), "x.f()", "x", "f");
+                            request.diagnostics.query(&query, "receiver-type");
+                            barrier.wait();
+                            Err(error("checker_failure", format!("{name} failed")))
+                        })
+                    })
+                });
+                assert!(events.is_empty());
+                result.unwrap_err().to_string()
+            })
+        });
+        let [first, second] = workers.map(|worker| worker.join().unwrap());
+        assert!(
+            first.contains("first/main.ts") && !first.contains("second"),
+            "{first}"
+        );
+        assert!(
+            second.contains("second/main.ts") && !second.contains("first"),
+            "{second}"
+        );
+    });
 }

@@ -83,6 +83,43 @@ fn experimental_tsr_cli_preserves_absence_and_explicit_overrides() {
 }
 
 #[test]
+fn tsr_diagnostics_cli_is_opt_in_and_independent_of_progress_and_backend_selection() {
+    let default = Cli::try_parse_from(["jscout", "--experimental-tsr", "enrich", "."]).unwrap();
+    assert!(!default.tsr_diagnostics);
+    for args in [
+        vec![
+            "jscout",
+            "--tsr-diagnostics",
+            "--no-progress",
+            "watch",
+            ".",
+            "--enrich",
+        ],
+        vec![
+            "jscout",
+            "checker",
+            "doctor",
+            ".",
+            "--tsr-diagnostics",
+            "--no-progress",
+        ],
+        vec![
+            "jscout",
+            "enrich",
+            ".",
+            "--tsr-diagnostics",
+            "--no-progress",
+        ],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.tsr_diagnostics);
+        assert!(cli.no_progress);
+        // TOML can select TSR; diagnostics must not force or require a CLI selection.
+        assert_eq!(cli.experimental_tsr, None);
+    }
+}
+
+#[test]
 fn flag_resolution_covers_every_truth_table_row() {
     let cases = [
         (false, false, false, false),
