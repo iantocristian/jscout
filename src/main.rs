@@ -59,22 +59,31 @@ use commands::{run_command, run_config_command};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let progress = (!cli.no_progress)
-        .then(|| cli.command.progress_label())
-        .flatten()
-        .and_then(|(label, immediate)| progress::Reporter::start(label, immediate));
-    let result = run(cli);
-    if let Some(progress) = progress {
-        progress.finish(result.is_ok());
-    }
-    result
+    run(cli)
 }
 
 fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Config { command } => run_config_command(command, cli.config.as_deref()),
+    let progress_label = (!cli.no_progress)
+        .then(|| cli.command.progress_label())
+        .flatten();
+    let start_progress = |configured_interval| {
+        progress_label.and_then(|(label, immediate)| {
+            progress::Reporter::start(
+                label,
+                immediate,
+                cli.progress_interval_seconds.unwrap_or(configured_interval),
+            )
+        })
+    };
+    let (progress, result) = match cli.command {
+        Command::Config { command } => {
+            // Config init must also work without an existing valid configuration.
+            let progress = start_progress(progress::DEFAULT_INTERVAL_SECONDS);
+            (progress, run_config_command(command, cli.config.as_deref()))
+        }
         command => {
             let runtime = config::RuntimeConfig::load(command.root(), cli.config.as_deref())?;
+            let progress = start_progress(runtime.effective.diagnostics.progress_interval_seconds);
             let legacy_keys = runtime.legacy_environment_keys();
             if !legacy_keys.is_empty() {
                 eprintln!(
@@ -83,7 +92,7 @@ fn run(cli: Cli) -> Result<()> {
                     config::FILE_NAME,
                 );
             }
-            run_command(
+            let result = run_command(
                 command,
                 &runtime,
                 if cli
@@ -94,9 +103,14 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     checker::Backend::TypeScript
                 },
-            )
+            );
+            (progress, result)
         }
+    };
+    if let Some(progress) = progress {
+        progress.finish(result.is_ok());
     }
+    result
 }
 
 #[cfg(test)]

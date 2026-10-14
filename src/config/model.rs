@@ -274,6 +274,7 @@ pub struct TelemetrySettings {
 pub struct DiagnosticsSettings {
     pub timing: bool,
     pub debug: bool,
+    pub progress_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

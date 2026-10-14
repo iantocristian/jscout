@@ -7,7 +7,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 static ACTIVE: OnceLock<mpsc::SyncSender<Message>> = OnceLock::new();
+pub const DEFAULT_INTERVAL_SECONDS: u64 = 5;
 const DELAY: Duration = Duration::from_secs(2);
+
+fn report_interval(terminal: bool, terminal_seconds: u64) -> Option<Duration> {
+    if terminal {
+        (terminal_seconds > 0).then(|| Duration::from_secs(terminal_seconds))
+    } else {
+        Some(Duration::from_secs(5))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -81,11 +90,11 @@ pub struct Reporter {
 }
 
 impl Reporter {
-    pub fn start(command: &'static str, immediate: bool) -> Option<Self> {
+    pub fn start(command: &'static str, immediate: bool, terminal_seconds: u64) -> Option<Self> {
         // Bound memory under slow stderr consumers. Backpressure preserves
         // every counter delta, just as ordinary CLI stderr writes do.
         let (sender, receiver) = mpsc::sync_channel(256);
-        let interval = Duration::from_secs(if io::stderr().is_terminal() { 1 } else { 5 });
+        let interval = report_interval(io::stderr().is_terminal(), terminal_seconds);
         let worker = std::thread::Builder::new()
             .name("jscout-progress".into())
             .spawn(move || report(receiver, command, immediate, interval, &mut io::stderr()))
@@ -132,7 +141,7 @@ struct State {
 impl State {
     fn new() -> Self {
         Self {
-            label: "loading configuration".into(),
+            label: "starting".into(),
             done: 0,
             total: None,
             detail: String::new(),
@@ -192,7 +201,7 @@ fn report(
     receiver: mpsc::Receiver<Message>,
     command: &str,
     immediate: bool,
-    interval: Duration,
+    interval: Option<Duration>,
     out: &mut impl Write,
 ) {
     let start = Instant::now();
@@ -207,12 +216,22 @@ fn report(
         // Check elapsed time even under a continuous stream of counter updates.
         let wait = if state.idle {
             interval
-        } else if visible {
-            interval.saturating_sub(start.elapsed().saturating_sub(last_report))
+        } else if !visible {
+            // The initial slow-command report is independent of periodic heartbeats.
+            Some(DELAY.saturating_sub(start.elapsed()))
         } else {
-            DELAY.saturating_sub(start.elapsed())
+            interval.map(|interval| {
+                interval.saturating_sub(start.elapsed().saturating_sub(last_report))
+            })
         };
-        let message = receiver.recv_timeout(wait);
+        let message = if let Some(wait) = wait {
+            receiver.recv_timeout(wait)
+        } else {
+            // Once visible (or idle), zero leaves only phase/completion events.
+            receiver
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
         let elapsed = start.elapsed();
         let phase_change = match &message {
             Ok(Message::Update(Event::Stage { .. })) => true,
@@ -254,9 +273,10 @@ fn report(
             .total
             .is_some_and(|total| total > 0 && state.done == total);
         if (visible || elapsed >= DELAY)
-            && (phase_change
+            && (!visible
+                || phase_change
                 || (dirty && count_complete)
-                || elapsed.saturating_sub(last_report) >= if visible { interval } else { DELAY })
+                || interval.is_some_and(|interval| elapsed.saturating_sub(last_report) >= interval))
         {
             let _ = writeln!(out, "{}", state.line(command, elapsed, "running"));
             last_report = elapsed;
@@ -294,6 +314,23 @@ pub fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_terminal_heartbeats_use_the_configured_interval() {
+        assert_eq!(report_interval(true, 0), None);
+        for seconds in [0, 1, DEFAULT_INTERVAL_SECONDS, 30] {
+            if seconds > 0 {
+                assert_eq!(
+                    report_interval(true, seconds),
+                    Some(Duration::from_secs(seconds))
+                );
+            }
+            assert_eq!(
+                report_interval(false, seconds),
+                Some(Duration::from_secs(5))
+            );
+        }
+    }
 
     #[test]
     fn counters_reset_and_dynamic_totals_do_not_claim_overall_completion() {
@@ -347,7 +384,7 @@ mod tests {
         .unwrap();
         tx.send(Message::Finish(true)).unwrap();
         let mut out = Vec::new();
-        report(rx, "watch", true, Duration::from_secs(5), &mut out);
+        report(rx, "watch", true, Some(Duration::from_secs(5)), &mut out);
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output.matches("generation 1 1/2").count(), 1, "{output}");
         assert_eq!(
@@ -358,8 +395,74 @@ mod tests {
     }
 
     #[test]
+    fn disabled_heartbeats_preserve_the_initial_slow_command_report() {
+        struct LiveOutput {
+            pending: Vec<u8>,
+            lines: mpsc::Sender<String>,
+        }
+        impl Write for LiveOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                for &byte in bytes {
+                    if byte == b'\n' {
+                        let line = String::from_utf8(std::mem::take(&mut self.pending)).unwrap();
+                        let _ = self.lines.send(line);
+                    } else {
+                        self.pending.push(byte);
+                    }
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let (lines_tx, lines_rx) = mpsc::channel();
+        tx.send(Message::Update(Event::Stage {
+            label: "searching".into(),
+            total: None,
+        }))
+        .unwrap();
+        let start = Instant::now();
+        let worker = std::thread::spawn(move || {
+            report(
+                rx,
+                "search",
+                false,
+                None,
+                &mut LiveOutput {
+                    pending: Vec::new(),
+                    lines: lines_tx,
+                },
+            );
+        });
+        let first = lines_rx
+            .recv_timeout(DELAY + Duration::from_secs(2))
+            .expect("slow commands must become visible even with heartbeats disabled");
+        assert!(start.elapsed() >= DELAY, "{first}");
+        assert!(first.contains("running: searching"), "{first}");
+        assert!(matches!(
+            lines_rx.recv_timeout(DELAY + Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        tx.send(Message::Finish(true)).unwrap();
+        let last = lines_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(last.contains("completed: searching"), "{last}");
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn quick_commands_are_silent_but_explicit_operations_finish_honestly() {
-        for (immediate, success) in [(false, true), (true, true), (true, false)] {
+        for (immediate, success, interval) in [
+            (false, true, Some(Duration::from_secs(5))),
+            (true, true, Some(Duration::from_secs(5))),
+            (true, false, Some(Duration::from_secs(5))),
+            (false, true, None),
+            (true, true, None),
+            (true, false, None),
+        ] {
             let (tx, rx) = mpsc::channel();
             tx.send(Message::Update(Event::Stage {
                 label: "embedding".into(),
@@ -369,13 +472,7 @@ mod tests {
             tx.send(Message::Update(Event::Advance(1))).unwrap();
             tx.send(Message::Finish(success)).unwrap();
             let mut out = Vec::new();
-            report(
-                rx,
-                "docs embed",
-                immediate,
-                Duration::from_secs(5),
-                &mut out,
-            );
+            report(rx, "docs embed", immediate, interval, &mut out);
             let output = String::from_utf8(out).unwrap();
             if immediate {
                 assert!(output.contains("embedding 1/2"));
