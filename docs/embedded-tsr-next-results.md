@@ -252,3 +252,42 @@ and exact reuse after selection changes.
 The TOML policy, command record, stdout and stderr are retained at
 `/tmp/jscout-tsr-toml-next-2026-10-13/`. Test and Clippy logs are
 `/tmp/jscout-tsr-toml-tests.log` and `/tmp/jscout-tsr-toml-clippy.log`.
+
+## PR #133 nested-root boundary review (2026-10-14)
+
+The follow-up merges main `91b77b2` (the TOML configuration change) without
+rewriting the published PR commits. New regression tests reproduced ancestor
+`.gitignore` and `package.json` events being discarded for `packages/app`.
+The shared watcher now explicitly subscribes to `.gitignore`, `.ignore`,
+`package.json`, `pnpm-workspace.yaml`, and npm/pnpm/Yarn/Bun lockfiles at each
+level from the indexed root through its owning Git worktree root. Absent files
+are covered by exact parent-directory subscriptions. These structural controls
+remain active with documentation freshness disabled; unrelated sibling paths
+and paths above the Git root remain excluded unless independently selected.
+
+Native macOS notification tests used a three-source `packages/app` fixture with
+enrichment enabled and periodic reconciliation disabled. All four combinations
+of TypeScript sidecar/TSR and documentation freshness on/off passed:
+
+- Creating, modifying and deleting both ignore files at the Git root,
+  intermediate `packages` directory and indexed root caused full refreshes.
+  Each exclusion removed `src/gen.ts` immediately (`removed=1`); allowing it
+  again or deleting the ignore file restored its indexed row.
+- Root `package-lock.json`, root `pnpm-workspace.yaml`, and intermediate
+  `package.json` edits each caused full refreshes.
+- Six unrelated outside create/delete events per configuration caused zero
+  refreshes (24 events across the four runs).
+- Editing `src/main.ts` remained incremental: one indexed file, two unchanged.
+  All checker phases succeeded and no final run reported degraded subscriptions.
+
+Validation passed: **834 Rust unit tests, 20 CLI integration tests**, Clippy
+with warnings denied, release compilation, formatting/whitespace checks and
+**18 documentation tests**. The two new unit tests also verify published source
+membership across ignore creation/edit/deletion and explicit target bounds.
+The earlier Next.js measurements above were not repeated for this boundary fix.
+
+Commands, code patch/build identity, before-fix failures, test logs, fixture
+setup corrections and all four live captures are retained at
+`/Users/cristian/git/js-rag/target/embedded-tsr-nested-watch-review-2026-10-14/`.
+`nested_watch_probe.py` adapts the previous review's `watch_probe.py` procedure;
+`summary.json` and `run-record.json` record outcomes and setup details.

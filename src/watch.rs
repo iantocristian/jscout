@@ -2127,7 +2127,7 @@ fn git_directories(root: &Path) -> Option<(PathBuf, PathBuf)> {
     }
 }
 
-fn git_ancestor_attribute_paths(root: &Path) -> BTreeSet<PathBuf> {
+fn git_ancestor_control_paths(root: &Path, names: &[&str]) -> BTreeSet<PathBuf> {
     let Some(worktree_root) = git_path(root, &["rev-parse", "--show-toplevel"]) else {
         return BTreeSet::new();
     };
@@ -2138,7 +2138,7 @@ fn git_ancestor_attribute_paths(root: &Path) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
     let mut directory = Some(indexed_root.as_path());
     while let Some(current) = directory {
-        paths.insert(current.join(".gitattributes"));
+        paths.extend(names.iter().map(|name| current.join(name)));
         if current == worktree_root {
             break;
         }
@@ -2151,7 +2151,25 @@ fn git_ancestor_attribute_paths(root: &Path) -> BTreeSet<PathBuf> {
 /// active when documentation provenance is disabled; source/package behavior
 /// must not lose its existing checkout and submodule coverage.
 fn source_git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
-    let mut paths = BTreeSet::from([root.join(".gitmodules")]);
+    // Ancestor ignore rules apply to nested inventories, while package and
+    // lockfile changes can invalidate resolution. Subscribe to exact controls
+    // (including absent ones) only as far as the owning Git worktree root;
+    // unrelated siblings and ancestors must still be discarded by classify.
+    let mut paths = git_ancestor_control_paths(
+        root,
+        &[
+            ".gitignore",
+            ".ignore",
+            "package.json",
+            "pnpm-workspace.yaml",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "bun.lock",
+            "bun.lockb",
+        ],
+    );
+    paths.insert(root.join(".gitmodules"));
     // A linked worktree or absorbed submodule discovers its private Git
     // directory through the nearest file-form `.git`. If that indirection is
     // repaired or repointed, every resolved HEAD/control target can move, so
@@ -2187,7 +2205,7 @@ fn git_control_paths(root: &Path) -> BTreeSet<PathBuf> {
     // worktree pointers remain usable; the filesystem parser is retained for
     // synthetic fixtures and older Git behavior.
     if let Some((git_dir, common_dir)) = git_directories(root) {
-        paths.extend(git_ancestor_attribute_paths(root));
+        paths.extend(git_ancestor_control_paths(root, &[".gitattributes"]));
         let head = git_dir.join("HEAD");
         paths.extend([
             head.clone(),

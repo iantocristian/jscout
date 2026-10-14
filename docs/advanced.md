@@ -461,6 +461,12 @@ prefer an external `--database` path (or ensure the selected database family is
 gitignored) so broad staging commands cannot add it. Git HEAD,
 `.gitmodules`, selected dependency roots and locators, and external inputs from
 the latest checker batch are watched as additional invalidation boundaries.
+For a nested indexed root, `.gitignore`, `.ignore`, `package.json`,
+`pnpm-workspace.yaml`, and npm/pnpm/Yarn/Bun lockfiles along the path to the
+owning Git worktree root are exact watch targets, including when absent. Their creation, modification, or deletion
+triggers a full refresh with either checker backend and with documentation
+freshness enabled or disabled. Unselected sibling paths and paths above the Git
+worktree root remain filtered.
 Branch switches therefore rebuild the complete current file set. Extraction,
 resolution, snapshot calculation, and graph publication commit in one SQLite
 transaction. Concurrent WAL readers keep seeing the last committed publication

@@ -987,6 +987,149 @@ fn nested_root_watches_ancestor_attributes_and_repository_conversion_config() ->
 }
 
 #[test]
+fn nested_root_ancestor_ignores_refresh_membership() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    git(repository.path(), &["init"])?;
+    let worktree_root = repository.path().canonicalize()?;
+    let packages = worktree_root.join("packages");
+    let nested = packages.join("app");
+    fs::create_dir_all(nested.join("src"))?;
+    let source = nested.join("src/gen.ts");
+    fs::write(&source, "export const generated = 1;\n")?;
+    let database = nested.join("watch.db");
+
+    for freshness in [false, true] {
+        let options = indexer::IndexOptions {
+            docs_freshness: freshness,
+            ..Default::default()
+        };
+        run_refresh(&nested, &database, &options, RefreshScope::Full, false)?;
+        let mut classifier = EventClassifier::new_with_docs_freshness(
+            &nested,
+            &database,
+            &Default::default(),
+            freshness,
+        )?;
+        // Missing controls need subscriptions too: creating the first ignore
+        // file must have the same effect as editing an existing one.
+        let targets = active_git_watch_targets(&nested, freshness);
+        for directory in [&worktree_root, &packages, &nested] {
+            for name in [".gitignore", ".ignore"] {
+                let ignore = directory.join(name);
+                for (contents, admitted) in [
+                    (Some("**/src/gen.ts\n"), false),
+                    (Some("# allow sources\n"), true),
+                    (Some("**/src/gen.ts\n"), false),
+                    (None, true),
+                ] {
+                    match contents {
+                        Some(contents) => fs::write(&ignore, contents)?,
+                        None => fs::remove_file(&ignore)?,
+                    }
+                    let signal = classifier
+                        .classify(std::slice::from_ref(&ignore))
+                        .unwrap_or_else(|| panic!("ignored boundary {}", ignore.display()));
+                    assert_eq!(signal.scope, RefreshScope::Full);
+                    let target = targets
+                        .iter()
+                        .find(|target| target.path == ignore)
+                        .expect("ancestor ignore needs an exact watch target even when absent");
+                    assert_eq!(target.kind, TargetKind::Exact);
+                    assert_eq!(target.source, TargetSource::Git);
+                    assert_eq!(target.watch_path, *directory);
+                    assert_eq!(target.mode, notify::RecursiveMode::NonRecursive);
+
+                    let refresh = run_refresh(&nested, &database, &options, signal.scope, false)?;
+                    assert_eq!(refresh.outcome.removed, usize::from(!admitted));
+                    let conn = crate::store::open_path_read_only(&database)?;
+                    let indexed: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM files WHERE path='src/gen.ts')",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(indexed, admitted, "{}", ignore.display());
+                    classifier.reload_path_policies()?;
+                    assert_eq!(
+                        classifier.classify(std::slice::from_ref(&source)).is_some(),
+                        admitted
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nested_root_ancestor_manifests_are_controls_but_siblings_are_not() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    git(repository.path(), &["init"])?;
+    let worktree_root = repository.path().canonicalize()?;
+    let packages = worktree_root.join("packages");
+    let nested = packages.join("app");
+    fs::create_dir_all(&nested)?;
+    for freshness in [false, true] {
+        let classifier = EventClassifier::new_with_docs_freshness(
+            &nested,
+            &nested.join("watch.db"),
+            &Default::default(),
+            freshness,
+        )?;
+        let targets = active_git_watch_targets(&nested, freshness);
+        for directory in [&worktree_root, &packages, &nested] {
+            for name in [
+                "package.json",
+                "pnpm-workspace.yaml",
+                "package-lock.json",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+                "bun.lock",
+                "bun.lockb",
+            ] {
+                let path = directory.join(name);
+                assert!(
+                    classifier
+                        .classify(std::slice::from_ref(&path))
+                        .is_some_and(|signal| signal.scope == RefreshScope::Full),
+                    "ancestor manifest must refresh: {}",
+                    path.display()
+                );
+                assert!(targets.iter().any(|target| target.path == path
+                    && target.kind == TargetKind::Exact
+                    && target.watch_path == *directory
+                    && target.mode == notify::RecursiveMode::NonRecursive));
+            }
+        }
+        for directory in [
+            worktree_root.parent().unwrap().to_path_buf(),
+            packages.join("sibling"),
+        ] {
+            for name in [
+                ".gitignore",
+                ".ignore",
+                "package.json",
+                "pnpm-lock.yaml",
+                "other.ts",
+            ] {
+                let path = directory.join(name);
+                assert!(
+                    classifier.classify(std::slice::from_ref(&path)).is_none(),
+                    "unrelated outside path scheduled work: {}",
+                    path.display()
+                );
+                assert!(!targets.iter().any(|target| target.path == path));
+            }
+        }
+        assert!(
+            classifier
+                .classify(std::slice::from_ref(&packages))
+                .is_none()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn event_classifier_ignores_an_ignored_cargo_manifest_for_target_membership() -> Result<()> {
     let repo = tempfile::tempdir()?;
     let root = repo.path();
