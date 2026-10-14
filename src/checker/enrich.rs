@@ -100,7 +100,10 @@ pub struct EnrichReport {
     pub occurrences_using_tooling_fallback: usize,
     pub project_decisions: Vec<ProjectDecision>,
     pub dry_run: bool,
+    /// Largest RSS reported by one project sidecar, not concurrent total RSS.
+    #[serde(rename = "peak_project_rss_bytes")]
     pub peak_rss_bytes: u64,
+    #[serde(rename = "peak_project_heap_bytes")]
     pub peak_heap_bytes: u64,
 }
 
@@ -481,9 +484,7 @@ struct PublishPlan<'a> {
 }
 
 pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> {
-    if options.jobs == 0 {
-        bail!("checker jobs must be greater than zero");
-    }
+    super::validate_jobs(options.jobs)?;
     if options.timeout.is_zero() {
         bail!("--timeout must be greater than zero seconds");
     }
@@ -881,9 +882,10 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut failed_projects = Vec::<ProjectFailure>::new();
 
     let mut jobs = Vec::new();
-    for (project_id, occurrences) in
+    for (project_index, (project_id, occurrences)) in
         projects_in_execution_order(&project_plan, &priority_projects, &first_selected_rank)
             .into_iter()
+            .enumerate()
     {
         if super::process::cancellation_pending() {
             bail!("checker enrichment interrupted; staged work retained");
@@ -927,6 +929,8 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         pending.extend(clean);
         mark_project_pending(&conn, batch_id, project_id)?;
         jobs.push(ProjectJob {
+            ordinal: project_index + 1,
+            completed: completed.len(),
             project_id,
             occurrences,
             pending,
@@ -952,15 +956,26 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
         options.jobs,
         super::process::cancellation_pending,
         |job| {
+            if !parallel {
+                crate::progress::stage(
+                    format!(
+                        "checker project {}/{} {} ({} pending, {} resumed)",
+                        job.ordinal,
+                        project_plan.len(),
+                        job.project_id,
+                        job.pending.len(),
+                        job.completed
+                    ),
+                    None,
+                );
+            }
             let mut metrics = ProjectMetrics::default();
             let result = (|| {
                 // The coordinator already initialized the schema. Worker
                 // connections stage disjoint projects; SQLite serializes only
                 // the short write transactions, not compiler execution.
-                let worker = Connection::open(&database)?;
-                worker.busy_timeout(Duration::from_secs(30))?;
-                worker.pragma_update(None, "synchronous", "NORMAL")?;
-                worker.pragma_update(None, "foreign_keys", "ON")?;
+                let worker =
+                    crate::store::open_existing_writer(&database, Duration::from_secs(30))?;
                 execute_project(
                     &canonical_root,
                     options,
@@ -1064,8 +1079,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                 }
             }
             if parallel {
-                crate::progress::advance(1);
-                crate::progress::detail(format!("finished {project_id}"));
+                crate::progress::advance_with_detail(1, format!("finished {project_id}"));
             }
             Ok(())
         },
@@ -3073,6 +3087,8 @@ fn mark_project_failed(
 }
 
 struct ProjectJob<'a> {
+    ordinal: usize,
+    completed: usize,
     project_id: &'a String,
     occurrences: &'a Vec<Occurrence>,
     pending: Vec<Occurrence>,

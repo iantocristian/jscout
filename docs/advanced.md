@@ -1113,7 +1113,7 @@ created. Provenance begins with the first release published by the workflow.
 `jscout --experimental-tsr --checker-jobs 4 watch ROOT --enrich` runs up to four
 checker projects concurrently. The same option works for `enrich` and the default
 TypeScript sidecar. Persist it with `[checker] jobs = 4` in `.jscout.toml`; the
-CLI overrides the file, and the default is one worker. Zero is rejected.
+CLI overrides the file, and the default is one worker. Values outside 1–16 are rejected.
 Restart watch after changing this setting.
 
 Each worker owns a compiler session and stages its own project. Projects that
@@ -1127,3 +1127,11 @@ Increasing the limit does not split a single project, parallelize initial
 selection/planning, or repair compiler inference failures. Each additional
 active project can require another compiler's worth of memory. Changing only
 the worker count does not invalidate reusable checker results.
+
+Enrichment JSON labels its memory counters `peak_project_rss_bytes` and
+`peak_project_heap_bytes` (formerly `peak_rss_bytes` and `peak_heap_bytes`).
+These are the largest values reported by any one project sidecar, not the
+combined memory of concurrent workers. Native TypeScript compiler children
+are not included in the sidecar RSS; embedded TSR does not report these counters
+and returns zero. Aggregate process memory is not measured. The worker limit
+bounds concurrency, not memory use; choose a lower count for large projects.

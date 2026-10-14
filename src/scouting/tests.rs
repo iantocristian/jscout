@@ -29,7 +29,7 @@ fn assert_progress_complete(events: &[crate::progress::Event], label: &str, expe
     for event in &events[start + 1..] {
         match event {
             Event::Stage { .. } => break,
-            Event::Advance(amount) => processed += amount,
+            Event::Advance(amount) | Event::AdvanceWithDetail { amount, .. } => processed += amount,
             Event::Total(updated) => total = *updated,
             Event::RequestStarted | Event::RequestFinished | Event::Idle | Event::Detail(_) => {}
         }

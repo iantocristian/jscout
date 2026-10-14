@@ -10,6 +10,17 @@ pub use backend::{Backend, Checker};
 pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_partial_failure};
 pub(crate) use enrich::{active_batch_inputs_fresh, target_fingerprint};
 
+/// Bound independently allocated compiler sessions; each can use substantial memory.
+pub(crate) const MAX_JOBS: usize = 16;
+
+pub(crate) fn validate_jobs(jobs: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=MAX_JOBS).contains(&jobs),
+        "checker jobs must be between 1 and {MAX_JOBS}"
+    );
+    Ok(())
+}
+
 /// Stable identity for the checker semantics and the actual watcher selection
 /// policy. It is intentionally independent of repository state, project
 /// membership, paths, timeouts, dirty affinity, and the per-generation

@@ -1048,9 +1048,7 @@ impl RuntimeConfig {
         let checker = CheckerSettings {
             jobs: resolver.configured_or("checker.jobs", raw.checker.jobs, 1),
         };
-        if checker.jobs == 0 {
-            bail!("checker.jobs must be greater than zero");
-        }
+        crate::checker::validate_jobs(checker.jobs).context("invalid checker.jobs")?;
         let effective = EffectiveConfig {
             checker,
             experimental,

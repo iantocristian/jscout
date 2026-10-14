@@ -86,6 +86,14 @@ fn compare(compiler: &str) {
         ],
     );
     assert!(
+        log.contains("checker project 3/4"),
+        "serial project position is missing: {log}"
+    );
+    assert!(
+        log.contains("(1 pending, 0 resumed)"),
+        "serial counts are missing: {log}"
+    );
+    assert!(
         !log.contains("checking projects (2 workers)"),
         "CLI must override TOML"
     );
@@ -102,6 +110,22 @@ fn compare(compiler: &str) {
         ],
     );
     assert!(log.contains("checking projects (2 workers)"), "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("checking projects (2 workers) 4/4"))
+            .count(),
+        1,
+        "duplicate completion: {log}"
+    );
+    for report in [&one, &many] {
+        assert!(report["peak_project_rss_bytes"].is_u64());
+        assert!(report["peak_project_heap_bytes"].is_u64());
+        assert!(
+            report.get("peak_rss_bytes").is_none(),
+            "ambiguous memory label remains"
+        );
+        assert!(report.get("peak_heap_bytes").is_none());
+    }
     assert!(
         !log.contains("checker preparation:"),
         "parallel workers must not overwrite aggregate progress"
@@ -162,17 +186,37 @@ fn checker_jobs_rejects_zero_and_config_reports_the_value() {
     .unwrap();
     let output = invoke(repo.path(), &["config", "show", "--json"]);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("checker.jobs must be greater than zero")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid checker.jobs"));
     fs::write(
         repo.path().join(".jscout.toml"),
         "version=1\n[checker]\njobs=4\n",
     )
     .unwrap();
+    for value in ["0", "17", "64"] {
+        let output = invoke(repo.path(), &["config", "show", "--checker-jobs", value]);
+        assert!(
+            !output.status.success(),
+            "invalid CLI job count {value} was accepted"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 16"));
+    }
+    success(
+        repo.path(),
+        &["config", "show", "--json", "--checker-jobs", "16"],
+    );
     let (config, _) = success(repo.path(), &["config", "show", "--json"]);
     assert_eq!(config["effective"]["checker"]["jobs"], 4);
     assert_eq!(config["sources"]["checker.jobs"], "config");
+    for value in [17, 64] {
+        fs::write(
+            repo.path().join(".jscout.toml"),
+            format!("version=1\n[checker]\njobs={value}\n"),
+        )
+        .unwrap();
+        let output = invoke(repo.path(), &["config", "show", "--json"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 16"));
+    }
 }
 
 #[test]

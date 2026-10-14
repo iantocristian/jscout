@@ -13,6 +13,7 @@ const DELAY: Duration = Duration::from_secs(2);
 pub enum Event {
     Stage { label: String, total: Option<usize> },
     Advance(usize),
+    AdvanceWithDetail { amount: usize, detail: String },
     Total(usize),
     Detail(String),
     RequestStarted,
@@ -66,6 +67,14 @@ pub fn stage(label: impl Into<String>, total: Option<usize>) {
 
 pub fn advance(amount: usize) {
     emit(Event::Advance(amount));
+}
+
+/// Publish a completed unit and its label together so completion renders once.
+pub fn advance_with_detail(amount: usize, detail: impl Into<String>) {
+    emit(Event::AdvanceWithDetail {
+        amount,
+        detail: detail.into(),
+    });
 }
 
 pub fn set_total(total: usize) {
@@ -172,6 +181,10 @@ impl State {
                 self.detail.clear();
             }
             Event::Advance(amount) => self.done = self.done.saturating_add(amount),
+            Event::AdvanceWithDetail { amount, detail } => {
+                self.done = self.done.saturating_add(amount);
+                self.detail = detail;
+            }
             Event::Total(total) => self.total = Some(total),
             Event::Detail(detail) => self.detail = detail,
             Event::RequestStarted => self.active_requests += 1,
@@ -338,6 +351,41 @@ mod tests {
                 .line("scout repository", Duration::ZERO, "failed")
                 .contains("completed")
         );
+    }
+
+    #[test]
+    fn project_completion_emits_one_line_with_the_final_detail() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Message::Update(Event::Stage {
+            label: "checking projects".into(),
+            total: Some(2),
+        }))
+        .unwrap();
+        tx.send(Message::Update(Event::AdvanceWithDetail {
+            amount: 1,
+            detail: "finished first".into(),
+        }))
+        .unwrap();
+        tx.send(Message::Update(Event::AdvanceWithDetail {
+            amount: 1,
+            detail: "finished second".into(),
+        }))
+        .unwrap();
+        tx.send(Message::Update(Event::Stage {
+            label: "publishing".into(),
+            total: None,
+        }))
+        .unwrap();
+        tx.send(Message::Finish(true)).unwrap();
+        let mut output = Vec::new();
+        report(rx, "enrich", true, Duration::from_secs(5), &mut output);
+        let output = String::from_utf8(output).unwrap();
+        let completed = output
+            .lines()
+            .filter(|line| line.contains("checking projects 2/2"))
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 1, "{output}");
+        assert!(completed[0].contains("finished second"), "{output}");
     }
 
     #[test]

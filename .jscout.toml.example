@@ -10,7 +10,7 @@ version = 1
 tsr = false
 
 # Shared by manual enrichment and watch. More jobs use more memory.
-# Restart watch after changing this setting; --checker-jobs overrides it.
+# Accepted range: 1–16. Restart watch after changing this setting; --checker-jobs overrides it.
 [checker]
 jobs = 1
 

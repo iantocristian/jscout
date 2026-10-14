@@ -1,5 +1,5 @@
 //! Bounded project execution with coordinator-owned result handling.
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
@@ -12,7 +12,7 @@ pub(super) fn run<T: Sync, R: Send>(
     work: impl Fn(&T) -> R + Sync,
     mut complete: impl FnMut(&T, R) -> Result<()>,
 ) -> Result<()> {
-    ensure!(limit > 0, "checker jobs must be greater than zero");
+    super::validate_jobs(limit)?;
     if limit == 1 || jobs.len() <= 1 {
         for job in jobs {
             if canceled() {

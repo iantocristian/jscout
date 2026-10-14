@@ -228,11 +228,49 @@ pub fn open_path(path: &Path) -> Result<Connection> {
             rebuild_legacy_disposable_schema(&conn)?;
         }
     }
+    configure_writer_connection(&conn)?;
+    init_schema(&conn)?;
+    Ok(conn)
+}
+
+/// Open a worker writer after the coordinator has initialized the database.
+/// Never create a missing file or migrate/rebuild schema from a worker.
+pub(crate) fn open_existing_writer(
+    path: &Path,
+    timeout: std::time::Duration,
+) -> Result<Connection> {
+    register_sqlite_vec();
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).with_context(
+        || {
+            format!(
+                "open initialized index database {} for writing",
+                path.display()
+            )
+        },
+    )?;
+    conn.busy_timeout(timeout)?;
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .context("worker index database has no schema version")?;
+    anyhow::ensure!(
+        version == SCHEMA_VERSION,
+        "worker index database uses schema v{version}, expected v{SCHEMA_VERSION}; initialize it before starting workers"
+    );
+    configure_writer_connection(&conn)?;
+    Ok(conn)
+}
+
+/// Writer connection policy shared by coordinators and worker connections.
+/// Put connection-local writer settings here so new settings reach both.
+fn configure_writer_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    init_schema(&conn)?;
-    Ok(conn)
+    Ok(())
 }
 
 /// One compatibility boundary replaces the historical per-version ladder.
@@ -1640,6 +1678,52 @@ mod tests {
         let mut statement = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
         let rows = statement.query_map([relation], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    #[test]
+    fn worker_writers_share_connection_policy_without_creating_or_migrating() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let missing = temp.path().join("missing.db");
+        assert!(super::open_existing_writer(&missing, std::time::Duration::from_secs(30)).is_err());
+        assert!(!missing.exists());
+        let path = temp.path().join("index.db");
+        let coordinator = open_path(&path)?;
+        let worker = super::open_existing_writer(&path, std::time::Duration::from_secs(30))?;
+        for pragma in ["journal_mode", "synchronous", "foreign_keys"] {
+            let expected: rusqlite::types::Value =
+                coordinator.pragma_query_value(None, pragma, |row| row.get(0))?;
+            let actual: rusqlite::types::Value =
+                worker.pragma_query_value(None, pragma, |row| row.get(0))?;
+            assert_eq!(
+                actual, expected,
+                "worker drifted from coordinator for {pragma}"
+            );
+        }
+        let timeout: i64 = worker.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+        assert_eq!(timeout, 30_000);
+        worker.execute(
+            "INSERT INTO meta(key,value) VALUES('worker-test','present')",
+            [],
+        )?;
+        let value: String = coordinator.query_row(
+            "SELECT value FROM meta WHERE key='worker-test'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(value, "present");
+        drop(worker);
+        coordinator.execute("UPDATE meta SET value='16' WHERE key='schema_version'", [])?;
+        assert!(super::open_existing_writer(&path, std::time::Duration::from_secs(30)).is_err());
+        let version: String = coordinator.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            version, "16",
+            "worker must not migrate a coordinator's schema"
+        );
+        Ok(())
     }
 
     #[test]

@@ -1671,9 +1671,7 @@ fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
 }
 
 fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
-    if options.checker_jobs == 0 {
-        bail!("checker jobs must be greater than zero");
-    }
+    checker::validate_jobs(options.checker_jobs)?;
     if options.config_explicit && options.config_path.is_none() {
         bail!("explicit watch configuration path is missing");
     }
