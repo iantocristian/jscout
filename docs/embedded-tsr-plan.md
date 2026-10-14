@@ -27,6 +27,8 @@ and does not replace Oxc structural indexing.
    project references, and deterministic inferred scopes grouped by package and
    compiler family with the existing 150-root limit. Dry-run must not create a
    compiler program. Report invalid configurations instead of inventing options.
+   Skip inaccessible/disappearing discovery subdirectories as the sidecar does;
+   preserve configuration diagnostics and cancellation.
 4. Build one immutable compiler session for each selected project. Resolve the
    exact indexed call, receiver, and property byte spans; reject source drift.
    Keep union candidates, alias resolution, overload implementation/signature
@@ -37,6 +39,12 @@ and does not replace Oxc structural indexing.
    before publication. Backend identity, compiler revision, embedded libraries,
    adapter semantics, effective options, and project membership participate in
    reuse identity. Switching backends must invalidate cached checker results.
+   Directory observations hash subdirectories and compiler-relevant file names,
+   while exact file reads/lookups remain unfiltered. Watch targets are a separate
+   policy: visible repository inputs use normal incremental classification;
+   ignored/unindexed and external inputs retain explicit coverage. Discard
+   ancestor directory probes as event targets, filter unrelated outside events,
+   and subscribe to missing directory chains from their nearest existing parent.
    Next.js validation exposed deferred filesystem queries during type printing:
    resolve the complete selected project set once into owned answers before
    staging, so every batch uses the same complete manifest. Preparation has

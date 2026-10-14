@@ -46,6 +46,14 @@ fn embedded_cli_publishes_without_node_reuses_and_invalidates_inputs() {
     let repeated = run(repo.path(), &args, true);
     assert_eq!(repeated["exact_batch_reused"], true);
     assert_eq!(first["batch_id"], repeated["batch_id"]);
+    for name in ["README.md", ".DS_Store", "image.png", "data.bin"] {
+        let path = repo.path().join(name);
+        fs::write(&path, "noise").unwrap();
+        let reused = run(repo.path(), &args, true);
+        assert_eq!(reused["exact_batch_reused"], true, "{name}");
+        assert_eq!(reused["batch_id"], first["batch_id"], "{name}");
+        fs::remove_file(path).unwrap();
+    }
     // Directory observations detect new ambient inputs without reindexing.
     fs::write(
         repo.path().join("ambient.d.ts"),
@@ -183,4 +191,47 @@ fn embedded_discovery_honors_sigint() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn embedded_discovery_skips_unreadable_subdirectories() {
+    use std::os::unix::fs::PermissionsExt;
+    struct RestorePermissions(std::path::PathBuf, fs::Permissions);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"noLib":true},"include":["**/*.ts"]}"#,
+    )
+    .unwrap();
+    fs::write(repo.path().join("main.ts"), "export class Service { ping() {} } export function run(service: Service) { service.ping(); }").unwrap();
+    let unreadable = repo.path().join("unreadable");
+    fs::create_dir(&unreadable).unwrap();
+    fs::write(unreadable.join("tsconfig.json"), "{}").unwrap();
+    let _restore = RestorePermissions(
+        unreadable.clone(),
+        fs::metadata(&unreadable).unwrap().permissions(),
+    );
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&unreadable).is_ok() {
+        eprintln!("permission fixture requires an unprivileged user");
+        return;
+    }
+    run(
+        repo.path(),
+        &["--experimental-tsr", "checker", "doctor"],
+        true,
+    );
+    run(repo.path(), &["index"], true);
+    let enriched = run(
+        repo.path(),
+        &["--experimental-tsr", "enrich", "--all"],
+        true,
+    );
+    assert_eq!(enriched["facts_published"], 1);
 }

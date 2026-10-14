@@ -279,6 +279,21 @@ also makes resumed rows comparable to a freshly checked project. Preparation
 progress is reported every 128 calls; interruptions during preparation restart
 that preparation. Completed batches and projects retain the existing resume rules.
 
+Directory fingerprints retain all subdirectory names and TypeScript, JavaScript,
+and JSON file names. Unrelated documents, images, and metadata do not invalidate
+checker reuse; explicitly read files and failed lookups remain tracked regardless
+of extension. The observation format is versioned, so upgrading from the initial
+adapter recomputes its cached checker results once.
+
+Watch treats ordinary repository sources and directories through the existing
+incremental event policy. Additional checker targets cover ignored/unindexed
+inputs and explicit external inputs. Ancestor directory probes do not become
+broad event targets, and unrelated outside notifications are ignored. Missing
+input directories are monitored through their first absent child under an
+existing parent. Relevant directory-listing events request an incremental
+refresh. Project discovery skips unreadable/disappearing subdirectories, matching
+the sidecar; discovered configuration errors are still reported.
+
 Embedded `--timeout` deadlines and cancellation are **cooperative**: they are
 checked at filesystem and query boundaries. A long compiler operation can exceed
 the deadline before returning; late results are discarded. A second Ctrl-C exits
@@ -446,6 +461,12 @@ prefer an external `--database` path (or ensure the selected database family is
 gitignored) so broad staging commands cannot add it. Git HEAD,
 `.gitmodules`, selected dependency roots and locators, and external inputs from
 the latest checker batch are watched as additional invalidation boundaries.
+For a nested indexed root, `.gitignore`, `.ignore`, `package.json`,
+`pnpm-workspace.yaml`, and npm/pnpm/Yarn/Bun lockfiles along the path to the
+owning Git worktree root are exact watch targets, including when absent. Their creation, modification, or deletion
+triggers a full refresh with either checker backend and with documentation
+freshness enabled or disabled. Unselected sibling paths and paths above the Git
+worktree root remain filtered.
 Branch switches therefore rebuild the complete current file set. Extraction,
 resolution, snapshot calculation, and graph publication commit in one SQLite
 transaction. Concurrent WAL readers keep seeing the last committed publication

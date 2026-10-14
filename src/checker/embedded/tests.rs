@@ -448,3 +448,85 @@ fn directory_spelling_variants_share_one_persistable_observation() {
         Some(inputs[0].source_hash.clone())
     );
 }
+
+#[test]
+fn directory_observations_ignore_noise_but_retain_compiler_inputs() {
+    use tsr_vfs::FileSystem;
+    let directory = fixture(&[("main.ts", "export {};")]);
+    let host = host::InputFs::os(Request::new(TIMEOUT).unwrap());
+    host.entries(path_text(directory.path()).unwrap().as_bytes())
+        .unwrap();
+    let input = host.inputs().unwrap().pop().unwrap();
+    for name in [
+        "README.md",
+        ".DS_Store",
+        "image.png",
+        "data.bin",
+        "notes.txt",
+    ] {
+        let path = directory.path().join(name);
+        fs::write(&path, "noise").unwrap();
+        assert_eq!(
+            host::fresh_signature(directory.path(), &input.source_hash),
+            Some(input.source_hash.clone()),
+            "{name} invalidated a directory observation"
+        );
+        #[cfg(unix)]
+        {
+            let link = directory.path().join(format!("link-{name}"));
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(
+                host::fresh_signature(directory.path(), &input.source_hash),
+                Some(input.source_hash.clone()),
+                "irrelevant symlink invalidated a directory observation"
+            );
+            fs::remove_file(link).unwrap();
+        }
+        fs::remove_file(path).unwrap();
+    }
+    for name in [
+        "new.ts",
+        "new.tsx",
+        "new.mts",
+        "new.cts",
+        "new.d.ts",
+        "new.js",
+        "new.jsx",
+        "new.mjs",
+        "new.cjs",
+        "data.json",
+        "package.json",
+    ] {
+        let path = directory.path().join(name);
+        fs::write(&path, "").unwrap();
+        assert_ne!(
+            host::fresh_signature(directory.path(), &input.source_hash),
+            Some(input.source_hash.clone()),
+            "{name} must invalidate directory membership"
+        );
+        fs::remove_file(path).unwrap();
+    }
+    let nested = directory.path().join("new-directory");
+    fs::create_dir(&nested).unwrap();
+    assert_ne!(
+        host::fresh_signature(directory.path(), &input.source_hash),
+        Some(input.source_hash.clone())
+    );
+    fs::remove_dir(nested).unwrap();
+    // Explicit reads remain inputs even for nonstandard file names.
+    let explicit = directory.path().join("compiler-config.txt");
+    fs::write(&explicit, "before").unwrap();
+    host.read_file(path_text(&explicit).unwrap().as_bytes())
+        .unwrap();
+    let observed = host
+        .inputs()
+        .unwrap()
+        .into_iter()
+        .find(|input| input.path == path_text(&explicit).unwrap())
+        .unwrap();
+    fs::write(&explicit, "after").unwrap();
+    assert_ne!(
+        host::fresh_signature(&explicit, &observed.source_hash),
+        Some(observed.source_hash)
+    );
+}
