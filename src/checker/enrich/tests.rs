@@ -2739,6 +2739,37 @@ fn receiver_value_flow_suppresses_canonical_checker_fact_during_projection() -> 
 }
 
 #[test]
+fn compiler_sha256_is_verified_for_reuse_and_publication() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("compiler");
+    // Standard SHA-256 vector; the Node conformance test checks the same wire tag.
+    let expected = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    fs::write(&path, b"abc")?;
+    assert_eq!(input_content_hash(b"abc", expected), expected);
+    let input = ValidatedInput {
+        kind: "repository".into(),
+        path: "compiler".into(),
+        source_hash: expected.into(),
+    };
+    assert!(InputFreshnessCache::new(root.path()).matches(&input));
+    verify_source_hash(&path, expected, "compiler")?;
+
+    // Preserve compatibility with BLAKE3 source and previously stored inputs.
+    verify_source_hash(&path, &blake3::hash(b"abc").to_hex(), "compiler")?;
+    assert!(verify_source_hash(&path, "sha256:invalid", "compiler").is_err());
+
+    let modified = fs::metadata(&path)?.modified()?;
+    fs::write(&path, b"abd")?;
+    fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_times(fs::FileTimes::new().set_modified(modified))?;
+    assert!(!InputFreshnessCache::new(root.path()).matches(&input));
+    assert!(verify_source_hash(&path, expected, "compiler").is_err());
+    Ok(())
+}
+
+#[test]
 fn input_freshness_cache_pins_first_digest_per_invocation() -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("ambient.d.ts");

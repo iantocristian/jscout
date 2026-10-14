@@ -211,6 +211,27 @@ declarations remain separate `possible` candidates;
 one mapped declaration becomes an occurrence-specific `likely` edge with
 `checker` provenance. `any`, error, and unknown receiver types publish no edge.
 
+TypeScript 7 is supported through the installed compiler's native IPC API;
+TypeScript 5/6 retain their JavaScript compiler API. Selection is automatic for
+`enrich`, `watch --enrich`, and `checker doctor`: no new configuration or
+`--experimental-tsr` flag is needed. The native API client and platform binary
+must come from the same TypeScript installation; missing/broken native support
+is reported instead of silently substituting the bundled TS5 compiler. Tested
+with TypeScript 7.0.2 and Node 24.13.1. TS7's API is currently unstable, so new
+compiler releases need compatibility testing.
+
+TS7 inventory remains configuration-only. Its 7.0.2 API omits configuration
+parsing diagnostics (including malformed compiler options) during that pass;
+these are checked when a selected project opens, before any answers are returned.
+`checker doctor` therefore reports JSONC
+read/syntax problems, not a full TS7 configuration validation. Native compiler
+processes are stopped on cancellation, shutdown, and hard request deadlines.
+The reported Node RSS/heap counters do not include the native compiler process.
+
+Compiler artifact fingerprints use native SHA-256 in the sidecar and are
+content-verified again in Rust. Indexed source hashes remain BLAKE3. Compiler
+changes are not inferred from file sizes or timestamps.
+
 If another owning project returns `unknown`, that incomplete answer does not
 demote an otherwise clean, agreeing resolution. The edge's `detail_json`
 reports the incomplete owner under `unknownProjects`, and the enrichment report
