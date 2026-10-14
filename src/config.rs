@@ -4,11 +4,11 @@ mod model;
 
 pub use load::{init, load_docs_indexing_settings};
 pub use model::{
-    DatabaseSettings, DiagnosticsSettings, DocsIndexingSettings, DocsSearchSettings, DocsSettings,
-    EffectiveConfig, EmbeddingSettings, ExpansionSettings, ExperimentalSettings, IndexSettings,
-    InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel, OpenAiCompatibleProvider,
-    RerankerSettings, RuntimeConfig, SearchSettings, SidecarSettings, TelemetrySettings,
-    ValueSource, WatchSettings,
+    CheckerSettings, DatabaseSettings, DiagnosticsSettings, DocsIndexingSettings,
+    DocsSearchSettings, DocsSettings, EffectiveConfig, EmbeddingSettings, ExpansionSettings,
+    ExperimentalSettings, IndexSettings, InferenceSettings, LlmSettings, McpSettings,
+    OpenAiCompatibleModel, OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig,
+    SearchSettings, SidecarSettings, TelemetrySettings, ValueSource, WatchSettings,
 };
 
 #[cfg(test)]

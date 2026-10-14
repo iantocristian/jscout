@@ -1,6 +1,7 @@
 mod backend;
 pub(crate) mod embedded;
 mod enrich;
+mod jobs;
 mod package_gate;
 pub mod process;
 pub mod protocol;
@@ -8,6 +9,17 @@ pub mod protocol;
 pub use backend::{Backend, Checker};
 pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_failure};
 pub(crate) use enrich::{active_batch_inputs_fresh, target_fingerprint};
+
+/// Bound independently allocated compiler sessions; each can use substantial memory.
+pub(crate) const MAX_JOBS: usize = 16;
+
+pub(crate) fn validate_jobs(jobs: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=MAX_JOBS).contains(&jobs),
+        "checker jobs must be between 1 and {MAX_JOBS}"
+    );
+    Ok(())
+}
 
 /// Stable identity for the checker semantics and the actual watcher selection
 /// policy. It is intentionally independent of repository state, project
@@ -200,6 +212,7 @@ mod policy_tests {
     fn options() -> EnrichOptions<'static> {
         EnrichOptions {
             backend: crate::checker::Backend::default(),
+            jobs: 1,
             database: None,
             sidecar: None,
             node: "node",

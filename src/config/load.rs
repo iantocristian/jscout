@@ -8,11 +8,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::{
-    DatabaseSettings, DiagnosticsSettings, DocsIndexingSettings, DocsSearchSettings, DocsSettings,
-    EffectiveConfig, EmbeddingSettings, ExpansionSettings, ExperimentalSettings, FILE_NAME,
-    IndexSettings, InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel,
-    OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig, SCHEMA_VERSION, SearchSettings,
-    SidecarSettings, TEMPLATE, TelemetrySettings, ValueSource, WatchSettings,
+    CheckerSettings, DatabaseSettings, DiagnosticsSettings, DocsIndexingSettings,
+    DocsSearchSettings, DocsSettings, EffectiveConfig, EmbeddingSettings, ExpansionSettings,
+    ExperimentalSettings, FILE_NAME, IndexSettings, InferenceSettings, LlmSettings, McpSettings,
+    OpenAiCompatibleModel, OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig,
+    SCHEMA_VERSION, SearchSettings, SidecarSettings, TEMPLATE, TelemetrySettings, ValueSource,
+    WatchSettings,
 };
 use crate::{docs, file_role, origin, search, store};
 
@@ -22,6 +23,8 @@ struct FileConfig {
     version: u32,
     #[serde(default)]
     experimental: ExperimentalFileConfig,
+    #[serde(default)]
+    checker: CheckerFileConfig,
     #[serde(default)]
     database: DatabaseFileConfig,
     #[serde(default)]
@@ -48,6 +51,12 @@ struct FileConfig {
     index: IndexFileConfig,
     #[serde(default)]
     watch: WatchFileConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckerFileConfig {
+    jobs: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1042,7 +1051,12 @@ impl RuntimeConfig {
         let experimental = ExperimentalSettings {
             tsr: resolver.bool("experimental.tsr", raw.experimental.tsr, None, false)?,
         };
+        let checker = CheckerSettings {
+            jobs: resolver.configured_or("checker.jobs", raw.checker.jobs, 1),
+        };
+        crate::checker::validate_jobs(checker.jobs).context("invalid checker.jobs")?;
         let effective = EffectiveConfig {
+            checker,
             experimental,
             database: DatabaseSettings {
                 path: database_path,

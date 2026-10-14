@@ -9,6 +9,11 @@ version = 1
 # CLI --experimental-tsr or --experimental-tsr=false overrides it for one run.
 tsr = false
 
+# Shared by manual enrichment and watch. More jobs use more memory.
+# Accepted range: 1–16. Restart watch after changing this setting; --checker-jobs overrides it.
+[checker]
+jobs = 1
+
 [database]
 path = ".jscout.db"
 

@@ -103,6 +103,7 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     checker::Backend::TypeScript
                 },
+                cli.checker_jobs.unwrap_or(runtime.effective.checker.jobs),
             );
             (progress, result)
         }

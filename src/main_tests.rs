@@ -214,12 +214,12 @@ fn lexical_only_and_rerank_controls_parse_independently() {
         "--no-rerank",
     ])
     .expect("explicit controls parse");
-    let Command::Search {
+    let Command::Search(crate::cli::SearchArgs {
         no_vector,
         no_rerank,
         lexical_only,
         ..
-    } = command
+    }) = command
     else {
         panic!("expected search")
     };
@@ -230,7 +230,7 @@ fn lexical_only_and_rerank_controls_parse_independently() {
     let Cli { command, .. } =
         Cli::try_parse_from(["jscout", "search", ".", "query", "--lexical-only"])
             .expect("lexical shortcut parses");
-    let Command::Search { lexical_only, .. } = command else {
+    let Command::Search(crate::cli::SearchArgs { lexical_only, .. }) = command else {
         panic!("expected search")
     };
     assert!(lexical_only);
@@ -246,14 +246,14 @@ fn lexical_only_and_rerank_controls_parse_independently() {
         "--no-expand",
     ])
     .expect("positive repository-default overrides parse");
-    let Command::Search {
+    let Command::Search(crate::cli::SearchArgs {
         vector,
         rerank,
         memory,
         no_expand,
         limit,
         ..
-    } = command
+    }) = command
     else {
         panic!("expected search")
     };
@@ -279,12 +279,12 @@ fn lexical_only_and_rerank_controls_parse_independently() {
         "12",
     ])
     .expect("expansion projection controls parse");
-    let Command::Search {
+    let Command::Search(crate::cli::SearchArgs {
         expand,
         expand_mode,
         expand_paths,
         ..
-    } = command
+    }) = command
     else {
         panic!("expected search")
     };
@@ -306,14 +306,14 @@ fn search_format_scope_is_repeatable_and_omitted_by_default() {
         "typescript",
     ])
     .expect("format allowlist parses");
-    let Command::Search { formats, .. } = command else {
+    let Command::Search(crate::cli::SearchArgs { formats, .. }) = command else {
         panic!("expected search")
     };
     assert_eq!(formats, ["javascript", "typescript"]);
 
     let Cli { command, .. } = Cli::try_parse_from(["jscout", "search", ".", "checker protocol"])
         .expect("omitted format scope parses");
-    let Command::Search { formats, .. } = command else {
+    let Command::Search(crate::cli::SearchArgs { formats, .. }) = command else {
         panic!("expected search")
     };
     assert!(formats.is_empty());
@@ -333,13 +333,13 @@ fn search_scope_and_exhaustive_operator_cli_contract() {
         "--allow-broad",
     ])
     .unwrap();
-    let Command::Search {
+    let Command::Search(crate::cli::SearchArgs {
         query,
         path_prefix,
         match_mode,
         allow_broad,
         ..
-    } = command
+    }) = command
     else {
         panic!("expected search");
     };
@@ -501,12 +501,12 @@ fn exhaustive_search_parses_cursor_paging_and_rejects_explicit_stage_enables() {
         "--no-expand",
     ])
     .expect("exhaustive continuation parses");
-    let Command::Search {
+    let Command::Search(crate::cli::SearchArgs {
         exhaustive,
         cursor,
         limit,
         ..
-    } = command
+    }) = command
     else {
         panic!("expected search")
     };
@@ -569,7 +569,7 @@ fn search_and_embed_accept_external_database_paths() {
         "/tmp/search.db",
     ])
     .expect("external search database parses");
-    let Command::Search { database, .. } = command else {
+    let Command::Search(crate::cli::SearchArgs { database, .. }) = command else {
         panic!("expected search")
     };
     assert_eq!(database, Some(PathBuf::from("/tmp/search.db")));
@@ -645,12 +645,12 @@ fn compact_and_debug_json_modes_parse_without_ambiguity() {
     let Cli { command, .. } =
         Cli::try_parse_from(["jscout", "search", ".", "query", "--debug-json"])
             .expect("debug search output parses");
-    let Command::Search {
+    let Command::Search(crate::cli::SearchArgs {
         json,
         debug_json,
         response_bytes,
         ..
-    } = command
+    }) = command
     else {
         panic!("expected search")
     };
