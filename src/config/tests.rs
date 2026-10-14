@@ -35,11 +35,66 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     assert!(!config.effective.search.attach_memory);
     assert_eq!(config.effective.search.response_bytes, 30_000);
     assert_eq!(config.effective.llm.max_concurrency, 1);
+    assert_eq!(config.effective.diagnostics.progress_interval_seconds, 5);
+    assert_eq!(
+        config.sources["diagnostics.progress_interval_seconds"],
+        ValueSource::Builtin
+    );
     assert_eq!(config.effective.search.expansion.mode, "paths");
     assert_eq!(config.effective.search.expansion.paths, 8);
     assert_eq!(config.sources["search.rerank"], ValueSource::Builtin);
     assert_eq!(config.sources["docs.include"], ValueSource::Builtin);
     assert_eq!(config.sources["docs.enabled"], ValueSource::Builtin);
+    Ok(())
+}
+
+#[test]
+fn progress_interval_is_configurable_and_reported() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    write_config(
+        root.path(),
+        "version = 1\n[diagnostics]\nprogress_interval_seconds = 15\n",
+    )?;
+    let config = RuntimeConfig::load(Some(root.path()), None)?;
+    assert_eq!(config.effective.diagnostics.progress_interval_seconds, 15);
+    assert_eq!(
+        config.sources["diagnostics.progress_interval_seconds"],
+        ValueSource::Config
+    );
+    assert!(
+        config
+            .show_text()
+            .contains("diagnostics.progress_interval_seconds = 15 [config]")
+    );
+    let json: serde_json::Value = serde_json::from_str(&config.show_json()?)?;
+    assert_eq!(
+        json["effective"]["diagnostics"]["progress_interval_seconds"],
+        15
+    );
+    assert_eq!(
+        json["sources"]["diagnostics.progress_interval_seconds"],
+        "config"
+    );
+    write_config(
+        root.path(),
+        "version = 1\n[diagnostics]\nprogress_interval_seconds = 0\n",
+    )?;
+    let config = RuntimeConfig::load(Some(root.path()), None)?;
+    assert_eq!(config.effective.diagnostics.progress_interval_seconds, 0);
+    Ok(())
+}
+
+#[test]
+fn progress_interval_requires_nonnegative_whole_seconds() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    for value in ["-1", "1.5", "\"5\""] {
+        write_config(
+            root.path(),
+            &format!("version = 1\n[diagnostics]\nprogress_interval_seconds = {value}\n"),
+        )?;
+        let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+        assert!(format!("{error:#}").contains("progress_interval_seconds"));
+    }
     Ok(())
 }
 

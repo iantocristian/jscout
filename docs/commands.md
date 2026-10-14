@@ -34,9 +34,14 @@ jscout --no-progress docs embed /path/to/repo --json > embeddings.json
 
 `--no-progress` is global and suppresses progress, including checker batch and
 resource updates. Warnings, errors, explicit diagnostics, and watch lifecycle
-logs remain visible. Progress is plain text, with
-waiting updates about once per second on a terminal and every five seconds
-otherwise. Phase changes and completion can be reported sooner.
+logs remain visible. Progress is plain text, with waiting updates every five
+seconds by default. Set `diagnostics.progress_interval_seconds` in `.jscout.toml`
+or use the global `--progress-interval-seconds 10` override to change the terminal
+interval (nonnegative whole seconds). Set it to `0` to disable periodic terminal
+heartbeats while retaining the initial report after two seconds for slow commands,
+phase changes, and completion. Redirected stderr always
+uses five seconds, including when the setting is `0`. Phase changes and completion
+can be reported sooner. Restart a running watcher to apply an interval change.
 
 Counts apply to the named phase, not an estimated percentage of the whole
 command. Embedding counts distinguish missing representations from cached reuse

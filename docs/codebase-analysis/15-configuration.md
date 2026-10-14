@@ -115,6 +115,7 @@ Column three is the legacy `JSCOUT_*` name; an em dash means the key has no envi
 | `telemetry.request_log` | — | none |
 | `diagnostics.timing` | `JSCOUT_TIMING` | `false` |
 | `diagnostics.debug` | `JSCOUT_DEBUG` | `false` |
+| `diagnostics.progress_interval_seconds` | — | `5`; terminal heartbeats only, `0` disables them; redirected stderr remains fixed at 5s |
 | `index.dependencies` | — | `[]` |
 | `watch.embed` | — | `false` |
 | `watch.product` | — | `false` (requires `watch.embed`) |

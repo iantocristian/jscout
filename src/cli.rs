@@ -17,6 +17,9 @@ pub(super) struct Cli {
     /// Suppress progress on stderr (warnings and errors are still reported)
     #[arg(long, global = true)]
     pub(super) no_progress: bool,
+    /// Terminal heartbeat seconds; 0 disables heartbeats (overrides `diagnostics.progress_interval_seconds`; default 5)
+    #[arg(long, global = true)]
+    pub(super) progress_interval_seconds: Option<u64>,
     /// Enable or disable embedded TSR (overrides experimental.tsr; cooperative deadlines)
     #[arg(long, global = true, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub(super) experimental_tsr: Option<bool>,

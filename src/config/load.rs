@@ -226,6 +226,7 @@ struct TelemetryFileConfig {
 struct DiagnosticsFileConfig {
     timing: Option<bool>,
     debug: Option<bool>,
+    progress_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -998,6 +999,11 @@ impl RuntimeConfig {
                 Some("JSCOUT_DEBUG"),
                 false,
             )?,
+            progress_interval_seconds: resolver.configured_or(
+                "diagnostics.progress_interval_seconds",
+                raw.diagnostics.progress_interval_seconds,
+                crate::progress::DEFAULT_INTERVAL_SECONDS,
+            ),
         };
         let index = IndexSettings {
             dependencies: resolver.configured_or(

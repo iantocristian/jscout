@@ -16,6 +16,45 @@ use crate::{
 use clap::Parser;
 
 #[test]
+fn progress_interval_cli_is_a_nonnegative_global_override() {
+    let default = Cli::try_parse_from(["jscout", "index", "."]).unwrap();
+    assert_eq!(default.progress_interval_seconds, None);
+    for arguments in [
+        vec!["jscout", "--progress-interval-seconds", "10", "index", "."],
+        vec!["jscout", "index", ".", "--progress-interval-seconds", "10"],
+    ] {
+        assert_eq!(
+            Cli::try_parse_from(arguments)
+                .unwrap()
+                .progress_interval_seconds,
+            Some(10)
+        );
+    }
+    assert_eq!(
+        Cli::try_parse_from(["jscout", "index", ".", "--progress-interval-seconds", "0"])
+            .unwrap()
+            .progress_interval_seconds,
+        Some(0)
+    );
+    for value in ["-1", "1.5", "invalid"] {
+        assert!(
+            Cli::try_parse_from(["jscout", "index", ".", "--progress-interval-seconds", value])
+                .is_err()
+        );
+    }
+    let quiet = Cli::try_parse_from([
+        "jscout",
+        "index",
+        ".",
+        "--no-progress",
+        "--progress-interval-seconds",
+        "10",
+    ])
+    .unwrap();
+    assert!(quiet.no_progress);
+}
+
+#[test]
 fn experimental_tsr_cli_preserves_absence_and_explicit_overrides() {
     for (args, expected) in [
         (vec!["jscout", "enrich", "."], None),
