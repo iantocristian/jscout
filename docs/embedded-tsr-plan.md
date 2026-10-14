@@ -1,7 +1,9 @@
 # Embedded TSR checker integration
 
 Jscout will offer an experimental in-process TypeScript checker selected by
-`--experimental-tsr`. The binary will link the compiler and its standard-library
+`--experimental-tsr` or `[experimental] tsr = true` in `.jscout.toml`. The CLI
+overrides TOML, including `--experimental-tsr=false` to use the default sidecar
+for one invocation. The binary will link the compiler and its standard-library
 declarations. Selecting it must not launch Node, `tsrust`, a language server, or
 a compiler sidecar. The existing TypeScript sidecar remains the default.
 

@@ -61,7 +61,8 @@ and upgrades, see [installation](docs/installation.md).
 For client-specific configuration and credentials, see [MCP setup](docs/mcp.md).
 
 The experimental `--experimental-tsr` flag runs checker enrichment with TSR
-and its standard libraries embedded in the Rust binary. See the
+and its standard libraries embedded in the Rust binary. Set `experimental.tsr = true`
+in `.jscout.toml` to enable it per repository. See the
 [embedded checker guide](docs/advanced.md#experimental-embedded-checker),
 [implementation plan](docs/embedded-tsr-plan.md), and
 [Next.js validation](docs/embedded-tsr-next-results.md).

@@ -15,6 +15,8 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     let root = tempfile::tempdir()?;
     let config = RuntimeConfig::load(Some(root.path()), None)?;
     assert!(!config.config_loaded);
+    assert!(!config.effective.experimental.tsr);
+    assert_eq!(config.sources["experimental.tsr"], ValueSource::Builtin);
     assert_eq!(
         config.effective.database.path,
         root.path().canonicalize()?.join(".jscout.db")
@@ -38,6 +40,46 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     assert_eq!(config.sources["search.rerank"], ValueSource::Builtin);
     assert_eq!(config.sources["docs.include"], ValueSource::Builtin);
     assert_eq!(config.sources["docs.enabled"], ValueSource::Builtin);
+    Ok(())
+}
+
+#[test]
+fn experimental_tsr_is_reported_and_fingerprinted_as_repository_policy() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let defaults = RuntimeConfig::load(Some(root.path()), None)?;
+    write_config(root.path(), "version = 1\n[experimental]\ntsr = true\n")?;
+    let enabled = RuntimeConfig::load(Some(root.path()), None)?;
+    assert!(enabled.effective.experimental.tsr);
+    assert_eq!(enabled.sources["experimental.tsr"], ValueSource::Config);
+    assert_ne!(enabled.fingerprint, defaults.fingerprint);
+    assert!(
+        enabled
+            .show_text()
+            .contains("experimental.tsr = true [config]")
+    );
+    let json: serde_json::Value = serde_json::from_str(&enabled.show_json()?)?;
+    assert_eq!(json["effective"]["experimental"]["tsr"], true);
+    assert_eq!(json["sources"]["experimental.tsr"], "config");
+
+    write_config(root.path(), "version = 1\n[experimental]\ntsr = false\n")?;
+    let disabled = RuntimeConfig::load(Some(root.path()), None)?;
+    assert!(!disabled.effective.experimental.tsr);
+    assert_eq!(disabled.sources["experimental.tsr"], ValueSource::Config);
+    assert_eq!(disabled.fingerprint, defaults.fingerprint);
+    Ok(())
+}
+
+#[test]
+fn experimental_options_reject_unknown_keys_and_non_boolean_values() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    for setting in ["tsr = \"true\"", "tsr = 1", "tsrr = true"] {
+        write_config(
+            root.path(),
+            &format!("version = 1\n[experimental]\n{setting}\n"),
+        )?;
+        let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+        assert!(error.to_string().contains(FILE_NAME));
+    }
     Ok(())
 }
 

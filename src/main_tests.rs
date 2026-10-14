@@ -16,6 +16,34 @@ use crate::{
 use clap::Parser;
 
 #[test]
+fn experimental_tsr_cli_preserves_absence_and_explicit_overrides() {
+    for (args, expected) in [
+        (vec!["jscout", "enrich", "."], None),
+        (
+            vec!["jscout", "--experimental-tsr", "enrich", "."],
+            Some(true),
+        ),
+        (
+            vec!["jscout", "enrich", ".", "--experimental-tsr"],
+            Some(true),
+        ),
+        (
+            vec!["jscout", "enrich", ".", "--experimental-tsr=true"],
+            Some(true),
+        ),
+        (
+            vec!["jscout", "--experimental-tsr=false", "enrich", "."],
+            Some(false),
+        ),
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.experimental_tsr, expected);
+        assert!(matches!(cli.command, Command::Enrich { .. }));
+    }
+    assert!(Cli::try_parse_from(["jscout", "--experimental-tsr=maybe", "enrich", "."]).is_err());
+}
+
+#[test]
 fn flag_resolution_covers_every_truth_table_row() {
     let cases = [
         (false, false, false, false),
