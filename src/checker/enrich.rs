@@ -203,13 +203,22 @@ impl fmt::Display for PartialEnrichmentError {
 impl std::error::Error for PartialEnrichmentError {}
 
 /// A partial batch with only deterministic per-project failures is usable and
-/// should not enter watch's tight phase-retry loop. A later structural
-/// generation or periodic reconciliation naturally attempts those projects
-/// again.
+/// should not enter watch's phase-retry loop. Watch parks checking until a
+/// checker input event, a changed code digest, or an explicit restart.
 pub fn is_terminal_partial_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<PartialEnrichmentError>()
         .is_some_and(|partial| !partial.retryable())
+}
+
+/// Recognize deterministic checker errors even before project execution has
+/// produced a partial batch (for example during discovery or planning).
+pub fn is_terminal_failure(error: &anyhow::Error) -> bool {
+    is_terminal_partial_failure(error)
+        || (error
+            .downcast_ref::<super::process::CheckerError>()
+            .is_some()
+            && !project_failure_is_retryable(error))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1067,6 +1076,12 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                     let message = error.to_string();
                     let retryable = project_failure_is_retryable(&error);
                     mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
+                    if !parallel {
+                        crate::progress::stage(
+                            format!("checker project failed: {project_id}"),
+                            None,
+                        );
+                    }
                     eprintln!(
                         "checker enrichment: project {project_id} failed disposition={}: {error:#}",
                         if retryable { "retryable" } else { "terminal" }

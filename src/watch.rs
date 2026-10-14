@@ -21,6 +21,7 @@ use crate::{checker, config, docs, embed, formats, indexer, store, structural, w
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const MAX_CHECKER_ATTEMPTS: u32 = 3;
 const DEFAULT_RETRY_MAX: Duration = Duration::from_secs(30);
 const CHECKER_DRIFT_FLUSH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const OPTIONAL_PHASE_POLL: Duration = Duration::from_millis(100);
@@ -153,6 +154,9 @@ struct DirtySignal {
     source_paths: BTreeSet<String>,
     checker_source_paths: BTreeSet<String>,
     checker_refresh_required: bool,
+    /// A concrete checker input event can release a failed checker. Timers
+    /// and inventory-only notifications must first discover a changed digest.
+    checker_retry_trigger: bool,
     force_full_enrichment: bool,
 }
 
@@ -164,6 +168,7 @@ impl DirtySignal {
             source_paths: BTreeSet::new(),
             checker_source_paths: BTreeSet::new(),
             checker_refresh_required: true,
+            checker_retry_trigger: true,
             force_full_enrichment: false,
         }
     }
@@ -176,6 +181,7 @@ impl DirtySignal {
             source_paths: [path.clone()].into(),
             checker_source_paths: checker_eligible.then_some(path).into_iter().collect(),
             checker_refresh_required: checker_eligible,
+            checker_retry_trigger: checker_eligible,
             force_full_enrichment: false,
         }
     }
@@ -190,6 +196,7 @@ impl DirtySignal {
             // changes refresh checker publication. Only checker-ineligible
             // code formats use the no-provider rebind path.
             checker_refresh_required: true,
+            checker_retry_trigger: false,
             force_full_enrichment: false,
         }
     }
@@ -201,6 +208,7 @@ impl DirtySignal {
             source_paths: BTreeSet::new(),
             checker_source_paths: BTreeSet::new(),
             checker_refresh_required: false,
+            checker_retry_trigger: false,
             force_full_enrichment: false,
         }
     }
@@ -216,7 +224,15 @@ impl DirtySignal {
             source_paths: BTreeSet::new(),
             checker_source_paths: BTreeSet::new(),
             checker_refresh_required: true,
+            checker_retry_trigger: false,
             force_full_enrichment: false,
+        }
+    }
+
+    fn checker_input(reason: impl Into<String>) -> Self {
+        Self {
+            checker_retry_trigger: true,
+            ..Self::inventory(reason)
         }
     }
 
@@ -227,6 +243,7 @@ impl DirtySignal {
             source_paths: BTreeSet::new(),
             checker_source_paths: BTreeSet::new(),
             checker_refresh_required: true,
+            checker_retry_trigger: false,
             force_full_enrichment: true,
         }
     }
@@ -241,6 +258,7 @@ impl DirtySignal {
             source_paths: BTreeSet::new(),
             checker_source_paths: BTreeSet::new(),
             checker_refresh_required: true,
+            checker_retry_trigger: false,
             force_full_enrichment: false,
         }
     }
@@ -251,6 +269,7 @@ impl DirtySignal {
         self.source_paths.extend(other.source_paths);
         self.checker_source_paths.extend(other.checker_source_paths);
         self.checker_refresh_required |= other.checker_refresh_required;
+        self.checker_retry_trigger |= other.checker_retry_trigger;
         self.force_full_enrichment |= other.force_full_enrichment;
     }
 }
@@ -302,6 +321,8 @@ struct Coordinator {
     embed: bool,
     enrich: bool,
     partial_generation: bool,
+    checker_paused: bool,
+    checker_snapshot: Option<String>,
     force_full_enrichment: bool,
 }
 
@@ -327,6 +348,8 @@ impl Coordinator {
             embed,
             enrich,
             partial_generation: false,
+            checker_paused: false,
+            checker_snapshot: None,
             force_full_enrichment: false,
         };
         coordinator.mark_dirty(Duration::ZERO, DirtySignal::full("startup"));
@@ -335,6 +358,9 @@ impl Coordinator {
     }
 
     fn mark_dirty(&mut self, now: Duration, signal: DirtySignal) {
+        if signal.checker_retry_trigger {
+            self.checker_paused = false;
+        }
         // Checker affinity spans generations. A source edit observed while an
         // older enrichment is running must remain dirty until a non-superseded
         // checker publication succeeds. Documentation and checker-ineligible
@@ -456,7 +482,7 @@ impl Coordinator {
             phase: Phase::Refresh,
             refresh_scope: self.refresh_scope,
             force_full_enrichment: self.force_full_enrichment,
-            rebind_checker: self.enrich && !self.needs_enrichment(),
+            rebind_checker: self.enrich && !self.checker_paused && !self.needs_enrichment(),
         };
         self.active = Some(work);
         Some(work)
@@ -476,6 +502,21 @@ impl Coordinator {
                 self.last_dirty_at.saturating_add(self.debounce)
             }
         })
+    }
+
+    fn observe_checker_snapshot(&mut self, snapshot: &str) {
+        // Reconciliation still repairs missed source notifications. Use the
+        // code digest, so documentation/provenance-only refreshes stay parked.
+        if self.checker_paused
+            && self
+                .checker_snapshot
+                .as_deref()
+                .is_some_and(|old| old != snapshot)
+        {
+            self.checker_paused = false;
+            self.checker_refresh_required = true;
+        }
+        self.checker_snapshot = Some(snapshot.to_owned());
     }
 
     fn finish_refresh(&mut self, work: Work) -> FinishState {
@@ -523,6 +564,9 @@ impl Coordinator {
         }
         self.retry_attempts.remove(&work.phase);
         self.partial_generation = true;
+        if work.phase == Phase::Enrich {
+            self.checker_paused = true;
+        }
         self.advance(work)
     }
 
@@ -530,6 +574,15 @@ impl Coordinator {
         self.clear_active(work);
         if work.generation != self.desired_generation {
             return FinishState::Superseded;
+        }
+        if work.phase == Phase::Enrich
+            && self.retry_attempts.get(&work.phase).copied().unwrap_or(0) + 1
+                >= MAX_CHECKER_ATTEMPTS
+        {
+            self.retry_attempts.remove(&work.phase);
+            self.checker_paused = true;
+            self.partial_generation = true;
+            return self.advance(work);
         }
         self.schedule_retry(now, work)
     }
@@ -578,7 +631,7 @@ impl Coordinator {
             self.completed_generation = work.generation;
             self.dirty_reasons.clear();
             self.dirty_source_paths.clear();
-            let partial = std::mem::take(&mut self.partial_generation);
+            let partial = std::mem::take(&mut self.partial_generation) || self.checker_paused;
             if !partial {
                 self.force_full_enrichment = false;
             }
@@ -596,6 +649,7 @@ impl Coordinator {
 
     fn needs_enrichment(&self) -> bool {
         self.enrich
+            && !self.checker_paused
             && (self.checker_refresh_required
                 || self.force_full_enrichment
                 || !self.checker_dirty_source_paths.is_empty())
@@ -698,7 +752,10 @@ impl EventClassifier {
 
     fn classify(&self, paths: &[PathBuf]) -> Option<DirtySignal> {
         if paths.is_empty() {
-            return Some(DirtySignal::full("unknown-event"));
+            return Some(DirtySignal {
+                checker_retry_trigger: false,
+                ..DirtySignal::full("unknown-event")
+            });
         }
         let mut signal = None;
         for path in paths {
@@ -709,7 +766,10 @@ impl EventClassifier {
             if self.config_exact.contains(&path) {
                 merge_signal(
                     &mut signal,
-                    DirtySignal::inventory(format!("config:{}", display_path(&self.root, &path))),
+                    DirtySignal::checker_input(format!(
+                        "config:{}",
+                        display_path(&self.root, &path)
+                    )),
                 );
                 continue;
             }
@@ -746,7 +806,7 @@ impl EventClassifier {
             {
                 merge_signal(
                     &mut signal,
-                    DirtySignal::inventory(format!("checker-directory:{}", path.display())),
+                    DirtySignal::checker_input(format!("checker-directory:{}", path.display())),
                 );
                 continue;
             }
@@ -1226,6 +1286,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                     };
                     match refresh_result {
                         Ok(result) => {
+                            coordinator.observe_checker_snapshot(&result.snapshot);
                             docs_policy = candidate_policy
                                 .expect("successful refresh has a loaded documentation policy");
                             match rejection_report_latch.observe(&result.outcome.rejections) {
@@ -1431,7 +1492,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                         Err(error) => {
                             let interrupted = checker::process::interrupt_pending();
                             let superseded = coordinator.is_superseded(work);
-                            let terminal_partial = checker::is_terminal_partial_failure(&error);
+                            let terminal_failure = checker::is_terminal_failure(&error);
                             eprintln!(
                                 "watch generation={} phase=enrich status={} elapsed_ms={} error={error:#}",
                                 work.generation,
@@ -1439,7 +1500,7 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                     "interrupted"
                                 } else if superseded {
                                     "canceled"
-                                } else if terminal_partial {
+                                } else if terminal_failure {
                                     "partial"
                                 } else {
                                     "failed"
@@ -1450,11 +1511,22 @@ pub fn watch(root: &Path, options: &WatchOptions<'_>) -> Result<()> {
                                 eprintln!("watch status=stopped reason=interrupt");
                                 return Ok(());
                             }
-                            let state = if terminal_partial {
+                            let state = if terminal_failure {
                                 coordinator.finish_optional_partial(work)
                             } else {
                                 coordinator.finish_error(started.elapsed(), work)
                             };
+                            if !superseded && coordinator.checker_paused {
+                                eprintln!(
+                                    "watch generation={} phase=enrich status=paused reason={} recovery=input-change-or-restart indexing=active",
+                                    work.generation,
+                                    if terminal_failure {
+                                        "terminal-failure"
+                                    } else {
+                                        "retry-limit"
+                                    },
+                                );
+                            }
                             report_finish(
                                 work,
                                 state,
@@ -1895,7 +1967,10 @@ fn ingest_event(
             None
         }
         Ok(event) => classifier.classify(&event.paths),
-        Err(error) => Some(DirtySignal::full(format!("watch-error:{error}"))),
+        Err(error) => Some(DirtySignal {
+            checker_retry_trigger: false,
+            ..DirtySignal::full(format!("watch-error:{error}"))
+        }),
     };
     if let Some(signal) = signal {
         coordinator.mark_dirty(now, signal);

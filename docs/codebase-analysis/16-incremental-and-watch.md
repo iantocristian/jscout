@@ -75,7 +75,7 @@ The three timers do not behave alike:
 
 The asymmetry is visible in the deadline min at `:1087-1094`: `checker_deadline` is gated on `is_clean()`, while `phase_deadline` and `next_reconcile` are not. Anchoring reconciliation on *completion* rather than on timer fire is what stops a long generation from producing a back-to-back refresh loop; dropping an overdue deadline while dirty is what stops the retry wait from polling at the one-millisecond floor.
 
-Retry is exponential and unbounded in count: `schedule_retry` (`:373`) doubles from 500 ms, caps at 30 s (`DEFAULT_RETRY_INITIAL`/`DEFAULT_RETRY_MAX`, `:18-19`), tracks attempts per phase, and any `mark_dirty` clears `retry_attempts` wholesale (`:251`).
+Retry delays double from 500 ms up to 30 s and are tracked per phase. Refresh and embedding retries remain unbounded. Checker enrichment gets at most three attempts per generation, while recognized terminal checker failures park it immediately. The coordinator retains `checker_paused` across timer, documentation, and inventory-only generations; these generations still refresh the index and report partial status. A concrete checker input event or a changed code digest discovered during refresh releases the pause. A watcher restart starts a fresh attempt. Parked refreshes preserve the existing partial checker publication rather than attempting the complete-publication rebind path.
 
 ## Phases, supersession, and what cancellation actually means
 

@@ -4151,3 +4151,21 @@ fn publishing_a_batch_prunes_the_one_it_supersedes() -> Result<()> {
     assert_eq!(surviving, vec![(third, 1)]);
     Ok(())
 }
+
+#[test]
+fn watch_recognizes_terminal_checker_errors_before_project_publication() {
+    let terminal = anyhow::Error::new(super::super::process::CheckerError::Remote {
+        code: "checker_failure".into(),
+        message: "missing skipped generic function inference".into(),
+    })
+    .context("planning checker projects");
+    assert!(is_terminal_failure(&terminal));
+    let transient = anyhow::Error::new(super::super::process::CheckerError::Remote {
+        code: "EBUSY".into(),
+        message: "temporary failure".into(),
+    });
+    assert!(!is_terminal_failure(&transient));
+    assert!(!is_terminal_failure(&anyhow::anyhow!(
+        "local storage error"
+    )));
+}

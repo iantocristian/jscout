@@ -434,25 +434,32 @@ during any phase advances the desired generation and cannot be consumed by the
 phase already running.
 
 Each phase opens and closes its own database connection with a finite SQLite
-busy timeout. Fatal refresh, embedding, and checker errors retry indefinitely
-without waiting for another edit, with an exponential delay capped at 30
-seconds. Recognized transient read failures such as descriptor exhaustion,
+busy timeout. Refresh and embedding errors retry without waiting for another
+edit, with an exponential delay capped at 30 seconds. Checker errors get at
+most three attempts per input generation (the initial attempt plus two
+retries); recognized terminal checker errors park enrichment immediately.
+Recognized transient read failures such as descriptor exhaustion,
 interrupted/network I/O, or stale handles are phase errors: the transaction
 rolls back and watch retries instead of publishing a reduced corpus. A path
 that disappears or changes between file and directory after inventory is
 ordinary checkout churn, not evidence of an atomic-snapshot violation; its old
 row is removed and later events or reconciliation converge on the next state.
 Checker enrichment may publish a partial batch when some projects fail. A
-transient project failure uses the phase retry loop; a partial batch containing
-only deterministic project failures completes the generation with
-`status=partial` and those projects are attempted again after the next source
-generation or periodic reconciliation. Published partial batches remain
-immutable; retryable rows are cloned into inactive staging before another
+transient project failure uses the bounded checker retry loop; a partial batch
+containing only deterministic project failures completes the generation with
+`status=partial`. The watcher logs `phase=enrich status=paused` and keeps
+indexing while checker enrichment waits for a source, configuration, or watched
+dependency event, a changed code digest discovered by reconciliation, or a
+watcher restart. Unchanged periodic reconciliation, the daily checker refresh,
+and documentation-only events do not restart parked checking. This pause applies
+to the enrichment phase, not just the failed project. It is local to the watch
+session; an explicit `enrich` command can still retry. To disable checking while
+investigating, restart the existing watch command with `--no-enrich` instead of
+`--enrich`. Published partial batches remain immutable; retryable rows are cloned into inactive staging before another
 checker is launched. A checker worker or whole sidecar
 process crash/exit is project-terminal: successful project staging is retained
-and the crashed project follows that generation/reconciliation recovery path
-instead of an uncapped immediate crash loop. Recognized launch, request,
-transport, and resource failures remain immediately retryable.
+and checking follows the same parked recovery path. Recognized launch, request,
+transport, and resource failures use the three-attempt budget.
 Repository traversal applies the same classifier at subtree granularity:
 retryable I/O aborts the phase, while a permanently inaccessible subtree is
 reported and excluded without losing accessible siblings. Attached

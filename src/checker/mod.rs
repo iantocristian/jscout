@@ -7,7 +7,7 @@ pub mod process;
 pub mod protocol;
 
 pub use backend::{Backend, Checker};
-pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_partial_failure};
+pub use enrich::{EnrichOptions, EnrichReport, enrich, is_terminal_failure};
 pub(crate) use enrich::{active_batch_inputs_fresh, target_fingerprint};
 
 /// Bound independently allocated compiler sessions; each can use substantial memory.
