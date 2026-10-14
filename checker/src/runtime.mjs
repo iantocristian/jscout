@@ -150,7 +150,10 @@ async function nativeRuntime(root, require, common, onChild) {
     },
     unionTypes: (type) => type.isUnionType() ? type.getTypes() : [type],
     declarations: (symbol) => (symbol.declarations ?? []).map((handle) => handle.resolve()),
-    isImplementation: (_checker, declaration) => ast.isFunctionLikeDeclaration(declaration)
+    // Accessor bodies are not overload implementations: collapsing their
+    // shared symbol would silently discard the other accessor.
+    isImplementation: (_checker, declaration) => (ast.isMethodDeclaration(declaration)
+      || ast.isFunctionDeclaration(declaration) || ast.isConstructorDeclaration(declaration))
       && declaration.body !== undefined,
     signatureDeclaration: (checker, call) => checker.getResolvedSignature(call)?.declaration?.resolve(),
     typeToString: (checker, type, node) => checker.typeToString(type, node, native.NodeBuilderFlags.NoTruncation),

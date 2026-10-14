@@ -31,7 +31,7 @@ function runtimeInputs() {
     return {
       identity: `typescript:${path.basename(canonical)}`,
       path: canonical,
-      source_hash: sourceHash(fs.readFileSync(canonical)),
+      source_hash: compilerHash(fs.readFileSync(canonical)),
     };
   });
 }
@@ -86,6 +86,18 @@ function digestText(text) {
 function sourceHash(value) {
   const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
   return bytesToHex(blake3(bytes));
+}
+
+// Compiler artifacts are large (the native binary is tens of MB). Use Node's
+// native SHA-256 instead of pure-JS BLAKE3, but still hash the actual bytes on
+// every observation. The tag lets Rust and validation select the same digest;
+// indexed sources and declaration spans retain their existing BLAKE3 hashes.
+function compilerHash(bytes) {
+  return `sha256:${digestText(bytes)}`;
+}
+
+function inputHash(bytes, expected) {
+  return expected.startsWith("sha256:") ? compilerHash(bytes) : sourceHash(bytes);
 }
 
 function insideRoot(file) {
@@ -1071,7 +1083,7 @@ function validateProject(projectId, fingerprint) {
       if (input.source_hash === ABSENT_INPUT_HASH) {
         fs.lstatSync(input.path);
         inputsValid = false;
-      } else if (sourceHash(fs.readFileSync(input.path)) !== input.source_hash) {
+      } else if (inputHash(fs.readFileSync(input.path), input.source_hash) !== input.source_hash) {
         inputsValid = false;
       }
     } catch (failure) {

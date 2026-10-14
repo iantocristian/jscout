@@ -228,6 +228,10 @@ read/syntax problems, not a full TS7 configuration validation. Native compiler
 processes are stopped on cancellation, shutdown, and hard request deadlines.
 The reported Node RSS/heap counters do not include the native compiler process.
 
+Compiler artifact fingerprints use native SHA-256 in the sidecar and are
+content-verified again in Rust. Indexed source hashes remain BLAKE3. Compiler
+changes are not inferred from file sizes or timestamps.
+
 If another owning project returns `unknown`, that incomplete answer does not
 demote an otherwise clean, agreeing resolution. The edge's `detail_json`
 reports the incomplete owner under `unknownProjects`, and the enrichment report

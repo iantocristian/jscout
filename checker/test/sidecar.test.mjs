@@ -377,6 +377,37 @@ test("collapses overload signatures onto their implementation", async (context) 
   await checker.close();
 });
 
+for (const setterFirst of [false, true]) {
+  test(`preserves getter and setter candidates (setter first: ${setterFirst})`, async (context) => {
+    const accessors = [
+      "  get execute(): () => void { return () => {}; }",
+      "  set execute(value: () => void) {}",
+    ];
+    if (setterFirst) accessors.reverse();
+    const source = [
+      "class Service {", ...accessors, "}",
+      "declare const service: Service;", "service.execute();", "",
+    ].join("\n");
+    const root = fixture({
+      "main.ts": source,
+      "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true }, files: ["main.ts"] }),
+    });
+    context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const checker = client(root);
+    context.after(() => checker.child.kill());
+    const resolved = await checker.request("resolve_members", {
+      project_id: "tsconfig.json",
+      queries: [queryFor(source, "service.execute()", "service", "execute")],
+    });
+    assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved));
+    const declarations = resolved.result.results[0].answer.declarations;
+    assert.deepEqual(declarations.map((declaration) => declaration.start).sort((a, b) => a - b),
+      accessors.map((accessor) => Buffer.byteLength(source.slice(0,
+        source.indexOf("execute", source.indexOf(accessor.trim()))))));
+    await checker.close();
+  });
+}
+
 test("groups declaration-only overloads by their resolved signature", async (context) => {
   const source = [
     'import type { DeclaredService } from "./types";',
@@ -1741,6 +1772,49 @@ test("rejects native configuration errors before publishing answers", { skip: !n
   await checker.close();
 });
 
+test("compiler digests detect same-size edits with restored timestamps", async (context) => {
+  const source = "class Value { run() {} }\nnew Value().run();\n";
+  const root = fixture({
+    "main.ts": source,
+    "tsconfig.json": JSON.stringify({ files: ["main.ts"] }),
+    "node_modules/typescript/package.json": JSON.stringify({ name: "typescript", main: "index.cjs" }),
+    "node_modules/typescript/index.cjs": `module.exports = require(${JSON.stringify(bundledTypeScript)}); // a\n`,
+  }, false);
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const compiler = fs.realpathSync(path.join(root, "node_modules/typescript/index.cjs"));
+  const before = fs.statSync(compiler);
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  const request = {
+    project_id: "tsconfig.json",
+    queries: [queryFor(source, "new Value().run()", "new Value()", "run")],
+  };
+  const resolved = await checker.request("resolve_members", request);
+  assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved));
+  const validate = () => checker.request("validate_project", {
+    project_id: "tsconfig.json",
+    fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  const unchanged = await validate();
+  assert.equal(unchanged.result.valid, true);
+  assert.equal(unchanged.result.inputs.find((input) => input.path === compiler).source_hash,
+    `sha256:${sha256(fs.readFileSync(compiler))}`);
+  assert.equal(unchanged.result.inputs.find((input) => input.path === fs.realpathSync(path.join(root, "main.ts"))).source_hash,
+    sourceHash(source));
+  fs.writeFileSync(compiler, fs.readFileSync(compiler, "utf8").replace("// a", "// b"));
+  fs.utimesSync(compiler, before.atime, before.mtime);
+  assert.equal(fs.statSync(compiler).size, before.size);
+  assert.equal((await validate()).result.valid, false);
+  await checker.close();
+
+  const restarted = client(root);
+  context.after(() => restarted.child.kill());
+  const changed = await restarted.request("resolve_members", request);
+  assert.equal(changed.kind, "resolve_members_result", JSON.stringify(changed));
+  assert.notEqual(changed.result.checker_input_fingerprint, resolved.result.checker_input_fingerprint);
+  await restarted.close();
+});
+
 test("native inventory stays configuration-only and fingerprints the actual binary", { skip: !nativeTests }, async (context) => {
   const source = "class Value { run() {} }\nnew Value().run();\n";
   const root = fixture({ "main.ts": source, "tsconfig.json": JSON.stringify({ files: ["main.ts"] }) });
@@ -1772,7 +1846,8 @@ test("native inventory stays configuration-only and fingerprints the actual bina
     fingerprint: result.result.checker_input_fingerprint,
   });
   assert.equal(validation.result.valid, true);
-  assert.ok(validation.result.inputs.some((input) => input.path === executable));
+  assert.equal(validation.result.inputs.find((input) => input.path === executable).source_hash,
+    `sha256:${sha256(fs.readFileSync(executable))}`);
   await checker.close();
 });
 
