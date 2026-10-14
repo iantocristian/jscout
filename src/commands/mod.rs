@@ -92,7 +92,7 @@ impl Command {
             Self::Embed { .. } => ("embed", true),
             Self::Enrich { .. } => ("enrich", true),
             Self::Watch { .. } => ("watch", true),
-            Self::Search { .. } => ("search", false),
+            Self::Search(_) => ("search", false),
             Self::Events { .. } => ("events", false),
             Self::Calls { .. } => ("calls", false),
             Self::Annotate { .. } => ("annotate", false),
@@ -117,7 +117,7 @@ impl Command {
             | Self::Chunks { root, .. }
             | Self::Index { root, .. }
             | Self::Embed { root, .. }
-            | Self::Search { root, .. }
+            | Self::Search(crate::cli::SearchArgs { root, .. })
             | Self::Events { root, .. }
             | Self::Calls { root, .. }
             | Self::Mcp { root, .. }
@@ -308,7 +308,7 @@ pub(super) fn run_command(
             },
             runtime,
         ),
-        Command::Search {
+        Command::Search(crate::cli::SearchArgs {
             root,
             query,
             path,
@@ -346,7 +346,7 @@ pub(super) fn run_command(
             expand_bytes,
             expand_min_confidence,
             expand_file_roles,
-        } => {
+        }) => {
             let configured = &runtime.effective.search;
             let query = query.as_deref().unwrap_or("");
             let path_scope = crate::search_scope::PathScope::new(path, path_prefix)?;

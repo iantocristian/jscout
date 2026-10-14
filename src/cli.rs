@@ -36,6 +36,122 @@ fn parse_checker_jobs(value: &str) -> Result<usize, String> {
     Ok(jobs)
 }
 
+// Keep the largest argument builder in a separate frame: nesting the complete
+// search and scout builders exhausts Linux's default test-thread stack in debug builds.
+#[derive(clap::Args)]
+pub(super) struct SearchArgs {
+    /// Repository root (must be indexed)
+    pub(super) root: PathBuf,
+    /// Natural language and/or identifiers; omit for a path-only lookup
+    #[arg(required_unless_present_any = ["path", "path_prefix"])]
+    pub(super) query: Option<String>,
+    /// Restrict primary hits to this exact repository-relative file
+    #[arg(long)]
+    pub(super) path: Option<String>,
+    /// Restrict primary hits to this repository-relative directory
+    #[arg(long)]
+    pub(super) path_prefix: Option<String>,
+    /// Use an index database at this path instead of ROOT/.jscout.db
+    #[arg(long)]
+    pub(super) database: Option<PathBuf>,
+    /// Max ranked results, or page size in exhaustive mode
+    #[arg(short = 'k', long)]
+    pub(super) limit: Option<usize>,
+    /// Traverse the complete source-content chunk match set in deterministic pages
+    #[arg(long, conflicts_with_all = ["vector", "rerank", "expand", "memory"])]
+    pub(super) exhaustive: bool,
+    /// Opaque continuation token from a previous exhaustive page
+    #[arg(long, requires = "exhaustive")]
+    pub(super) cursor: Option<String>,
+    /// Exhaustive terms must all match the same chunk (all), or any may match (any)
+    #[arg(long, value_enum, requires = "exhaustive")]
+    pub(super) match_mode: Option<crate::search::MatchMode>,
+    /// Confirm delivery of a broad exhaustive OR query instead of counts only
+    #[arg(long, requires = "exhaustive")]
+    pub(super) allow_broad: bool,
+    /// Restrict primary hits to a file role (repeatable)
+    #[arg(long = "file-role")]
+    pub(super) file_roles: Vec<String>,
+    /// Restrict code retrieval to a registered format (repeatable; omitted means all)
+    #[arg(long = "format")]
+    pub(super) formats: Vec<String>,
+    /// Restrict hits and expansion to file origins (dependency is opt-in)
+    #[arg(long = "origin", value_delimiter = ',')]
+    pub(super) file_origins: Vec<String>,
+    /// Attach matching persistent semantic memory, overriding repository configuration
+    #[arg(long = "memory", conflicts_with = "no_memory")]
+    pub(super) memory: bool,
+    /// Do not attach matching persistent semantic memory
+    #[arg(long, conflicts_with = "memory")]
+    pub(super) no_memory: bool,
+    /// Maximum matching semantic artifacts
+    #[arg(long)]
+    pub(super) memory_limit: Option<usize>,
+    /// Likely/certain graph hops allowed between hits and attached memory
+    #[arg(long)]
+    pub(super) memory_depth: Option<usize>,
+    /// Maximum graph nodes visited while connecting attached memory
+    #[arg(long)]
+    pub(super) memory_nodes: Option<usize>,
+    /// Maximum bytes in the complete rendered JSON response; debug JSON is unbounded when omitted
+    #[arg(long)]
+    pub(super) response_bytes: Option<usize>,
+    /// Enable vector search, overriding repository configuration
+    #[arg(long, conflicts_with_all = ["no_vector", "lexical_only"])]
+    pub(super) vector: bool,
+    /// Skip vector search even if a provider is configured
+    #[arg(long, conflicts_with = "vector")]
+    pub(super) no_vector: bool,
+    /// Enable cross-encoder reranking, overriding repository configuration
+    #[arg(long, conflicts_with_all = ["no_rerank", "lexical_only"])]
+    pub(super) rerank: bool,
+    /// Skip cross-encoder reranking even if it is configured
+    #[arg(long, conflicts_with = "rerank")]
+    pub(super) no_rerank: bool,
+    /// Use BM25 only (equivalent to --no-vector --no-rerank)
+    #[arg(long)]
+    pub(super) lexical_only: bool,
+    /// Output compact agent JSON
+    #[arg(long, conflicts_with = "debug_json")]
+    pub(super) json: bool,
+    /// Output the full diagnostic JSON representation
+    #[arg(long, conflicts_with = "json")]
+    pub(super) debug_json: bool,
+    /// Attach a separately labelled structural context pack (off by default)
+    #[arg(long, conflicts_with = "no_expand")]
+    pub(super) expand: bool,
+    /// Suppress structural expansion, overriding repository configuration
+    #[arg(long, conflicts_with = "expand")]
+    pub(super) no_expand: bool,
+    /// Structural expansion depth
+    #[arg(long)]
+    pub(super) expand_depth: Option<usize>,
+    /// Expansion projection: compact paths or diagnostic neighborhood
+    #[arg(long, value_parser = ["paths", "neighborhood"])]
+    pub(super) expand_mode: Option<String>,
+    /// Maximum search-hit anchors used as expansion seeds
+    #[arg(long)]
+    pub(super) expand_seeds: Option<usize>,
+    /// Maximum ranked continuation paths in path mode
+    #[arg(long)]
+    pub(super) expand_paths: Option<usize>,
+    /// Global expansion node budget
+    #[arg(long)]
+    pub(super) expand_nodes: Option<usize>,
+    /// Global expansion edge budget
+    #[arg(long)]
+    pub(super) expand_edges: Option<usize>,
+    /// Global serialized node/edge payload budget
+    #[arg(long)]
+    pub(super) expand_bytes: Option<usize>,
+    /// Lowest expansion confidence: certain, likely, or possible
+    #[arg(long)]
+    pub(super) expand_min_confidence: Option<String>,
+    /// Restrict expansion to a file role (repeatable; defaults to production/unknown)
+    #[arg(long = "expand-file-role")]
+    pub(super) expand_file_roles: Vec<String>,
+}
+
 #[derive(Subcommand)]
 pub(super) enum Command {
     /// Index a repository, install its agent skill, and register project-local MCP
@@ -121,118 +237,7 @@ pub(super) enum Command {
         repair: bool,
     },
     /// Hybrid search over the indexed repository
-    Search {
-        /// Repository root (must be indexed)
-        root: PathBuf,
-        /// Natural language and/or identifiers; omit for a path-only lookup
-        #[arg(required_unless_present_any = ["path", "path_prefix"])]
-        query: Option<String>,
-        /// Restrict primary hits to this exact repository-relative file
-        #[arg(long)]
-        path: Option<String>,
-        /// Restrict primary hits to this repository-relative directory
-        #[arg(long)]
-        path_prefix: Option<String>,
-        /// Use an index database at this path instead of ROOT/.jscout.db
-        #[arg(long)]
-        database: Option<PathBuf>,
-        /// Max ranked results, or page size in exhaustive mode
-        #[arg(short = 'k', long)]
-        limit: Option<usize>,
-        /// Traverse the complete source-content chunk match set in deterministic pages
-        #[arg(long, conflicts_with_all = ["vector", "rerank", "expand", "memory"])]
-        exhaustive: bool,
-        /// Opaque continuation token from a previous exhaustive page
-        #[arg(long, requires = "exhaustive")]
-        cursor: Option<String>,
-        /// Exhaustive terms must all match the same chunk (all), or any may match (any)
-        #[arg(long, value_enum, requires = "exhaustive")]
-        match_mode: Option<crate::search::MatchMode>,
-        /// Confirm delivery of a broad exhaustive OR query instead of counts only
-        #[arg(long, requires = "exhaustive")]
-        allow_broad: bool,
-        /// Restrict primary hits to a file role (repeatable)
-        #[arg(long = "file-role")]
-        file_roles: Vec<String>,
-        /// Restrict code retrieval to a registered format (repeatable; omitted means all)
-        #[arg(long = "format")]
-        formats: Vec<String>,
-        /// Restrict hits and expansion to file origins (dependency is opt-in)
-        #[arg(long = "origin", value_delimiter = ',')]
-        file_origins: Vec<String>,
-        /// Attach matching persistent semantic memory, overriding repository configuration
-        #[arg(long = "memory", conflicts_with = "no_memory")]
-        memory: bool,
-        /// Do not attach matching persistent semantic memory
-        #[arg(long, conflicts_with = "memory")]
-        no_memory: bool,
-        /// Maximum matching semantic artifacts
-        #[arg(long)]
-        memory_limit: Option<usize>,
-        /// Likely/certain graph hops allowed between hits and attached memory
-        #[arg(long)]
-        memory_depth: Option<usize>,
-        /// Maximum graph nodes visited while connecting attached memory
-        #[arg(long)]
-        memory_nodes: Option<usize>,
-        /// Maximum bytes in the complete rendered JSON response; debug JSON is unbounded when omitted
-        #[arg(long)]
-        response_bytes: Option<usize>,
-        /// Enable vector search, overriding repository configuration
-        #[arg(long, conflicts_with_all = ["no_vector", "lexical_only"])]
-        vector: bool,
-        /// Skip vector search even if a provider is configured
-        #[arg(long, conflicts_with = "vector")]
-        no_vector: bool,
-        /// Enable cross-encoder reranking, overriding repository configuration
-        #[arg(long, conflicts_with_all = ["no_rerank", "lexical_only"])]
-        rerank: bool,
-        /// Skip cross-encoder reranking even if it is configured
-        #[arg(long, conflicts_with = "rerank")]
-        no_rerank: bool,
-        /// Use BM25 only (equivalent to --no-vector --no-rerank)
-        #[arg(long)]
-        lexical_only: bool,
-        /// Output compact agent JSON
-        #[arg(long, conflicts_with = "debug_json")]
-        json: bool,
-        /// Output the full diagnostic JSON representation
-        #[arg(long, conflicts_with = "json")]
-        debug_json: bool,
-        /// Attach a separately labelled structural context pack (off by default)
-        #[arg(long, conflicts_with = "no_expand")]
-        expand: bool,
-        /// Suppress structural expansion, overriding repository configuration
-        #[arg(long, conflicts_with = "expand")]
-        no_expand: bool,
-        /// Structural expansion depth
-        #[arg(long)]
-        expand_depth: Option<usize>,
-        /// Expansion projection: compact paths or diagnostic neighborhood
-        #[arg(long, value_parser = ["paths", "neighborhood"])]
-        expand_mode: Option<String>,
-        /// Maximum search-hit anchors used as expansion seeds
-        #[arg(long)]
-        expand_seeds: Option<usize>,
-        /// Maximum ranked continuation paths in path mode
-        #[arg(long)]
-        expand_paths: Option<usize>,
-        /// Global expansion node budget
-        #[arg(long)]
-        expand_nodes: Option<usize>,
-        /// Global expansion edge budget
-        #[arg(long)]
-        expand_edges: Option<usize>,
-        /// Global serialized node/edge payload budget
-        #[arg(long)]
-        expand_bytes: Option<usize>,
-        /// Lowest expansion confidence: certain, likely, or possible
-        #[arg(long)]
-        expand_min_confidence: Option<String>,
-        /// Restrict expansion to a file role (repeatable; defaults to production/unknown)
-        #[arg(long = "expand-file-role")]
-        expand_file_roles: Vec<String>,
-    },
+    Search(SearchArgs),
     /// List string-keyed event wiring (emit/listen sites)
     Events {
         /// Repository root (must be indexed)

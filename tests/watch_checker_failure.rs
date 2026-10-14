@@ -60,9 +60,14 @@ fn facts(root: &Path) -> i64 {
         .unwrap()
 }
 
-fn check_failure(code: &str, attempts: usize) {
+fn check_failure(code: &str, attempts: usize, jobs: usize) {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
+    fs::write(
+        root.join(".jscout.toml"),
+        format!("version=1\n[checker]\njobs={jobs}\n"),
+    )
+    .unwrap();
     for project in ["good", "bad"] {
         let directory = root.join(project);
         fs::create_dir(&directory).unwrap();
@@ -190,10 +195,20 @@ createInterface({input:process.stdin}).on('line', line => {
 
 #[test]
 fn terminal_failure_stays_parked_across_reconciliation_and_recovers_on_edit() {
-    check_failure("checker_failure", 1);
+    check_failure("checker_failure", 1, 1);
 }
 
 #[test]
 fn transient_failure_stops_after_three_attempts_and_recovers_on_edit() {
-    check_failure("EBUSY", 3);
+    check_failure("EBUSY", 3, 1);
+}
+
+#[test]
+fn parallel_terminal_failure_stays_parked_and_recovers_on_edit() {
+    check_failure("checker_failure", 1, 2);
+}
+
+#[test]
+fn parallel_transient_failure_stops_after_three_attempts_and_recovers_on_edit() {
+    check_failure("EBUSY", 3, 2);
 }
