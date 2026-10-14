@@ -94,6 +94,8 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     checker::Backend::TypeScript
                 },
+                cli.checker_jobs
+                    .map_or(runtime.effective.checker.jobs, std::num::NonZeroUsize::get),
             )
         }
     }

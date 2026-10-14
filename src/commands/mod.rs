@@ -244,6 +244,7 @@ pub(super) fn run_command(
     command: Command,
     runtime: &config::RuntimeConfig,
     checker_backend: checker::Backend,
+    checker_jobs: usize,
 ) -> Result<()> {
     if matches!(command.progress_label(), Some((_, false))) {
         crate::progress::stage("executing command", None);
@@ -732,6 +733,7 @@ pub(super) fn run_command(
                         .as_deref()),
                     checker_node: &runtime.effective.sidecars.node,
                     checker_backend,
+                    checker_jobs,
                     timing: runtime.effective.diagnostics.timing,
                     debug: runtime.effective.diagnostics.debug,
                     debounce: std::time::Duration::from_millis(debounce_ms),
@@ -819,6 +821,7 @@ pub(super) fn run_command(
                 &root,
                 &checker::EnrichOptions {
                     backend: checker_backend,
+                    jobs: checker_jobs,
                     database: Some(database.as_deref().unwrap_or(configured_database)),
                     sidecar: sidecar_path.as_deref().or(runtime
                         .effective

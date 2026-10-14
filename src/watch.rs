@@ -42,6 +42,7 @@ pub struct WatchOptions<'a> {
     pub checker_sidecar: Option<&'a Path>,
     pub checker_node: &'a str,
     pub checker_backend: checker::Backend,
+    pub checker_jobs: usize,
     pub timing: bool,
     pub debug: bool,
     pub debounce: Duration,
@@ -1571,7 +1572,7 @@ fn watch_startup_log(
     watch_policy_fingerprint: &str,
 ) -> String {
     format!(
-        "watch root={} database={} jscout_version={} binary_fingerprint={} config_fingerprint={} config_loaded={} config_reload=docs-indexing-only checker_policy_fingerprint={} watch_policy_fingerprint={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={} docs_freshness={}",
+        "watch root={} database={} jscout_version={} binary_fingerprint={} config_fingerprint={} config_loaded={} config_reload=docs-indexing-only checker_policy_fingerprint={} watch_policy_fingerprint={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={} docs_freshness={} checker_jobs={}",
         root.display(),
         database.display(),
         env!("CARGO_PKG_VERSION"),
@@ -1586,6 +1587,7 @@ fn watch_startup_log(
         options.embed_product_only,
         options.enrich_on_change,
         options.docs_freshness,
+        options.checker_jobs,
     )
 }
 
@@ -1645,6 +1647,11 @@ fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
     field(&mut hasher, "checker_node", options.checker_node);
     field(
         &mut hasher,
+        "checker_jobs",
+        &options.checker_jobs.to_string(),
+    );
+    field(
+        &mut hasher,
         "checker_backend",
         options.checker_backend.name(),
     );
@@ -1664,6 +1671,9 @@ fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
 }
 
 fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
+    if options.checker_jobs == 0 {
+        bail!("checker jobs must be greater than zero");
+    }
     if options.config_explicit && options.config_path.is_none() {
         bail!("explicit watch configuration path is missing");
     }
@@ -1776,6 +1786,7 @@ fn run_enrichment_interruptible(
     let node = options.checker_node.to_string();
     let timeout = options.enrich_timeout;
     let backend = options.checker_backend;
+    let jobs = options.checker_jobs;
     let force_full = monitor.work.force_full_enrichment;
     let dirty_files = monitor
         .coordinator
@@ -1784,7 +1795,7 @@ fn run_enrichment_interruptible(
         .cloned()
         .collect();
     let worker = thread::spawn(move || {
-        let enrich_options = watch_enrich_options(
+        let mut enrich_options = watch_enrich_options(
             backend,
             &database,
             sidecar.as_deref(),
@@ -1793,6 +1804,7 @@ fn run_enrichment_interruptible(
             force_full,
             dirty_files,
         );
+        enrich_options.jobs = jobs;
         checker::enrich(&root, &enrich_options)
     });
     while !worker.is_finished() {
@@ -1818,6 +1830,7 @@ fn watch_enrich_options<'a>(
 ) -> checker::EnrichOptions<'a> {
     checker::EnrichOptions {
         backend,
+        jobs: 1,
         database: Some(database),
         sidecar,
         node,

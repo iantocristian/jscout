@@ -36,6 +36,7 @@ fn planned_occurrence(
 fn options() -> EnrichOptions<'static> {
     EnrichOptions {
         backend: crate::checker::Backend::default(),
+        jobs: 1,
         database: None,
         sidecar: None,
         node: "node",

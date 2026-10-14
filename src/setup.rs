@@ -160,6 +160,7 @@ pub fn run(
         },
         &runtime,
         crate::checker::Backend::default(),
+        runtime.effective.checker.jobs,
     )?;
 
     // Start the exact command that will be registered, before publishing client config.

@@ -1,6 +1,7 @@
 mod backend;
 pub(crate) mod embedded;
 mod enrich;
+mod jobs;
 mod package_gate;
 pub mod process;
 pub mod protocol;
@@ -200,6 +201,7 @@ mod policy_tests {
     fn options() -> EnrichOptions<'static> {
         EnrichOptions {
             backend: crate::checker::Backend::default(),
+            jobs: 1,
             database: None,
             sidecar: None,
             node: "node",

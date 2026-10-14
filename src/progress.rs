@@ -25,7 +25,27 @@ enum Message {
     Finish(bool),
 }
 
+thread_local! {
+    static SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Parallel workers report project completion through their coordinator.
+pub(crate) fn without_reporting<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SUPPRESSED.set(self.0);
+        }
+    }
+    let _restore = Restore(SUPPRESSED.replace(true));
+    run()
+}
+
 fn emit(event: Event) {
+    if SUPPRESSED.get() {
+        return;
+    }
+
     #[cfg(test)]
     CAPTURE.with(|events| {
         if let Some(events) = events.borrow_mut().as_mut() {

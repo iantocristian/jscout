@@ -1086,3 +1086,23 @@ refuses to publish unless every platform package the wrapper declares is
 present at the Cargo.toml version with a binary whose actual architecture
 matches its target. npm prompts for the one-time password, so no token is
 created. Provenance begins with the first release published by the workflow.
+
+## Checker project concurrency
+
+`jscout --experimental-tsr --checker-jobs 4 watch ROOT --enrich` runs up to four
+checker projects concurrently. The same option works for `enrich` and the default
+TypeScript sidecar. Persist it with `[checker] jobs = 4` in `.jscout.toml`; the
+CLI overrides the file, and the default is one worker. Zero is rejected.
+Restart watch after changing this setting.
+
+Each worker owns a compiler session and stages its own project. Projects that
+are already reusable do not occupy workers. SQLite serializes short staging
+writes; the complete or partial result is activated centrally after project
+execution and input validation. Cancellation reaches all active checkers and
+stops queued work. Embedded cancellation remains cooperative.
+
+Parallel progress reports completed projects out of the scheduled total.
+Increasing the limit does not split a single project, parallelize initial
+selection/planning, or repair compiler inference failures. Each additional
+active project can require another compiler's worth of memory. Changing only
+the worker count does not invalidate reusable checker results.

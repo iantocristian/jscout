@@ -208,6 +208,7 @@ and `maxTokens` are accepted; prefer the snake_case TOML names above.
 
 | Key | Default | Meaning and constraints |
 | --- | --- | --- |
+| `checker.jobs` | `1` | Positive limit of concurrent checker projects for `enrich` and `watch --enrich`. `--checker-jobs N` overrides it. More workers use more memory; restart watch after changes. |
 | `experimental.tsr` | `false` | Use the embedded TSR compiler for `enrich`, `checker doctor`, `watch --enrich`, and `scout repository` checker inventory. Compiler and standard libraries are linked into the binary; checker execution needs no Node or sidecar. Deadlines are cooperative. |
 
 To enable it for this repository:

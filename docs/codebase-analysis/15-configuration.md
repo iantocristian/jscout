@@ -104,6 +104,7 @@ Column three is the legacy `JSCOUT_*` name; an em dash means the key has no envi
 | `llm.openai_compatible_providers` | `JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS` (JSON array) | `[]` |
 | `sidecars.node` | `JSCOUT_NODE` | `"node"` |
 | `sidecars.gateway` | `JSCOUT_PI_AI_GATEWAY`, then `JSCOUT_BUNDLED_GATEWAY` as *builtin* | none |
+| `checker.jobs` | `1` | Positive limit of concurrent checker projects for `enrich` and `watch --enrich`. `--checker-jobs N` overrides it. More workers use more memory; restart watch after changes. |
 | `experimental.tsr` | — | `false`; selects the embedded checker, CLI overrides it |
 | `sidecars.checker` | `JSCOUT_CHECKER_SIDECAR`, then `JSCOUT_BUNDLED_CHECKER` as *builtin* | none |
 | `mcp.profile` | — | `"core"` (`core\|full`; `baseline` aliases core, `structural` aliases full) |

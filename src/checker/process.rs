@@ -26,7 +26,7 @@ const PLAN_FRAME_MAX_BYTES: usize = 1024 * 1024;
 const PLAN_FILE_PAYLOAD_BYTES: usize = 900 * 1024;
 
 static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
-static INTERRUPT_CONTROL: Mutex<Option<CheckerControl>> = Mutex::new(None);
+static INTERRUPT_CONTROLS: Mutex<Vec<CheckerControl>> = Mutex::new(Vec::new());
 static CANCELLATION_FLAGS: CancellationFlags = CancellationFlags::new();
 static EMBEDDED_CONTROLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -238,15 +238,22 @@ fn request_interrupt_cancellation() -> bool {
 }
 
 fn cancel_active_request() -> bool {
-    let control = INTERRUPT_CONTROL
+    let controls = INTERRUPT_CONTROLS
         .lock()
-        .ok()
-        .and_then(|registered| registered.clone());
-    control
-        .as_ref()
-        .and_then(|control| control.cancel_active().ok())
-        .unwrap_or(false)
-        || EMBEDDED_CONTROLS.load(Ordering::SeqCst) > 0
+        .map(|controls| controls.clone())
+        .unwrap_or_default();
+    let mut active = EMBEDDED_CONTROLS.load(Ordering::SeqCst) > 0;
+    active |= cancel_controls(&controls);
+    active
+}
+
+fn cancel_controls(controls: &[CheckerControl]) -> bool {
+    let mut active = false;
+    for control in controls {
+        // Do not short-circuit: every live sidecar must receive cancellation.
+        active |= control.cancel_active().unwrap_or(false);
+    }
+    active
 }
 
 pub(super) fn register_embedded_interrupts() -> Result<(), CheckerError> {
@@ -293,19 +300,21 @@ pub(crate) fn cancellation_pending() -> bool {
 
 fn register_interrupt_control(control: CheckerControl) -> Result<(), CheckerError> {
     install_interrupt_handler()?;
-    *INTERRUPT_CONTROL
+    let mut controls = INTERRUPT_CONTROLS
         .lock()
-        .map_err(|_| CheckerError::Io("Ctrl-C control lock poisoned".into()))? = Some(control);
+        .map_err(|_| CheckerError::Io("Ctrl-C control lock poisoned".into()))?;
+    if !controls
+        .iter()
+        .any(|registered| Arc::ptr_eq(&registered.writer, &control.writer))
+    {
+        controls.push(control);
+    }
     Ok(())
 }
 
 fn unregister_interrupt_control(writer: &Arc<Writer>) {
-    if let Ok(mut registered) = INTERRUPT_CONTROL.lock()
-        && registered
-            .as_ref()
-            .is_some_and(|control| Arc::ptr_eq(&control.writer, writer))
-    {
-        *registered = None;
+    if let Ok(mut controls) = INTERRUPT_CONTROLS.lock() {
+        controls.retain(|control| !Arc::ptr_eq(&control.writer, writer));
     }
 }
 
@@ -401,7 +410,7 @@ impl ProcessChecker {
         }
     }
 
-    /// Point the process-wide Ctrl-C router at this sidecar. Registering a new
+    /// Register this sidecar with the process-wide Ctrl-C router. Adding a new
     /// per-project worker deliberately preserves the enclosing operation's
     /// interrupt state; `begin_interrupt_scope` resets it once per pass.
     pub fn register_interrupts(&self) -> Result<(), CheckerError> {
@@ -919,6 +928,25 @@ done
         let checker = ProcessChecker::spawn(Path::new("/bin/sh"), &script, directory.path())
             .expect("spawn fake");
         (directory, checker)
+    }
+
+    #[test]
+    fn cancellation_reaches_all_parallel_sidecars() {
+        let (_first_dir, mut first) = spawn_fake("cancel");
+        let (_second_dir, mut second) = spawn_fake("cancel");
+        let first_id = first
+            .send_active(&Outbound::ResolveMember { query: query() })
+            .unwrap();
+        let second_id = second
+            .send_active(&Outbound::ResolveMember { query: query() })
+            .unwrap();
+        assert!(cancel_controls(&[first.control(), second.control()]));
+        for (checker, id) in [(&mut first, first_id), (&mut second, second_id)] {
+            assert!(matches!(
+                checker.receive_for(&id, Duration::from_secs(2)).unwrap(),
+                Inbound::Canceled { .. }
+            ));
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub(super) const INFERRED_ROOT_CAP: usize = 150;
 #[derive(Debug, Clone)]
 pub struct EnrichOptions<'a> {
     pub backend: super::Backend,
+    pub jobs: usize,
     pub database: Option<&'a Path>,
     pub sidecar: Option<&'a Path>,
     pub node: &'a str,
@@ -480,6 +481,9 @@ struct PublishPlan<'a> {
 }
 
 pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> {
+    if options.jobs == 0 {
+        bail!("checker jobs must be greater than zero");
+    }
     if options.timeout.is_zero() {
         bail!("--timeout must be greater than zero seconds");
     }
@@ -876,10 +880,10 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     let mut peak_heap_bytes = 0;
     let mut failed_projects = Vec::<ProjectFailure>::new();
 
-    for (project_index, (project_id, occurrences)) in
+    let mut jobs = Vec::new();
+    for (project_id, occurrences) in
         projects_in_execution_order(&project_plan, &priority_projects, &first_selected_rank)
             .into_iter()
-            .enumerate()
     {
         if super::process::cancellation_pending() {
             bail!("checker enrichment interrupted; staged work retained");
@@ -922,102 +926,150 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             .partition(|occurrence| dirty_files.contains(&occurrence.file));
         pending.extend(clean);
         mark_project_pending(&conn, batch_id, project_id)?;
+        jobs.push(ProjectJob {
+            project_id,
+            occurrences,
+            pending,
+            staging_resumed,
+        });
+    }
+    let database = options
+        .database
+        .map_or_else(|| crate::store::db_path(&canonical_root), Path::to_path_buf);
+    conn.busy_timeout(Duration::from_secs(30))?;
+    let parallel = options.jobs > 1 && jobs.len() > 1;
+    if parallel {
         crate::progress::stage(
             format!(
-                "checker project {}/{} {} ({} pending, {} resumed)",
-                project_index + 1,
-                project_plan.len(),
-                project_id,
-                pending.len(),
-                completed.len()
+                "checking projects ({} workers)",
+                options.jobs.min(jobs.len())
             ),
-            None,
+            Some(jobs.len()),
         );
-        let project_result = execute_project(
-            &canonical_root,
-            options,
-            &conn,
-            batch_id,
-            project_id,
-            project_roots.get(project_id).map_or(&[][..], Vec::as_slice),
-            occurrences,
-            &pending,
-            &ownership.typescript,
-            &mut request_batches,
-            &mut occurrences_queried,
-            &mut unknown_answers,
-            &mut unmapped_declarations,
-            &mut unmapped_declaration_contexts,
-            &mut peak_rss_bytes,
-            &mut peak_heap_bytes,
-            true,
-            true,
-        );
-        match project_result {
-            Ok(execution) if !execution.failed_files.is_empty() => {
-                if execution.staging_occurrences_reset == 0 {
-                    if staging_resumed != 0 {
-                        resumed_projects.insert(project_id.clone());
-                        occurrences_resumed += staging_resumed;
-                    }
-                } else {
-                    carry.discard_project_carry(project_id);
-                    projects_reset += 1;
-                    occurrences_reset += execution.staging_occurrences_reset;
-                }
-                let files = execution
-                    .failed_files
-                    .into_iter()
-                    .map(|(file, error)| FileFailure { file, error })
-                    .collect::<Vec<_>>();
-                eprintln!(
-                    "checker enrichment: project {project_id} retained healthy files but failed {} file(s): {}",
-                    files.len(),
-                    files
-                        .iter()
-                        .map(|failure| failure.file.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                failed_projects.push(ProjectFailure {
-                    project_id: project_id.clone(),
-                    files,
-                    retryable: false,
-                });
-            }
-            Ok(execution) => {
-                if execution.staging_occurrences_reset == 0 {
-                    if staging_resumed != 0 {
-                        resumed_projects.insert(project_id.clone());
-                        occurrences_resumed += staging_resumed;
-                    }
-                } else {
-                    carry.discard_project_carry(project_id);
-                    projects_reset += 1;
-                    occurrences_reset += execution.staging_occurrences_reset;
-                }
-            }
-            Err(error) => {
-                if project_was_interrupted(&error) {
-                    bail!(
-                        "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
-                    );
-                }
-                let message = error.to_string();
-                let retryable = project_failure_is_retryable(&error);
-                mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
-                eprintln!(
-                    "checker enrichment: project {project_id} failed disposition={}: {error:#}",
-                    if retryable { "retryable" } else { "terminal" }
-                );
-                failed_projects.push(ProjectFailure {
-                    project_id: project_id.clone(),
-                    files: Vec::new(),
-                    retryable,
-                });
-            }
-        }
     }
+    super::jobs::run(
+        &jobs,
+        options.jobs,
+        super::process::cancellation_pending,
+        |job| {
+            let mut metrics = ProjectMetrics::default();
+            let result = (|| {
+                // The coordinator already initialized the schema. Worker
+                // connections stage disjoint projects; SQLite serializes only
+                // the short write transactions, not compiler execution.
+                let worker = Connection::open(&database)?;
+                worker.busy_timeout(Duration::from_secs(30))?;
+                worker.pragma_update(None, "synchronous", "NORMAL")?;
+                worker.pragma_update(None, "foreign_keys", "ON")?;
+                execute_project(
+                    &canonical_root,
+                    options,
+                    &worker,
+                    batch_id,
+                    job.project_id,
+                    project_roots
+                        .get(job.project_id)
+                        .map_or(&[][..], Vec::as_slice),
+                    job.occurrences,
+                    &job.pending,
+                    &ownership.typescript,
+                    &mut metrics.request_batches,
+                    &mut metrics.occurrences_queried,
+                    &mut metrics.unknown_answers,
+                    &mut metrics.unmapped_declarations,
+                    &mut metrics.unmapped_declaration_contexts,
+                    &mut metrics.peak_rss_bytes,
+                    &mut metrics.peak_heap_bytes,
+                    true,
+                    true,
+                )
+            })();
+            (metrics, result)
+        },
+        |job, (metrics, project_result)| {
+            let project_id = job.project_id;
+            let occurrences = job.occurrences;
+            let staging_resumed = job.staging_resumed;
+            request_batches += metrics.request_batches;
+            occurrences_queried += metrics.occurrences_queried;
+            unknown_answers += metrics.unknown_answers;
+            unmapped_declarations += metrics.unmapped_declarations;
+            for (context, count) in metrics.unmapped_declaration_contexts {
+                *unmapped_declaration_contexts.entry(context).or_default() += count;
+            }
+            peak_rss_bytes = peak_rss_bytes.max(metrics.peak_rss_bytes);
+            peak_heap_bytes = peak_heap_bytes.max(metrics.peak_heap_bytes);
+            match project_result {
+                Ok(execution) if !execution.failed_files.is_empty() => {
+                    if execution.staging_occurrences_reset == 0 {
+                        if staging_resumed != 0 {
+                            resumed_projects.insert(project_id.clone());
+                            occurrences_resumed += staging_resumed;
+                        }
+                    } else {
+                        carry.discard_project_carry(project_id);
+                        projects_reset += 1;
+                        occurrences_reset += execution.staging_occurrences_reset;
+                    }
+                    let files = execution
+                        .failed_files
+                        .into_iter()
+                        .map(|(file, error)| FileFailure { file, error })
+                        .collect::<Vec<_>>();
+                    eprintln!(
+                        "checker enrichment: project {project_id} retained healthy files but failed {} file(s): {}",
+                        files.len(),
+                        files
+                            .iter()
+                            .map(|failure| failure.file.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    failed_projects.push(ProjectFailure {
+                        project_id: project_id.clone(),
+                        files,
+                        retryable: false,
+                    });
+                }
+                Ok(execution) => {
+                    if execution.staging_occurrences_reset == 0 {
+                        if staging_resumed != 0 {
+                            resumed_projects.insert(project_id.clone());
+                            occurrences_resumed += staging_resumed;
+                        }
+                    } else {
+                        carry.discard_project_carry(project_id);
+                        projects_reset += 1;
+                        occurrences_reset += execution.staging_occurrences_reset;
+                    }
+                }
+                Err(error) => {
+                    if project_was_interrupted(&error) {
+                        bail!(
+                            "checker enrichment interrupted during project {project_id}; staged work retained: {error:#}"
+                        );
+                    }
+                    let message = error.to_string();
+                    let retryable = project_failure_is_retryable(&error);
+                    mark_project_failed(&conn, batch_id, project_id, occurrences, &message)?;
+                    eprintln!(
+                        "checker enrichment: project {project_id} failed disposition={}: {error:#}",
+                        if retryable { "retryable" } else { "terminal" }
+                    );
+                    failed_projects.push(ProjectFailure {
+                        project_id: project_id.clone(),
+                        files: Vec::new(),
+                        retryable,
+                    });
+                }
+            }
+            if parallel {
+                crate::progress::advance(1);
+                crate::progress::detail(format!("finished {project_id}"));
+            }
+            Ok(())
+        },
+    )?;
 
     if super::process::cancellation_pending() {
         bail!("checker enrichment interrupted before activation; staged work retained");
@@ -3018,6 +3070,24 @@ fn mark_project_failed(
         }
     }
     Ok(())
+}
+
+struct ProjectJob<'a> {
+    project_id: &'a String,
+    occurrences: &'a Vec<Occurrence>,
+    pending: Vec<Occurrence>,
+    staging_resumed: usize,
+}
+
+#[derive(Default)]
+struct ProjectMetrics {
+    request_batches: usize,
+    occurrences_queried: usize,
+    unknown_answers: usize,
+    unmapped_declarations: usize,
+    unmapped_declaration_contexts: BTreeMap<String, usize>,
+    peak_rss_bytes: u64,
+    peak_heap_bytes: u64,
 }
 
 #[expect(
