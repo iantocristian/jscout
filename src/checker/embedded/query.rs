@@ -476,6 +476,8 @@ impl BuiltProject {
                 .expression()
                 .ok_or_else(|| error("checker_failure", "missing receiver"))?;
             request.diagnostics.operation("receiver-type");
+            #[cfg(test)]
+            super::test_support::query_fault(query)?;
             let ty = op.get_type_at_location(receiver).map_err(compiler_error)?;
             request.check()?;
             request.diagnostics.operation("receiver-type-flags");
@@ -517,6 +519,18 @@ impl BuiltProject {
             source_hash: hash,
             answer,
         })
+    }
+
+    pub fn restart_checker(&mut self, request: &Request) -> Result<(), CheckerError> {
+        request
+            .diagnostics
+            .project(&self.project.summary.project_id, "checker-recovery");
+        request.check()?;
+        let program = Arc::clone(self.session.program());
+        self.session.retire();
+        self.session = Session::from_program(program, &tsr_arena::Counters::new());
+        self.session.checker().map_err(compiler_error)?;
+        request.check()
     }
 
     pub fn refresh_manifest(&mut self) -> Result<(), CheckerError> {

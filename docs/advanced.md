@@ -1181,3 +1181,27 @@ claiming a source location. Typed deadline/transport failures log context separa
 The reported source is the query that triggered the work. TSR may follow imported
 types into other files; locating its exact internal failing node can still require
 a compiler backtrace or TSR instrumentation. Embedded deadlines remain cooperative.
+
+## Isolating embedded TSR query failures
+
+A returned `checker_failure` from an embedded TSR query fails only the queried
+source file, in both configured and inferred projects. All selected occurrences
+from that file are marked failed, including earlier prepared or resumed answers;
+its checker facts are removed from the new publication. Healthy sibling files
+continue and can publish their facts after the project input manifest validates.
+The failure stays attached to that file for the remainder of the checker session.
+
+After such an error, jscout creates a fresh TSR checker over the same loaded
+program before processing sibling files. This discards potentially incomplete
+query caches without reloading the program. This recovery costs additional checker
+initialization only when a query fails. A healthy run keeps its existing checker.
+
+Project loading, input/hash mismatches, configured-project span errors, timeouts,
+and compiler panics still fail the project. Inferred projects additionally isolate
+their existing `invalid_span` and `span_mismatch` query errors. Sidecar execution
+is unchanged. File-local recovery is always active for embedded TSR;
+`--tsr-diagnostics` only controls extra error context and progress.
+
+A partial result remains an error: standalone `enrich` exits unsuccessfully after
+publishing healthy facts, and watch follows its existing terminal-failure pause
+policy. The failed file does not silently become an unknown or successful answer.

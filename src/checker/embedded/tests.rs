@@ -709,3 +709,149 @@ fn parallel_error_contexts_are_isolated_even_when_progress_is_suppressed() {
         );
     });
 }
+
+#[test]
+fn configured_failure_discards_the_whole_file_across_preparation_batches() {
+    use std::cell::Cell;
+    use std::fmt::Write;
+    thread_local! { static BAD_QUERIES: Cell<usize> = const { Cell::new(0) }; }
+    let mut bad_source =
+        String::from("export interface A { ping(n: number): void } declare const receiver: A;\n");
+    for n in 0..260 {
+        writeln!(bad_source, "receiver.ping({n});").unwrap();
+    }
+    let good_source =
+        "export interface B { ping(): void } declare const healthy: B; healthy.ping();";
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"include":["*.ts"]}"#,
+        ),
+        ("bad.ts", &bad_source),
+        ("good.ts", good_source),
+    ]);
+    let mut queries = (0..260)
+        .map(|n| {
+            query(
+                &bad_source,
+                "bad.ts",
+                &format!("receiver.ping({n})"),
+                "receiver",
+                "ping",
+            )
+        })
+        .collect::<Vec<_>>();
+    queries.push(query(
+        good_source,
+        "good.ts",
+        "healthy.ping()",
+        "healthy",
+        "ping",
+    ));
+    let mut checker = EmbeddedChecker::new(directory.path(), true).unwrap();
+    let failed = test_support::with_query_fault(
+        |query| {
+            if query.file == "bad.ts" {
+                let count = BAD_QUERIES.get() + 1;
+                BAD_QUERIES.set(count);
+                assert!(count <= 129, "quarantined files must not be queried again");
+                if count == 129 {
+                    return Err(error("checker_failure", "compiler probe failure"));
+                }
+            }
+            Ok(())
+        },
+        || checker.prepare_project("tsconfig.json", &[], &queries, TIMEOUT),
+    )
+    .unwrap();
+    assert_eq!(failed, BTreeSet::from(["bad.ts".into()]));
+    assert_eq!(BAD_QUERIES.get(), 129);
+    let mut fingerprint = None;
+    // Replay with different boundaries, mixing earlier successes and the later
+    // failed query in one batch. Every answer for bad.ts must now be failed.
+    for batch in queries.chunks(100) {
+        let result = checker
+            .resolve_members("tsconfig.json".into(), vec![], batch.to_vec(), TIMEOUT)
+            .unwrap();
+        if let Some(expected) = &fingerprint {
+            assert_eq!(&result.checker_input_fingerprint, expected);
+        }
+        fingerprint = Some(result.checker_input_fingerprint.clone());
+        for (query, result) in batch.iter().zip(result.results) {
+            assert_eq!(
+                &result.answer.checker_input_fingerprint,
+                fingerprint.as_ref().unwrap()
+            );
+            if query.file == "bad.ts" {
+                assert_eq!(result.answer.status, "failed");
+                assert!(result.answer.declarations.is_empty());
+                assert!(result.answer.receiver_type.is_none());
+                let failure = result.answer.error.unwrap();
+                assert_eq!(failure.code, "checker_failure");
+                assert!(failure.message.contains(&format!(
+                    "call_bytes={}..{}",
+                    queries[128].call_start, queries[128].call_end
+                )));
+                assert!(failure.message.contains("operation=receiver-type"));
+            } else {
+                assert_eq!(result.answer.status, "resolved");
+                assert_eq!(result.answer.declarations.len(), 1);
+                assert!(result.answer.error.is_none());
+            }
+        }
+    }
+    assert!(
+        checker
+            .validate_project("tsconfig.json".into(), fingerprint.unwrap(), TIMEOUT)
+            .unwrap()
+            .valid
+    );
+    // A fatal session error clears quarantine along with the retired program.
+    assert!(
+        checker
+            .resolve_members(
+                "missing.json".into(),
+                vec![],
+                vec![queries[0].clone()],
+                TIMEOUT
+            )
+            .is_err()
+    );
+    assert!(checker.failed_files.is_empty());
+    let fresh = checker
+        .resolve_members(
+            "tsconfig.json".into(),
+            vec![],
+            vec![queries[0].clone()],
+            TIMEOUT,
+        )
+        .unwrap();
+    assert_eq!(fresh.results[0].answer.status, "resolved");
+}
+
+#[test]
+fn compiler_panics_during_a_query_still_fail_and_retire_the_project() {
+    let source = "export interface A { ping(): void } declare const receiver: A; receiver.ping();";
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+        ),
+        ("main.ts", source),
+    ]);
+    let query = query(source, "main.ts", "receiver.ping()", "receiver", "ping");
+    let mut checker = EmbeddedChecker::new(directory.path(), true).unwrap();
+    let failure = test_support::with_query_fault(
+        |_| panic!("compiler query panic"),
+        || checker.prepare_project("tsconfig.json", &[], &[query], TIMEOUT),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&failure, CheckerError::Remote { code, message }
+        if code == "checker_failure" && message.contains("compiler query panic")
+        && message.contains("file=\"main.ts\"") && message.contains("operation=receiver-type")),
+        "{failure}"
+    );
+    assert!(checker.built.is_none());
+    assert!(checker.failed_files.is_empty());
+}
