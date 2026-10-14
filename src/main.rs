@@ -99,7 +99,9 @@ fn run(cli: Cli) -> Result<()> {
                     .experimental_tsr
                     .unwrap_or(runtime.effective.experimental.tsr)
                 {
-                    checker::Backend::Tsr
+                    checker::Backend::Tsr {
+                        diagnostics: cli.tsr_diagnostics,
+                    }
                 } else {
                     checker::Backend::TypeScript
                 },

@@ -46,6 +46,13 @@ fn embedded_cli_publishes_without_node_reuses_and_invalidates_inputs() {
     let repeated = run(repo.path(), &args, true);
     assert_eq!(repeated["exact_batch_reused"], true);
     assert_eq!(first["batch_id"], repeated["batch_id"]);
+    let diagnostics = run(
+        repo.path(),
+        &[args.as_slice(), &["--tsr-diagnostics"]].concat(),
+        true,
+    );
+    assert_eq!(diagnostics["exact_batch_reused"], true);
+    assert_eq!(diagnostics["batch_id"], first["batch_id"]);
     for name in ["README.md", ".DS_Store", "image.png", "data.bin"] {
         let path = repo.path().join(name);
         fs::write(&path, "noise").unwrap();
@@ -119,6 +126,7 @@ fn embedded_toml_selection_honors_cli_and_explicit_config_overrides() {
         .args([
             "--no-progress",
             "--experimental-tsr=false",
+            "--tsr-diagnostics",
             "enrich",
             "--all",
         ])
@@ -154,6 +162,103 @@ fn embedded_toml_selection_honors_cli_and_explicit_config_overrides() {
     );
     assert_eq!(overridden["checker_source"], "tsr-embedded");
     assert_eq!(overridden["exact_batch_reused"], true);
+}
+
+#[test]
+fn embedded_diagnostics_are_opt_in_and_errors_survive_no_progress_in_serial_and_parallel() {
+    let repo = tempfile::tempdir().unwrap();
+    // Select TSR through TOML to verify diagnostics do not require the selector flag.
+    fs::write(
+        repo.path().join(".jscout.toml"),
+        "version = 1\n[experimental]\ntsr = true\n",
+    )
+    .unwrap();
+    for project in ["first", "second"] {
+        let directory = repo.path().join(project);
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("tsconfig.json"),
+            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+        )
+        .unwrap();
+        fs::write(directory.join("main.ts"), "export class Service { ping() {} } export function run(service: Service) { service.ping(); }").unwrap();
+    }
+    run(repo.path(), &["index"], true);
+    // Inject a malformed indexed span, causing a deterministic real adapter error.
+    // Source text stays unchanged, so the checker reaches its call-lookup operation.
+    let conn = rusqlite::Connection::open(repo.path().join(".jscout.db")).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE member_calls SET receiver_start = receiver_start + 1",
+            []
+        )
+        .unwrap(),
+        2
+    );
+    drop(conn);
+    for jobs in ["1", "2"] {
+        for diagnostics in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_jscout"));
+            command
+                .args([
+                    "--no-progress",
+                    "enrich",
+                    "--all",
+                    "--full",
+                    "--checker-jobs",
+                    jobs,
+                ])
+                .arg(repo.path());
+            if diagnostics {
+                command.arg("--tsr-diagnostics");
+            }
+            let output = command
+                .env("PATH", "/jscout-test-no-executables")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{stderr}");
+            assert!(
+                !stderr.contains("progress [") && !stderr.contains("checker preparation:"),
+                "{stderr}"
+            );
+            let failures = stderr
+                .lines()
+                .filter(|line| line.starts_with("checker enrichment: project "))
+                .collect::<Vec<_>>();
+            assert_eq!(failures.len(), 2, "{stderr}");
+            for project in ["first", "second"] {
+                let failure = failures
+                    .iter()
+                    .find(|line| line.contains(&format!("project {project}/tsconfig.json failed")))
+                    .unwrap();
+                assert!(
+                    failure.contains("disposition=terminal") && failure.contains("[span_mismatch]"),
+                    "{failure}"
+                );
+                assert!(
+                    failure.contains("exact indexed member-call occurrence not found"),
+                    "{failure}"
+                );
+                assert_eq!(
+                    failure.contains(&format!("project=\"{project}/tsconfig.json\"")),
+                    diagnostics,
+                    "{failure}"
+                );
+                assert_eq!(
+                    failure.contains(&format!("file=\"{project}/main.ts\"")),
+                    diagnostics,
+                    "{failure}"
+                );
+                assert_eq!(failure.contains("call_bytes="), diagnostics, "{failure}");
+                assert_eq!(
+                    failure.contains("operation=call-lookup"),
+                    diagnostics,
+                    "{failure}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(unix)]

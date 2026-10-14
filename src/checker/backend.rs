@@ -12,14 +12,16 @@ use super::protocol::{
 pub enum Backend {
     #[default]
     TypeScript,
-    Tsr,
+    Tsr {
+        diagnostics: bool,
+    },
 }
 
 impl Backend {
     pub const fn name(self) -> &'static str {
         match self {
             Self::TypeScript => "typescript",
-            Self::Tsr => "tsr-embedded",
+            Self::Tsr { .. } => "tsr-embedded",
         }
     }
 }
@@ -30,8 +32,11 @@ pub enum Checker {
 }
 
 impl Checker {
-    pub fn embedded(root: &Path) -> Result<Self, CheckerError> {
-        Ok(Self::Tsr(Box::new(EmbeddedChecker::new(root)?)))
+    pub fn embedded(root: &Path, diagnostics: bool) -> Result<Self, CheckerError> {
+        Ok(Self::Tsr(Box::new(EmbeddedChecker::new(
+            root,
+            diagnostics,
+        )?)))
     }
 
     pub fn protocol_version(&self) -> u32 {

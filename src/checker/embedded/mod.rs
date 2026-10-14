@@ -104,14 +104,14 @@ pub struct Request {
 }
 
 impl Request {
-    fn new(timeout: Duration) -> Result<Arc<Self>, CheckerError> {
+    fn new(timeout: Duration, diagnostics: bool) -> Result<Arc<Self>, CheckerError> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| error("protocol", "checker timeout is too large"))?;
         Ok(Arc::new(Self {
             deadline,
             timeout,
-            diagnostics: diagnostics::Diagnostics::default(),
+            diagnostics: diagnostics::Diagnostics::new(diagnostics),
         }))
     }
 
@@ -136,10 +136,11 @@ pub struct EmbeddedChecker {
     preparing: bool,
     prepared: Option<BTreeMap<String, MemberProjectResult>>,
     interrupts_registered: bool,
+    diagnostics: bool,
 }
 
 impl EmbeddedChecker {
-    pub fn new(root: &Path) -> Result<Self, CheckerError> {
+    pub fn new(root: &Path, diagnostics: bool) -> Result<Self, CheckerError> {
         let root = std::fs::canonicalize(root).map_err(|e| error("outside_root", e.to_string()))?;
         if !root.is_dir() {
             return Err(error("outside_root", "repository root is not a directory"));
@@ -152,6 +153,7 @@ impl EmbeddedChecker {
             preparing: false,
             prepared: None,
             interrupts_registered: false,
+            diagnostics,
         })
     }
 
@@ -168,7 +170,7 @@ impl EmbeddedChecker {
         timeout: Duration,
         task: impl FnOnce(&mut Self, &Arc<Request>) -> Result<T, CheckerError>,
     ) -> Result<T, CheckerError> {
-        let request = Request::new(timeout)?;
+        let request = Request::new(timeout, self.diagnostics)?;
         if let Some(built) = &self.built {
             built.project.host.set_request(request.clone());
         }

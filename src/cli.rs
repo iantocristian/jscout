@@ -23,6 +23,9 @@ pub(super) struct Cli {
     /// Enable or disable embedded TSR (overrides experimental.tsr; cooperative deadlines)
     #[arg(long, global = true, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub(super) experimental_tsr: Option<bool>,
+    /// Track embedded TSR queries/operations for detailed errors and progress (off by default)
+    #[arg(long, global = true)]
+    pub(super) tsr_diagnostics: bool,
     /// Maximum checker projects running concurrently, 1–16 (overrides checker.jobs)
     #[arg(long, global = true, value_parser = parse_checker_jobs)]
     pub(super) checker_jobs: Option<usize>,

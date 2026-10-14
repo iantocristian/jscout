@@ -2509,7 +2509,7 @@ fn embedded_watch_targets_leave_repository_sources_incremental() -> Result<()> {
     // signal handler in the unit-test process (the gateway tests own one).
     let source = fs::read_to_string(root.join("src/main.ts"))?;
     let start = source.find("service.ping()").unwrap() as i64;
-    let mut checker = crate::checker::embedded::EmbeddedChecker::new(&root)?;
+    let mut checker = crate::checker::embedded::EmbeddedChecker::new(&root, false)?;
     let result = checker.resolve_members(
         "tsconfig.json".into(),
         vec![],

@@ -1145,13 +1145,25 @@ bounds concurrency, not memory use; choose a lower count for large projects.
 
 ## Debugging embedded TSR failures
 
-Embedded TSR errors include the project, queried source file, `call_bytes=START..END`,
+Add `--tsr-diagnostics` to opt into detailed embedded TSR error context and
+serial progress. It is off by default and applies only to embedded TSR, whether
+selected by `--experimental-tsr` or `[experimental] tsr = true` in TOML. The flag
+does not select a checker backend or change cached-result validity.
+
+```sh
+jscout --experimental-tsr --tsr-diagnostics enrich /path/to/repo --all --full
+jscout --experimental-tsr --tsr-diagnostics --no-progress watch /path/to/repo --enrich
+```
+
+With this option, errors include the project, queried source file, `call_bytes=START..END`,
 and the adapter operation that failed, such as `receiver-type`,
 `declaration-resolution`, or `type-printing`. The call range uses zero-based UTF-8
 byte offsets with an exclusive end, matching the indexed source. Paths are quoted
 and escaped. The original error message and retry classification are preserved;
-caught compiler panics carry the same context. These diagnostics are enabled by
-default and still appear with `--no-progress` and parallel checker workers.
+caught compiler panics carry the same context. `--no-progress` suppresses progress
+output but keeps the opted-in error context, including with parallel checker workers.
+Without `--tsr-diagnostics`, the adapter skips context locking, path cloning, and
+diagnostic formatting; ordinary progress and errors retain their existing behavior.
 
 For example, a query failure can report:
 

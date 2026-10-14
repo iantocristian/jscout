@@ -27,12 +27,17 @@ impl Context {
     }
 }
 
-#[derive(Default)]
-pub(super) struct Diagnostics(Mutex<Context>);
+pub(super) struct Diagnostics(Option<Mutex<Context>>);
 
 impl Diagnostics {
+    pub fn new(enabled: bool) -> Self {
+        Self(enabled.then(|| Mutex::new(Context::default())))
+    }
+
     fn update(&self, change: impl FnOnce(&mut Context)) {
-        let mut context = self.0.lock().expect("checker diagnostic context");
+        // Keep path cloning, locking, formatting, and progress behind the opt-in.
+        let Some(context) = &self.0 else { return };
+        let mut context = context.lock().expect("checker diagnostic context");
         change(&mut context);
         // The reporter throttles details to its heartbeat. Parallel workers
         // suppress progress, but keep their own error context above.
@@ -61,7 +66,8 @@ impl Diagnostics {
     }
 
     pub fn annotate(&self, error: CheckerError) -> CheckerError {
-        let context = self.0.lock().expect("checker diagnostic context");
+        let Some(context) = &self.0 else { return error };
+        let context = context.lock().expect("checker diagnostic context");
         if context.operation.is_empty() {
             return error;
         }
