@@ -32,9 +32,19 @@ fn facts(database: &Path) -> Vec<(String, i64, String, String, String, String)> 
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
         .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
 }
-fn compare(tsr: bool) {
+fn compare(compiler: &str) {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
+    #[cfg(unix)]
+    if compiler == "typescript7" {
+        let native = Path::new(env!("CARGO_MANIFEST_DIR")).join("checker/node_modules/typescript7");
+        assert!(
+            native.join("package.json").is_file(),
+            "run npm ci --prefix checker first"
+        );
+        fs::create_dir(root.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(native, root.join("node_modules/typescript")).unwrap();
+    }
     for index in 0..4 {
         let project = root.join(format!("packages/p{index}"));
         fs::create_dir_all(&project).unwrap();
@@ -55,7 +65,7 @@ fn compare(tsr: bool) {
     let parallel = root.join("parallel.db");
     fs::copy(root.join(".jscout.db"), &serial).unwrap();
     fs::copy(&serial, &parallel).unwrap();
-    let backend = if tsr {
+    let backend = if compiler == "tsr" {
         "--experimental-tsr=true"
     } else {
         "--experimental-tsr=false"
@@ -96,6 +106,11 @@ fn compare(tsr: bool) {
         !log.contains("checker preparation:"),
         "parallel workers must not overwrite aggregate progress"
     );
+    if compiler == "typescript7" {
+        assert_eq!(one["checker_version"], "7.0.2");
+        assert_eq!(many["checker_version"], "7.0.2");
+        assert_eq!(many["checker_source"], "repository");
+    }
     assert_eq!(one["facts_published"], 4);
     assert_eq!(many["facts_published"], 4);
     assert_eq!(one["occurrences_queried"], many["occurrences_queried"]);
@@ -121,11 +136,16 @@ fn compare(tsr: bool) {
 }
 #[test]
 fn embedded_parallel_results_match_serial_and_reuse_across_job_counts() {
-    compare(true);
+    compare("tsr");
 }
 #[test]
 fn sidecar_parallel_results_match_serial_and_reuse_across_job_counts() {
-    compare(false);
+    compare("typescript");
+}
+#[cfg(unix)]
+#[test]
+fn native_typescript7_parallel_results_match_serial_and_reuse_across_job_counts() {
+    compare("typescript7");
 }
 #[test]
 fn checker_jobs_rejects_zero_and_config_reports_the_value() {
