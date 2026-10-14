@@ -1142,3 +1142,30 @@ combined memory of concurrent workers. Native TypeScript compiler children
 are not included in the sidecar RSS; embedded TSR does not report these counters
 and returns zero. Aggregate process memory is not measured. The worker limit
 bounds concurrency, not memory use; choose a lower count for large projects.
+
+## Debugging embedded TSR failures
+
+Embedded TSR errors include the project, queried source file, `call_bytes=START..END`,
+and the adapter operation that failed, such as `receiver-type`,
+`declaration-resolution`, or `type-printing`. The call range uses zero-based UTF-8
+byte offsets with an exclusive end, matching the indexed source. Paths are quoted
+and escaped. The original error message and retry classification are preserved;
+caught compiler panics carry the same context. These diagnostics are enabled by
+default and still appear with `--no-progress` and parallel checker workers.
+
+For example, a query failure can report:
+
+```text
+checker error [checker_failure]: embedded TSR project="packages/ui/tsconfig.json" file="packages/ui/src/button.tsx" call_bytes=120..136 operation=receiver-type: missing skipped generic function inference
+```
+
+Serial progress includes the active query and operation before entering the compiler,
+so a heartbeat can identify a slow call. `checker preparation N/M` counts queries,
+not files, and advances after each batch of up to 128 queries. Parallel mode retains
+aggregate project progress; errors still identify the individual project and query.
+Failures before query execution report their project/operation when known, without
+claiming a source location. Typed deadline/transport failures log context separately.
+
+The reported source is the query that triggered the work. TSR may follow imported
+types into other files; locating its exact internal failing node can still require
+a compiler backtrace or TSR instrumentation. Embedded deadlines remain cooperative.

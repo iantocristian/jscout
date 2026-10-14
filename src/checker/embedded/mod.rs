@@ -1,5 +1,6 @@
 //! In-process compiler adapter. Results escape as owned protocol records;
 //! compiler handles and AST owners live only for one selected project.
+mod diagnostics;
 pub(crate) mod host;
 mod projects;
 mod query;
@@ -76,6 +77,7 @@ pub fn identity() -> TypeScriptIdentity {
         for bytes in [
             include_bytes!("../../../Cargo.lock").as_slice(),
             include_bytes!("mod.rs"),
+            include_bytes!("diagnostics.rs"),
             include_bytes!("projects.rs"),
             include_bytes!("query.rs"),
             include_bytes!("host.rs"),
@@ -98,6 +100,7 @@ pub fn identity() -> TypeScriptIdentity {
 pub struct Request {
     deadline: Instant,
     timeout: Duration,
+    diagnostics: diagnostics::Diagnostics,
 }
 
 impl Request {
@@ -105,7 +108,11 @@ impl Request {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| error("protocol", "checker timeout is too large"))?;
-        Ok(Arc::new(Self { deadline, timeout }))
+        Ok(Arc::new(Self {
+            deadline,
+            timeout,
+            diagnostics: diagnostics::Diagnostics::default(),
+        }))
     }
 
     pub fn check(&self) -> Result<(), CheckerError> {
@@ -183,6 +190,7 @@ impl EmbeddedChecker {
                 ))
             }
         });
+        let result = result.map_err(|error| request.diagnostics.annotate(error));
         if result.is_err()
             && !matches!(&result, Err(CheckerError::Remote { code, .. }) if code == "oversized_batch")
         {
@@ -198,6 +206,7 @@ impl EmbeddedChecker {
 
     pub fn capabilities(&mut self, timeout: Duration) -> Result<Capabilities, CheckerError> {
         self.request(timeout, |this, request| {
+            request.diagnostics.operation("project-discovery");
             let discovery = projects::discover(&this.root, request)?;
             let result = Capabilities {
                 typescript: identity(),
@@ -221,6 +230,7 @@ impl EmbeddedChecker {
         refresh: bool,
     ) -> Result<MemberPlanResult, CheckerError> {
         self.request(timeout, |this, request| {
+            request.diagnostics.operation("project-planning");
             files.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
             if files.windows(2).any(|pair| pair[0] == pair[1]) {
                 return Err(error("protocol", "duplicate plan file"));
@@ -300,6 +310,9 @@ impl EmbeddedChecker {
         timeout: Duration,
     ) -> Result<MemberBatchResult, CheckerError> {
         self.request(timeout, |this, request| {
+            request
+                .diagnostics
+                .project(&project_id, "project-discovery");
             if queries.is_empty() || queries.len() > 512 {
                 return Err(error(
                     "protocol",
@@ -349,6 +362,7 @@ impl EmbeddedChecker {
             let previous_fingerprint = built.fingerprint.clone();
             let mut by_file: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             for (index, query) in queries.iter().enumerate() {
+                request.diagnostics.query(query, "validate-source");
                 request.check()?;
                 let path = query_file(&this.root, &query.file)?;
                 if !built.project.roots.contains(&path) {
@@ -374,12 +388,20 @@ impl EmbeddedChecker {
                 let mut failure = None;
                 for &index in indices {
                     let result = match &this.prepared {
-                        Some(prepared) => prepared
-                            .get(&query_key(&queries[index])?)
-                            .cloned()
-                            .ok_or_else(|| {
-                                error("protocol", "query was not included in project preparation")
-                            }),
+                        Some(prepared) => {
+                            request
+                                .diagnostics
+                                .query(&queries[index], "prepared-answer");
+                            prepared
+                                .get(&query_key(&queries[index])?)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    error(
+                                        "protocol",
+                                        "query was not included in project preparation",
+                                    )
+                                })
+                        }
                         None => built.resolve(&this.root, &queries[index], request),
                     };
                     match result {
@@ -389,6 +411,12 @@ impl EmbeddedChecker {
                                 && ["invalid_span", "span_mismatch", "checker_failure"]
                                     .contains(&code.as_str()) =>
                         {
+                            let CheckerError::Remote { code, message } = request
+                                .diagnostics
+                                .annotate(CheckerError::Remote { code, message })
+                            else {
+                                unreachable!("annotation preserves remote errors");
+                            };
                             failure = Some(RemoteError { code, message });
                             break;
                         }
@@ -413,6 +441,7 @@ impl EmbeddedChecker {
                     }
                 }
             }
+            request.diagnostics.project(&project_id, "input-manifest");
             built.refresh_manifest()?;
             if !this.preparing && this.returned_batch && built.fingerprint != previous_fingerprint {
                 return Err(error(
@@ -461,6 +490,9 @@ impl EmbeddedChecker {
         timeout: Duration,
     ) -> Result<ProjectValidationResult, CheckerError> {
         self.request(timeout, |this, request| {
+            request
+                .diagnostics
+                .project(&project_id, "validate-project-inputs");
             let built = this
                 .built
                 .as_ref()
