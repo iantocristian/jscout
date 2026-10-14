@@ -1416,7 +1416,7 @@ fn partial_failure_retry_policy_separates_project_state_from_transport_failure()
 }
 
 #[test]
-fn file_local_failure_answers_are_inferred_only_and_shape_checked() {
+fn file_local_failure_answers_limit_configured_projects_to_checker_failures() {
     let failed = ProjectAnswer {
         project_id: "inferred:.#node-esm".into(),
         status: "failed".into(),
@@ -1430,6 +1430,23 @@ fn file_local_failure_answers_are_inferred_only_and_shape_checked() {
     };
     validate_project_answer_shape("inferred:.#node-esm", &failed).expect("valid inferred failure");
     assert!(validate_project_answer_shape("tsconfig.json", &failed).is_err());
+
+    let mut configured = failed.clone();
+    configured.project_id = "tsconfig.json".into();
+    for code in [
+        "span_mismatch",
+        "hash_mismatch",
+        "protocol",
+        "timeout",
+        "EBUSY",
+    ] {
+        configured.error.as_mut().unwrap().code = code.into();
+        assert!(validate_project_answer_shape("tsconfig.json", &configured).is_err());
+    }
+    configured.error.as_mut().unwrap().code = "checker_failure".into();
+    validate_project_answer_shape("tsconfig.json", &configured).unwrap();
+    configured.receiver_type = Some("must not retain successful answers".into());
+    assert!(validate_project_answer_shape("tsconfig.json", &configured).is_err());
 
     let mut malformed = failed;
     malformed.declarations.push(DeclarationSite {
@@ -4168,4 +4185,118 @@ fn watch_recognizes_terminal_checker_errors_before_project_publication() {
     assert!(!is_terminal_failure(&anyhow::anyhow!(
         "local storage error"
     )));
+}
+
+#[test]
+fn configured_tsr_failure_publishes_healthy_facts_and_invalidates_failed_resumed_files()
+-> Result<()> {
+    use crate::checker::embedded::test_support::with_query_fault;
+    // Full enrichment installs a process-wide Ctrl-C handler. Isolate this
+    // test from gateway tests that install their own handler in the parent.
+    const CHILD: &str = "JSCOUT_TEST_TSR_FILE_FAILURE_CHILD";
+    const TEST: &str = "checker::enrich::tests::configured_tsr_failure_publishes_healthy_facts_and_invalidates_failed_resumed_files";
+    if std::env::var(CHILD).as_deref() != Ok(TEST) {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([TEST, "--exact", "--nocapture"])
+            .env(CHILD, TEST)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    let repo = tempfile::tempdir()?;
+    fs::write(
+        repo.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"noLib":true},"include":["*.ts"]}"#,
+    )?;
+    let source = "export class Service { insert() {} } export function run(service: Service) { service.insert(); }";
+    fs::write(repo.path().join("bad.ts"), source)?;
+    fs::write(repo.path().join("good.ts"), source)?;
+    let conn = crate::store::open(repo.path())?;
+    crate::indexer::index_repo(repo.path(), &conn)?;
+    let options = EnrichOptions {
+        backend: crate::checker::Backend::Tsr { diagnostics: false },
+        timeout: Duration::from_secs(60),
+        include_all: true,
+        ..options()
+    };
+    let first = with_query_fault(
+        |query| {
+            if query.file == "bad.ts" {
+                Err(crate::checker::embedded::error(
+                    "checker_failure",
+                    "compiler probe failure",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        || enrich(repo.path(), &options),
+    )
+    .unwrap_err();
+    assert!(is_terminal_partial_failure(&first), "{first}");
+    assert!(
+        first.to_string().contains("bad.ts")
+            && first.to_string().contains("compiler probe failure"),
+        "{first}"
+    );
+    let active_facts = || -> Result<Vec<String>> {
+        Ok(conn.prepare("SELECT source_file FROM checker_enrichments WHERE batch_id=(SELECT id FROM checker_enrichment_batches WHERE active=1) ORDER BY source_file")?
+            .query_map([], |row| row.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?)
+    };
+    let active_status = || -> Result<String> {
+        Ok(conn.query_row("SELECT status FROM checker_project_runs WHERE batch_id=(SELECT id FROM checker_enrichment_batches WHERE active=1) AND project_id='tsconfig.json'", [], |row| row.get(0))?)
+    };
+    assert_eq!(active_facts()?, ["good.ts"]);
+    assert_eq!(active_status()?, "partial");
+    let good = occurrence_in(&conn, "good.ts")?;
+    let detail: String = conn.query_row(
+        "SELECT detail_json FROM resolved_edges WHERE provenance='checker' AND source_ref_id=?1",
+        [good.id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&detail)?["failedProjects"],
+        serde_json::json!([])
+    );
+
+    // Good's facts were completed in the partial batch. On resume, preparation
+    // must invalidate them if that file now fails, even though only bad is pending.
+    let second = with_query_fault(
+        |query| {
+            if query.file == "good.ts" {
+                Err(crate::checker::embedded::error(
+                    "checker_failure",
+                    "second compiler probe failure",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        || enrich(repo.path(), &options),
+    )
+    .unwrap_err();
+    assert!(is_terminal_partial_failure(&second), "{second}");
+    let partial = second.downcast_ref::<PartialEnrichmentError>().unwrap();
+    assert_eq!(
+        partial.occurrences_resumed, 1,
+        "test must exercise a resumed healthy file"
+    );
+    assert_eq!(
+        partial.projects_reset, 0,
+        "resumed facts must be purged without a full project reset"
+    );
+    assert!(second.to_string().contains("good.ts"), "{second}");
+    assert_eq!(active_facts()?, ["bad.ts"]);
+    assert_eq!(active_status()?, "partial");
+    let completed = enrich(repo.path(), &options)?;
+    assert_eq!(completed.facts_published, 2);
+    assert_eq!(active_facts()?, ["bad.ts", "good.ts"]);
+    assert_eq!(active_status()?, "completed");
+    assert!(enrich(repo.path(), &options)?.exact_batch_reused);
+    Ok(())
 }

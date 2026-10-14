@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -105,9 +106,9 @@ impl Checker {
         project_files: &[String],
         queries: &[MemberQuery],
         timeout: Duration,
-    ) -> Result<(), CheckerError> {
+    ) -> Result<BTreeSet<String>, CheckerError> {
         match self {
-            Self::TypeScript(_) => Ok(()),
+            Self::TypeScript(_) => Ok(BTreeSet::new()),
             Self::Tsr(checker) => {
                 checker.prepare_project(project_id, project_files, queries, timeout)
             }

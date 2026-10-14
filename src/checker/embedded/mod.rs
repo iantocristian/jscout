@@ -137,6 +137,7 @@ pub struct EmbeddedChecker {
     prepared: Option<BTreeMap<String, MemberProjectResult>>,
     interrupts_registered: bool,
     diagnostics: bool,
+    failed_files: BTreeMap<String, RemoteError>,
 }
 
 impl EmbeddedChecker {
@@ -154,6 +155,7 @@ impl EmbeddedChecker {
             prepared: None,
             interrupts_registered: false,
             diagnostics,
+            failed_files: BTreeMap::new(),
         })
     }
 
@@ -202,6 +204,7 @@ impl EmbeddedChecker {
             self.discovery = None;
             self.returned_batch = false;
             self.prepared = None;
+            self.failed_files.clear();
         }
         result
     }
@@ -258,13 +261,14 @@ impl EmbeddedChecker {
     /// Resolve selected queries before exposing any batch. TSR can defer host
     /// lookups until type printing, so the complete observed manifest is known
     /// only after this pass. Answers are owned and reused, not checked twice.
+    /// Return failed files so callers also invalidate any previously staged answers.
     pub fn prepare_project(
         &mut self,
         project_id: &str,
         project_files: &[String],
         queries: &[MemberQuery],
         timeout: Duration,
-    ) -> Result<(), CheckerError> {
+    ) -> Result<BTreeSet<String>, CheckerError> {
         if self.built.is_some() || queries.is_empty() {
             return Err(error(
                 "protocol",
@@ -298,7 +302,7 @@ impl EmbeddedChecker {
                     .clone_from(fingerprint);
             }
             self.prepared = Some(prepared);
-            Ok(())
+            Ok(self.failed_files.keys().cloned().collect())
         })();
         self.preparing = false;
         result
@@ -386,9 +390,14 @@ impl EmbeddedChecker {
                 by_file.entry(query.file.clone()).or_default().push(index);
             }
             let mut results = vec![None; queries.len()];
-            for indices in by_file.values() {
-                let mut failure = None;
+            for (file, indices) in &by_file {
+                // Quarantine also overrides earlier prepared successes from
+                // this file, even when replay uses different batch boundaries.
+                let mut failure = this.failed_files.get(file).cloned();
                 for &index in indices {
+                    if failure.is_some() {
+                        break;
+                    }
                     let result = match &this.prepared {
                         Some(prepared) => {
                             request
@@ -409,9 +418,10 @@ impl EmbeddedChecker {
                     match result {
                         Ok(result) => results[index] = Some(result),
                         Err(CheckerError::Remote { code, message })
-                            if project_id.starts_with("inferred:")
-                                && ["invalid_span", "span_mismatch", "checker_failure"]
-                                    .contains(&code.as_str()) =>
+                            if code == "checker_failure"
+                                || project_id.starts_with("inferred:")
+                                    && ["invalid_span", "span_mismatch"]
+                                        .contains(&code.as_str()) =>
                         {
                             let CheckerError::Remote { code, message } = request
                                 .diagnostics
@@ -419,7 +429,15 @@ impl EmbeddedChecker {
                             else {
                                 unreachable!("annotation preserves remote errors");
                             };
-                            failure = Some(RemoteError { code, message });
+                            // A returned compiler error can leave query caches
+                            // incomplete. Keep the loaded program, but use a new
+                            // checker before attempting a healthy sibling file.
+                            if code == "checker_failure" {
+                                built.restart_checker(request)?;
+                            }
+                            let error = RemoteError { code, message };
+                            this.failed_files.insert(file.clone(), error.clone());
+                            failure = Some(error);
                             break;
                         }
                         Err(failure) => return Err(failure),
@@ -427,19 +445,8 @@ impl EmbeddedChecker {
                 }
                 if let Some(failure) = failure {
                     for &index in indices {
-                        let query = &queries[index];
-                        results[index] = Some(MemberProjectResult {
-                            indexed_hash: query.indexed_hash.clone(),
-                            source_hash: query.indexed_hash.clone(),
-                            answer: ProjectAnswer {
-                                project_id: project_id.clone(),
-                                status: "failed".into(),
-                                receiver_type: None,
-                                declarations: Vec::new(),
-                                checker_input_fingerprint: String::new(),
-                                error: Some(failure.clone()),
-                            },
-                        });
+                        results[index] =
+                            Some(failed_result(&project_id, &queries[index], failure.clone()));
                     }
                 }
             }
@@ -522,6 +529,25 @@ impl EmbeddedChecker {
     }
 }
 
+fn failed_result(
+    project_id: &str,
+    query: &MemberQuery,
+    failure: RemoteError,
+) -> MemberProjectResult {
+    MemberProjectResult {
+        indexed_hash: query.indexed_hash.clone(),
+        source_hash: query.indexed_hash.clone(),
+        answer: ProjectAnswer {
+            project_id: project_id.into(),
+            status: "failed".into(),
+            receiver_type: None,
+            declarations: Vec::new(),
+            checker_input_fingerprint: String::new(),
+            error: Some(failure),
+        },
+    }
+}
+
 fn query_key(query: &MemberQuery) -> Result<String, CheckerError> {
     serde_json::to_string(query).map_err(|e| error("protocol", e.to_string()))
 }
@@ -534,5 +560,7 @@ impl Drop for EmbeddedChecker {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

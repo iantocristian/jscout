@@ -3197,12 +3197,32 @@ fn execute_project(
     // Embedded queries may consult the host lazily. Resolve the complete
     // selected set once before publishing batches, fixing their input identity
     // even when resuming a subset of an interrupted project.
-    checker.prepare_project(
+    let prepared_failures = checker.prepare_project(
         project_id,
         project_files,
         &all_occurrences.iter().map(member_query).collect::<Vec<_>>(),
         options.timeout,
     )?;
+    // Preparation also checks resumed files. Include newly failed files even
+    // when all their occurrences were already staged, so their old facts are
+    // purged by the same file-failure path as newly queried occurrences.
+    let pending_with_failures;
+    let occurrences = if prepared_failures.is_empty() {
+        occurrences
+    } else {
+        let pending = occurrences
+            .iter()
+            .map(|occurrence| occurrence.id)
+            .collect::<BTreeSet<_>>();
+        pending_with_failures = all_occurrences
+            .iter()
+            .filter(|occurrence| {
+                pending.contains(&occurrence.id) || prepared_failures.contains(&occurrence.file)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        &pending_with_failures
+    };
     let resumed_fingerprint = project_fingerprint.clone();
     let mut execution = ProjectExecution::default();
     let mut project_peak_rss_bytes = 0;
@@ -3465,7 +3485,11 @@ fn validate_project_answer_shape(project_id: &str, answer: &ProjectAnswer) -> Re
         }
         "unknown" if answer.error.is_none() && answer.declarations.is_empty() => Ok(()),
         "failed"
-            if is_inferred_project(project_id)
+            if (is_inferred_project(project_id)
+                || answer
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.code == "checker_failure"))
                 && answer
                     .error
                     .as_ref()
@@ -3753,12 +3777,12 @@ fn complete_project(
         } else if successful == 0 {
             (
                 "failed",
-                Some("every selected source file failed during inferred checking"),
+                Some("every selected source file failed during checker queries"),
             )
         } else {
             (
                 "partial",
-                Some("one or more source files failed during inferred checking"),
+                Some("one or more source files failed during checker queries"),
             )
         };
         conn.execute(
