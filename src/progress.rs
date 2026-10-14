@@ -214,17 +214,20 @@ fn report(
     }
     loop {
         // Check elapsed time even under a continuous stream of counter updates.
-        let message = if let Some(interval) = interval {
-            let wait = if state.idle {
-                interval
-            } else if visible {
+        let wait = if state.idle {
+            interval
+        } else if !visible {
+            // The initial slow-command report is independent of periodic heartbeats.
+            Some(DELAY.saturating_sub(start.elapsed()))
+        } else {
+            interval.map(|interval| {
                 interval.saturating_sub(start.elapsed().saturating_sub(last_report))
-            } else {
-                DELAY.saturating_sub(start.elapsed())
-            };
+            })
+        };
+        let message = if let Some(wait) = wait {
             receiver.recv_timeout(wait)
         } else {
-            // No timer at all: zero disables heartbeats, not phase/completion events.
+            // Once visible (or idle), zero leaves only phase/completion events.
             receiver
                 .recv()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
@@ -270,11 +273,10 @@ fn report(
             .total
             .is_some_and(|total| total > 0 && state.done == total);
         if (visible || elapsed >= DELAY)
-            && (phase_change
+            && (!visible
+                || phase_change
                 || (dirty && count_complete)
-                || interval.is_some_and(|interval| {
-                    elapsed.saturating_sub(last_report) >= if visible { interval } else { DELAY }
-                }))
+                || interval.is_some_and(|interval| elapsed.saturating_sub(last_report) >= interval))
         {
             let _ = writeln!(out, "{}", state.line(command, elapsed, "running"));
             last_report = elapsed;
@@ -390,6 +392,65 @@ mod tests {
             1,
             "{output}"
         );
+    }
+
+    #[test]
+    fn disabled_heartbeats_preserve_the_initial_slow_command_report() {
+        struct LiveOutput {
+            pending: Vec<u8>,
+            lines: mpsc::Sender<String>,
+        }
+        impl Write for LiveOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                for &byte in bytes {
+                    if byte == b'\n' {
+                        let line = String::from_utf8(std::mem::take(&mut self.pending)).unwrap();
+                        let _ = self.lines.send(line);
+                    } else {
+                        self.pending.push(byte);
+                    }
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let (lines_tx, lines_rx) = mpsc::channel();
+        tx.send(Message::Update(Event::Stage {
+            label: "searching".into(),
+            total: None,
+        }))
+        .unwrap();
+        let start = Instant::now();
+        let worker = std::thread::spawn(move || {
+            report(
+                rx,
+                "search",
+                false,
+                None,
+                &mut LiveOutput {
+                    pending: Vec::new(),
+                    lines: lines_tx,
+                },
+            );
+        });
+        let first = lines_rx
+            .recv_timeout(DELAY + Duration::from_secs(2))
+            .expect("slow commands must become visible even with heartbeats disabled");
+        assert!(start.elapsed() >= DELAY, "{first}");
+        assert!(first.contains("running: searching"), "{first}");
+        assert!(matches!(
+            lines_rx.recv_timeout(DELAY + Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        tx.send(Message::Finish(true)).unwrap();
+        let last = lines_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(last.contains("completed: searching"), "{last}");
+        worker.join().unwrap();
     }
 
     #[test]
