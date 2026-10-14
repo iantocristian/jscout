@@ -316,11 +316,21 @@ pub struct ProcessChecker {
     active: Arc<Mutex<Option<String>>>,
     pub versions: Versions,
     poisoned: bool,
+    killed: bool,
 }
 
 impl ProcessChecker {
     pub fn spawn(node: &Path, sidecar: &Path, root: &Path) -> Result<Self, CheckerError> {
-        let mut child = Command::new(node)
+        let mut command = Command::new(node);
+        // Native TypeScript runs a compiler subprocess behind the Node host.
+        // Give each checker its own group so a hard timeout stops both, even
+        // when the host cannot perform its normal child-process cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
             .arg(sidecar)
             .arg(root)
             .stdin(Stdio::piped())
@@ -373,6 +383,7 @@ impl ProcessChecker {
                 protocol: 0,
             },
             poisoned: false,
+            killed: false,
         };
         let id = checker.send(&Outbound::Hello)?;
         match checker.receive_for(&id, HELLO_TIMEOUT)? {
@@ -791,12 +802,35 @@ impl ProcessChecker {
 
     fn timeout<T>(&mut self, timeout: Duration) -> Result<T, CheckerError> {
         self.poisoned = true;
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill();
         Err(CheckerError::Timeout(timeout))
     }
 
+    fn kill(&mut self) {
+        if self.killed {
+            return;
+        }
+        self.killed = true;
+        #[cfg(unix)]
+        // SAFETY: spawn made this live child the leader of its own process
+        // group. A negative PID addresses only that checker and its children.
+        unsafe {
+            libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &self.child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     fn exit_error(&mut self) -> CheckerError {
+        // Stop descendants before reaping the host: once its PID is released,
+        // a delayed Drop must not address a potentially reused process group.
+        self.kill();
         let status = match self.child.try_wait() {
             Ok(Some(status)) => format!("exited with {status}"),
             Ok(None) => "closed stdout while still running".into(),
@@ -820,8 +854,7 @@ impl Drop for ProcessChecker {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill();
     }
 }
 
@@ -1005,6 +1038,53 @@ done
             .expect_err("timeout");
         assert!(matches!(error, CheckerError::Timeout(_)));
         assert!(checker.child.try_wait().expect("child status").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_the_native_compiler_process_group() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let script = directory.path().join("native-host.sh");
+        let child_pid_file = directory.path().join("compiler.pid");
+        fs::write(
+            &script,
+            format!(
+                r#"sleep 60 &
+echo $! > '{}'
+while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) echo '{READY}' ;;
+  esac
+done
+"#,
+                child_pid_file.display()
+            ),
+        )
+        .expect("host script");
+        let mut checker = ProcessChecker::spawn(Path::new("/bin/sh"), &script, directory.path())
+            .expect("spawn host");
+        let pid: libc::pid_t = fs::read_to_string(&child_pid_file)
+            .expect("compiler pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        // SAFETY: these are the live test processes just spawned above.
+        assert_eq!(
+            unsafe { libc::getpgid(pid) },
+            checker.child.id() as libc::pid_t
+        );
+        assert!(matches!(
+            checker.resolve_member(query(), Duration::from_millis(30)),
+            Err(CheckerError::Timeout(_))
+        ));
+        for _ in 0..100 {
+            // SAFETY: signal zero only probes the recorded test child's PID.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("native compiler {pid} survived the checker timeout");
     }
 
     #[test]

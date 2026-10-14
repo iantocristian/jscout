@@ -25,13 +25,34 @@ let active;
 let planSession;
 let canceledPlanId;
 let shuttingDown = false;
+const compilerChildren = new Map();
 
 const send = (message) => writeMessage(process.stdout, message);
+
+function killCompiler(pid) {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") process.stderr.write(`jscout-checker: cannot stop compiler ${pid}: ${error.message}\n`);
+  }
+}
+
+function stopCompilers(owner) {
+  for (const pid of compilerChildren.get(owner) ?? []) killCompiler(pid);
+  compilerChildren.delete(owner);
+}
+
+process.on("exit", () => {
+  for (const owner of compilerChildren.keys()) stopCompilers(owner);
+});
 
 function terminateWorker() {
   const old = worker;
   worker = undefined;
-  if (old) void old.terminate();
+  if (old) {
+    stopCompilers(old);
+    void old.terminate();
+  }
 }
 
 function clearPlanSession() {
@@ -76,6 +97,21 @@ function ensureWorker() {
   if (worker) return worker;
   const created = new Worker(workerUrl, { workerData: { root } });
   created.on("message", (message) => {
+    if (message.kind === "compiler_child") {
+      // Registration may have been queued just before cancellation.
+      if (worker !== created) killCompiler(message.pid);
+      else {
+        const children = compilerChildren.get(created) ?? new Set();
+        children.add(message.pid);
+        compilerChildren.set(created, children);
+      }
+      return;
+    }
+    if (message.kind === "compiler_child_exit") {
+      compilerChildren.get(created)?.delete(message.pid);
+      return;
+    }
+    if (worker !== created) return;
     if (!active || message.id !== active.id) return;
     if (planSession?.phase === "processing") {
       if (message.payload?.kind === "error") {
@@ -102,6 +138,7 @@ function ensureWorker() {
     send({ id: completed.id, ...message.payload });
   });
   created.on("error", (error) => {
+    if (worker !== created) return;
     reportWorkerError(error);
     if (active) {
       const id = active.id;
@@ -115,6 +152,7 @@ function ensureWorker() {
     terminateWorker();
   });
   created.on("exit", (code) => {
+    stopCompilers(created);
     if (worker !== created) return;
     worker = undefined;
     if (!shuttingDown && active) {
@@ -341,3 +379,10 @@ process.on("uncaughtException", () => {
   process.stderr.write("jscout-checker: protocol host failed\n");
   process.exit(1);
 });
+
+for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+  process.once(signal, () => {
+    terminateWorker();
+    process.exit(code);
+  });
+}

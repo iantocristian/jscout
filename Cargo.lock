@@ -704,6 +704,7 @@ dependencies = [
  "oxc_syntax",
  "pulldown-cmark",
  "ra_ap_syntax",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

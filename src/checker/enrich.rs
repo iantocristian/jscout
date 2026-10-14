@@ -16,7 +16,7 @@ use super::protocol::{
 /// Checker answer normalization and stored confidence semantics participate in
 /// both exact-plan reuse and cross-snapshot project carry. Bump this whenever
 /// the same inputs could map to different facts or confidence.
-pub(super) const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v4\0";
+pub(super) const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v5\0";
 pub(super) const PROJECT_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"jscout-checker-project-plan-v1\0";
 pub(super) const ENRICH_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"jscout-checker-plan-v5\0";
 const ABSENT_INPUT_HASH: &str = "absent:v1";
@@ -442,7 +442,7 @@ impl<'a> InputFreshnessCache<'a> {
                     Err(_) => None,
                     Ok(_) => fs::read(path)
                         .ok()
-                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string()),
+                        .map(|bytes| input_content_hash(&bytes, &input.source_hash)),
                 }
             })
             .as_deref()
@@ -3932,6 +3932,24 @@ fn load_unknown_projects(conn: &Connection, batch_id: i64) -> Result<Vec<String>
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+// Compiler artifacts use native SHA-256 in the Node sidecar. Keep their tagged
+// digests content-verified during reuse and publication as well; ordinary
+// indexed source and legacy compiler inputs remain BLAKE3.
+fn input_content_hash(bytes: &[u8], expected: &str) -> String {
+    if expected.starts_with("sha256:") {
+        use std::fmt::Write as _;
+
+        let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+        let mut hash = String::from("sha256:");
+        for byte in digest.as_ref() {
+            write!(hash, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        hash
+    } else {
+        blake3::hash(bytes).to_hex().to_string()
+    }
+}
+
 fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> {
     if expected.starts_with(super::embedded::host::INPUT_PREFIX) {
         if super::embedded::host::fresh_signature(path, expected).as_deref() != Some(expected) {
@@ -3950,7 +3968,7 @@ fn verify_source_hash(path: &Path, expected: &str, display: &str) -> Result<()> 
     }
     let bytes =
         fs::read(path).with_context(|| format!("could not read indexed source {display}"))?;
-    let actual = blake3::hash(&bytes).to_hex().to_string();
+    let actual = input_content_hash(&bytes, expected);
     if actual != expected {
         bail!("indexed source changed since the code snapshot: {display}");
     }

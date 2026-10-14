@@ -9,10 +9,14 @@
   },
   "main": "src/main.mjs",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test && node scripts/ts7-conformance.mjs",
+    "test:ts7": "node scripts/ts7-conformance.mjs"
   },
   "dependencies": {
     "@noble/hashes": "2.0.1",
     "typescript": "5.9.3"
+  },
+  "devDependencies": {
+    "typescript7": "npm:typescript@7.0.2"
   }
 }
