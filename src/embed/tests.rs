@@ -136,6 +136,8 @@ fn local_handshake(
                     Err(error) => return Err(error.into()),
                 }
             };
+            // Poll the listener, then read each accepted request with blocking deadlines.
+            stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
