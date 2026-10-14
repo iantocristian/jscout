@@ -60,7 +60,7 @@ impl Running {
         }
     }
 
-    fn wait_for_progress(&self, expected: &str) {
+    fn wait_for_progress(&self, expected: &str) -> String {
         let deadline = Instant::now() + DEADLINE;
         loop {
             let line = self
@@ -69,7 +69,7 @@ impl Running {
                 .unwrap_or_else(|error| panic!("missing live progress {expected:?}: {error}"));
             if line.contains(expected) {
                 assert!(line.starts_with("progress ["), "{line}");
-                return;
+                return line;
             }
         }
     }
@@ -229,7 +229,22 @@ fn docs_json_has_live_progress_and_cached_reruns_make_no_provider_calls() {
     let provider = Provider::new();
     let directory = fixture(&provider.endpoint(), 1);
     let root = directory.path();
-    let mut running = Running::start(root, &["docs", "embed", ".", "--json"]);
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join(".jscout.toml"))
+        .unwrap();
+    writeln!(config, "\n[diagnostics]\nprogress_interval_seconds = 0").unwrap();
+    let mut running = Running::start(
+        root,
+        &[
+            "docs",
+            "embed",
+            ".",
+            "--json",
+            "--progress-interval-seconds",
+            "0",
+        ],
+    );
     let (stream, request) = provider.request();
     assert_eq!(request["input"].as_array().unwrap().len(), 1);
     // The server has the request but deliberately has not replied. Seeing the
@@ -237,7 +252,17 @@ fn docs_json_has_live_progress_and_cached_reruns_make_no_provider_calls() {
     running.wait_for_progress("docs embeddings: missing representations (0 cached) 0/1");
     // A second line for this unchanged phase can only be the background
     // heartbeat: the caller remains blocked inside the provider request.
-    running.wait_for_progress("docs embeddings: missing representations (0 cached) 0/1");
+    let heartbeat =
+        running.wait_for_progress("docs embeddings: missing representations (0 cached) 0/1");
+    let elapsed: f64 = heartbeat
+        .rsplit_once("elapsed=")
+        .unwrap()
+        .1
+        .trim_end_matches('s')
+        .parse()
+        .unwrap();
+    // Redirected stderr stays at five seconds even when terminal heartbeats are disabled.
+    assert!((5.0..10.0).contains(&elapsed), "{heartbeat}");
     assert!(running.child.try_wait().unwrap().is_none());
     reply(stream, vectors(1));
     let output = running.finish();

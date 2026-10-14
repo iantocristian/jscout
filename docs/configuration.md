@@ -238,6 +238,7 @@ uses its Node gateway. See the [embedded checker guide](advanced.md#experimental
 | `telemetry.request_log` | none | Optional JSONL raw MCP request log; includes request content. |
 | `diagnostics.timing` | `false` | Print operation timing diagnostics. |
 | `diagnostics.debug` | `false` | Enable embedding/reranking debug diagnostics. |
+| `diagnostics.progress_interval_seconds` | `5` | Terminal heartbeat interval in nonnegative whole seconds; `0` disables periodic terminal heartbeats, not phase/completion reports. `--progress-interval-seconds` overrides it for one invocation. Redirected stderr stays fixed at five seconds, including with `0`. Restart watch to apply changes. |
 | `index.dependencies` | `[]` | Installed package names whose internals are indexed. Nonempty names, no duplicates. Omitted `--deps` uses this list; `--no-deps` disables it for a pass. |
 | `watch.embed` | `false` | Refresh code embeddings after a watch generation; does not request documentation embeddings. |
 | `watch.product` | `false` | Also embed the default product semantic view; requires `watch.embed = true`. |

@@ -158,6 +158,8 @@ result_transport = "auto"
 [diagnostics]
 timing = false
 debug = false
+# Terminal heartbeat seconds; 0 disables heartbeats. Redirected stderr stays at 5 seconds.
+progress_interval_seconds = 5
 
 [index]
 dependencies = []
