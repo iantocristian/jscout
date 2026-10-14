@@ -26,6 +26,7 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveConfig {
+    pub experimental: ExperimentalSettings,
     pub database: DatabaseSettings,
     pub docs: DocsSettings,
     pub search: SearchSettings,
@@ -39,6 +40,11 @@ pub struct EffectiveConfig {
     pub diagnostics: DiagnosticsSettings,
     pub index: IndexSettings,
     pub watch: WatchSettings,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExperimentalSettings {
+    pub tsr: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

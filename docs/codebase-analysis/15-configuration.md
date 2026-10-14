@@ -104,6 +104,7 @@ Column three is the legacy `JSCOUT_*` name; an em dash means the key has no envi
 | `llm.openai_compatible_providers` | `JSCOUT_PI_AI_OPENAI_COMPATIBLE_PROVIDERS` (JSON array) | `[]` |
 | `sidecars.node` | `JSCOUT_NODE` | `"node"` |
 | `sidecars.gateway` | `JSCOUT_PI_AI_GATEWAY`, then `JSCOUT_BUNDLED_GATEWAY` as *builtin* | none |
+| `experimental.tsr` | — | `false`; selects the embedded checker, CLI overrides it |
 | `sidecars.checker` | `JSCOUT_CHECKER_SIDECAR`, then `JSCOUT_BUNDLED_CHECKER` as *builtin* | none |
 | `mcp.profile` | — | `"core"` (`core\|full`; `baseline` aliases core, `structural` aliases full) |
 | `mcp.tools` | — | omitted: all tools permitted by the profile; explicit allowlists must be nonempty |
@@ -122,9 +123,9 @@ Column three is the legacy `JSCOUT_*` name; an em dash means the key has no envi
 | `watch.debounce_ms` | — | `2000` (must be > 0) |
 | `watch.reconcile_seconds` | — | `600` (0 allowed = no periodic reconcile) |
 
-That is 78 resolved policy keys, all stamped unconditionally on every successful load. There are 87 TOML leaf fields when the custom-provider array is expanded into its nine nested fields and the required `version` is included. The whole of `[database]`, `[docs]`, `[search]`, `[mcp]`, `[index]`, `[watch]` plus `embedding.api_key_env`, `embedding.batch`, `embedding.origins`, `llm.max_concurrency`, `llm.api_key_env` and `telemetry.request_log` have no environment level — those surfaces were born in the config file, so there is no legacy behavior to preserve.
+That is 79 resolved policy keys, all stamped unconditionally on every successful load. There are 88 TOML leaf fields when the custom-provider array is expanded into its nine nested fields and the required `version` is included. The whole of `[experimental]`, `[database]`, `[docs]`, `[search]`, `[mcp]`, `[index]`, `[watch]` plus `embedding.api_key_env`, `embedding.batch`, `embedding.origins`, `llm.max_concurrency`, `llm.api_key_env` and `telemetry.request_log` have no environment level — those surfaces were born in the config file, so there is no legacy behavior to preserve.
 
-`llm.max_concurrency` (`load.rs:798-803`) is the newest of them. It is the ceiling on in-flight scouting model requests; model execution may overlap, validation and database publication do not (`model.rs:178-181`). It defaults to 1 because scouting was serialized before wave execution landed, and the sustainable value depends entirely on the operator's provider and account, which jscout cannot know. It is also uncapped — nothing rejects 128, and `tests.rs:290-298` pins that. The zero check is duplicated downstream at `llm/config.rs:203-205` and again at `llm/process.rs:563-565`, three copies of one rule.
+`llm.max_concurrency` (`load.rs:798-803`) is the ceiling on in-flight scouting model requests; model execution may overlap, validation and database publication do not (`model.rs:178-181`). It defaults to 1 because scouting was serialized before wave execution landed, and the sustainable value depends entirely on the operator's provider and account, which jscout cannot know. It is also uncapped — nothing rejects 128, and `tests.rs:290-298` pins that. The zero check is duplicated downstream at `llm/config.rs:203-205` and again at `llm/process.rs:563-565`, three copies of one rule.
 
 ## Validation, fingerprint, warning
 

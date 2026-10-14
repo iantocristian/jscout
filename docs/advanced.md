@@ -242,7 +242,8 @@ actual Node error/stack in the command error as well as stderr.
 
 ### Experimental embedded checker
 
-`--experimental-tsr` selects the in-process [TSR compiler](https://github.com/ferrotype/tsr),
+`--experimental-tsr` or `experimental.tsr = true` in `.jscout.toml` selects the
+in-process [TSR compiler](https://github.com/ferrotype/tsr),
 pinned to revision `2009f6ec101358966902698f9ac2a7ff71ed57c3`. Compiler code and
 standard-library declarations are linked into every jscout binary. No compiler
 executable, language server, Node worker, local TSR checkout, or checker sidecar
@@ -255,7 +256,16 @@ jscout --experimental-tsr enrich /path/to/repo
 jscout --experimental-tsr watch /path/to/repo --enrich
 ```
 
-The global flag also selects the checker inventory for `scout repository`;
+To enable it for every checker command in a repository, add to `.jscout.toml`:
+
+```toml
+[experimental]
+tsr = true
+```
+
+The CLI flag overrides TOML; use `--experimental-tsr=false` to select the default
+TypeScript sidecar for one run. Restart a running watcher after changing the
+setting. Both forms also select the checker inventory for `scout repository`;
 generative scouting still needs its Node gateway. Enrichment continues to resolve
 indexed member calls with the existing ownership, package policy, confidence,
 staging, and publication rules. It does not run TypeScript diagnostics or emit.

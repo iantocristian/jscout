@@ -9,10 +9,10 @@ use serde::Deserialize;
 
 use super::{
     DatabaseSettings, DiagnosticsSettings, DocsIndexingSettings, DocsSearchSettings, DocsSettings,
-    EffectiveConfig, EmbeddingSettings, ExpansionSettings, FILE_NAME, IndexSettings,
-    InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel, OpenAiCompatibleProvider,
-    RerankerSettings, RuntimeConfig, SCHEMA_VERSION, SearchSettings, SidecarSettings, TEMPLATE,
-    TelemetrySettings, ValueSource, WatchSettings,
+    EffectiveConfig, EmbeddingSettings, ExpansionSettings, ExperimentalSettings, FILE_NAME,
+    IndexSettings, InferenceSettings, LlmSettings, McpSettings, OpenAiCompatibleModel,
+    OpenAiCompatibleProvider, RerankerSettings, RuntimeConfig, SCHEMA_VERSION, SearchSettings,
+    SidecarSettings, TEMPLATE, TelemetrySettings, ValueSource, WatchSettings,
 };
 use crate::{docs, file_role, origin, search, store};
 
@@ -20,6 +20,8 @@ use crate::{docs, file_role, origin, search, store};
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     version: u32,
+    #[serde(default)]
+    experimental: ExperimentalFileConfig,
     #[serde(default)]
     database: DatabaseFileConfig,
     #[serde(default)]
@@ -46,6 +48,12 @@ struct FileConfig {
     index: IndexFileConfig,
     #[serde(default)]
     watch: WatchFileConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExperimentalFileConfig {
+    tsr: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1025,7 +1033,11 @@ impl RuntimeConfig {
             bail!("watch.reconcile_seconds must exceed watch.debounce_ms or be zero");
         }
 
+        let experimental = ExperimentalSettings {
+            tsr: resolver.bool("experimental.tsr", raw.experimental.tsr, None, false)?,
+        };
         let effective = EffectiveConfig {
+            experimental,
             database: DatabaseSettings {
                 path: database_path,
             },

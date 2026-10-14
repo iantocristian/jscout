@@ -171,3 +171,26 @@ Final-run databases, stdout/stderr, commands, metrics and SQL comparisons are at
 `/Users/cristian/git/js-rag/target/embedded-tsr-pr-next-2026-10-11/`.
 The `run.py` and `compare.py` procedures from the initial experiment were reused.
 All captures and databases remain build output outside the Next.js checkout.
+
+## TOML configuration follow-up
+
+The configuration follow-up is based on main
+`569b486d51f8dd605108366c1ae359e25e1300b4`, which merged PR #130. On the same
+clean Next.js revision, `checker doctor` selected `tsr-embedded` using only
+`[experimental] tsr = true` in an explicit TOML file, with no experimental CLI
+flag. The debug binary ran with `PATH=/jscout-test-no-executables`, a nonexistent
+`sidecars.node`, and `--sidecar-path /missing-checker`. It exited successfully,
+discovered all **324 configured projects**, reported the same **nine
+configuration problems**, and reported readiness. Next.js remained unchanged.
+This checks configuration selection and discovery; it does not repeat the
+release timing comparison above.
+
+Follow-up checks passed: **829 Rust unit tests, 19 CLI integration tests**, Clippy
+with warnings denied, formatting, diff whitespace validation, and **18
+documentation tests**. CLI coverage checks native enrichment without Node,
+repository TOML selection, explicit config selection, both CLI override values,
+and exact reuse after selection changes.
+
+The TOML policy, command record, stdout and stderr are retained at
+`/tmp/jscout-tsr-toml-next-2026-10-13/`. Test and Clippy logs are
+`/tmp/jscout-tsr-toml-tests.log` and `/tmp/jscout-tsr-toml-clippy.log`.

@@ -195,7 +195,7 @@ See [authentication](installation.md) for the first login/API-key setup and
 | `llm.openai_compatible_providers.models.reasoning` | `false` | Whether the model advertises reasoning capability. |
 | `llm.openai_compatible_providers.models.context_window` | `131072` | Positive context-token capacity. |
 | `llm.openai_compatible_providers.models.max_tokens` | `32768` | Positive maximum output-token capacity. |
-| `sidecars.node` | `"node"` | Node executable used for gateway/checker; Node ≥22.19.0 required. |
+| `sidecars.node` | `"node"` | Node executable used for the gateway and default TypeScript checker; Node ≥22.19.0 required for those backends. |
 | `sidecars.gateway` | auto-discovered | Existing gateway entry file; release/npm installations bundle it. |
 | `sidecars.checker` | auto-discovered | Existing checker entry file; release/npm installations bundle it. |
 
@@ -203,6 +203,28 @@ Use `[[llm.openai_compatible_providers]]` and
 `[[llm.openai_compatible_providers.models]]` TOML array-table syntax as shown in
 the template. Legacy camelCase aliases `baseUrl`, `apiKeyEnv`, `contextWindow`,
 and `maxTokens` are accepted; prefer the snake_case TOML names above.
+
+### Experimental checker
+
+| Key | Default | Meaning and constraints |
+| --- | --- | --- |
+| `experimental.tsr` | `false` | Use the embedded TSR compiler for `enrich`, `checker doctor`, `watch --enrich`, and `scout repository` checker inventory. Compiler and standard libraries are linked into the binary; checker execution needs no Node or sidecar. Deadlines are cooperative. |
+
+To enable it for this repository:
+
+```toml
+version = 1
+
+[experimental]
+tsr = true
+```
+
+`--experimental-tsr` (or `--experimental-tsr=true`) overrides the setting to enable
+TSR for one invocation. `--experimental-tsr=false` selects the default TypeScript
+sidecar for one invocation, even when TOML enables TSR. Restart a running watcher
+after changing this setting. Selecting a checker does not enable watch enrichment;
+use `watch.enrich = true` or `watch --enrich` separately. Generative scouting still
+uses its Node gateway. See the [embedded checker guide](advanced.md#experimental-embedded-checker).
 
 ### MCP, diagnostics, indexing and watch
 
@@ -221,7 +243,7 @@ and `maxTokens` are accepted; prefer the snake_case TOML names above.
 | `watch.product` | `false` | Also embed the default product semantic view; requires `watch.embed = true`. |
 | `watch.dependencies` | `[]` | Installed dependency packages to keep indexed by watch; independent of `index.dependencies`. Nonempty names, no duplicates. |
 | `watch.enrich` | `false` | Run checker enrichment after generations. |
-| `watch.enrich_timeout_seconds` | `300` | Positive hard checker-enrichment timeout. |
+| `watch.enrich_timeout_seconds` | `300` | Positive checker-enrichment request timeout; hard for the TypeScript sidecar, cooperative for embedded TSR. |
 | `watch.debounce_ms` | `2000` | Positive event coalescing delay in milliseconds. |
 | `watch.reconcile_seconds` | `600` | Periodic full reconciliation interval; `0` disables it, otherwise must exceed the debounce delay. |
 

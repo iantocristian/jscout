@@ -86,7 +86,10 @@ fn run(cli: Cli) -> Result<()> {
             run_command(
                 command,
                 &runtime,
-                if cli.experimental_tsr {
+                if cli
+                    .experimental_tsr
+                    .unwrap_or(runtime.effective.experimental.tsr)
+                {
                     checker::Backend::Tsr
                 } else {
                     checker::Backend::TypeScript
