@@ -19,7 +19,7 @@ use super::protocol::{
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const INTERRUPTED_EXIT_CODE: i32 = 130;
-const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROTOCOL_LINE_BYTES: usize = 64 * 1024 * 1024;
 const PLAN_FRAME_MAX_BYTES: usize = 1024 * 1024;
 // Leave ample room for the version/id/kind envelope and JSON escaping. The
 // completed frame is also measured before it is written.
@@ -1009,7 +1009,7 @@ done
             .iter()
             .map(|file| serde_json::to_vec(file).expect("path json").len())
             .sum::<usize>();
-        assert!(logical_bytes > MAX_PROTOCOL_LINE_BYTES);
+        assert!(logical_bytes > 4 * PLAN_FRAME_MAX_BYTES);
 
         let normalized = normalize_plan_files(logical_files).expect("unique logical files");
         let chunks = chunk_plan_files(&normalized).expect("bounded chunks");

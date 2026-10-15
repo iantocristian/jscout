@@ -6,7 +6,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { loadRuntime } from "./runtime.mjs";
-import { PROTOCOL_VERSION } from "./protocol.mjs";
+import { MAX_BATCH_RESPONSE_BYTES, PROTOCOL_VERSION } from "./protocol.mjs";
 
 const root = fs.realpathSync(workerData.root);
 const runtime = await loadRuntime(root, (child) => {
@@ -1067,8 +1067,8 @@ function resolveMembers(projectId, projectFiles, queries) {
     results,
     resources: resources(),
   };
-  if (Buffer.byteLength(JSON.stringify(response)) > 1024 * 1024) {
-    throw coded("oversized_batch", "resolve_members response exceeds 1 MiB; retry a smaller batch");
+  if (Buffer.byteLength(JSON.stringify(response)) > MAX_BATCH_RESPONSE_BYTES) {
+    throw coded("oversized_batch", "resolve_members response exceeds 16 MiB; retry a smaller batch");
   }
   return response;
 }

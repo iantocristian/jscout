@@ -300,6 +300,12 @@ also makes resumed rows comparable to a freshly checked project. Preparation
 progress is reported every 128 calls; interruptions during preparation restart
 that preparation. Completed batches and projects retain the existing resume rules.
 
+Embedded answers stay in process and have no serialized response-size cap. The
+sidecar accepts answer batches up to 16 MiB and protocol frames up to 64 MiB;
+larger batches are retried with fewer queries. A single answer above the sidecar
+batch limit still fails the project. Ownership planning remains paginated in
+1 MiB frames.
+
 Directory fingerprints retain all subdirectory names and TypeScript, JavaScript,
 and JSON file names. Unrelated documents, images, and metadata do not invalidate
 checker reuse; explicitly read files and failed lookups remain tracked regardless

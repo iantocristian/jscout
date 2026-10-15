@@ -338,6 +338,66 @@ fn prepared_batches_share_one_manifest_and_deadlines_retire_loaded_programs() {
 }
 
 #[test]
+fn prepared_answers_above_sidecar_frame_limit_remain_usable() {
+    let source = "interface A { ping(): void } declare const receiver: A; receiver.ping();";
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"include":["*.ts"]}"#,
+        ),
+        ("first.ts", source),
+        ("second.ts", source),
+    ]);
+    let queries = ["first.ts", "second.ts"]
+        .map(|file| query(source, file, "receiver.ping()", "receiver", "ping"));
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
+    checker
+        .prepare_project("tsconfig.json", &[], &queries, TIMEOUT)
+        .unwrap();
+    // Simulate a large printed type without an expensive compiler fixture.
+    // Exceed even the sidecar's 4 MiB frame limit with one prepared answer:
+    // shrinking the batch cannot help, and embedded results need no JSON frame.
+    let large_type = "x".repeat(4 * 1024 * 1024 + 1);
+    checker
+        .prepared
+        .as_mut()
+        .unwrap()
+        .get_mut(&query_key(&queries[0]).unwrap())
+        .unwrap()
+        .answer
+        .receiver_type = Some(large_type.clone());
+    let fingerprint = checker.built.as_ref().unwrap().fingerprint.clone();
+    for batch in [
+        queries.to_vec(),
+        queries[..1].to_vec(),
+        queries[1..].to_vec(),
+    ] {
+        let result = checker
+            .resolve_members("tsconfig.json".into(), vec![], batch.clone(), TIMEOUT)
+            .unwrap();
+        assert_eq!(result.results.len(), batch.len());
+        assert_eq!(result.checker_input_fingerprint, fingerprint);
+        if batch[0].file == "first.ts" {
+            assert!(serde_json::to_vec(&result).unwrap().len() > 4 * 1024 * 1024);
+            assert_eq!(
+                result.results[0].answer.receiver_type.as_ref(),
+                Some(&large_type)
+            );
+        }
+        for answer in &result.results {
+            assert_eq!(answer.answer.status, "resolved");
+            assert_eq!(answer.answer.declarations.len(), 1);
+        }
+    }
+    assert!(
+        checker
+            .validate_project("tsconfig.json".into(), fingerprint, TIMEOUT)
+            .unwrap()
+            .valid
+    );
+}
+
+#[test]
 fn source_edits_new_inputs_and_invalid_spans_are_rejected() {
     let source = "import { A } from './service'; declare const receiver: A; receiver.ping();";
     let directory = fixture(&[

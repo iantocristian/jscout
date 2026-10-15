@@ -195,9 +195,7 @@ impl EmbeddedChecker {
             }
         });
         let result = result.map_err(|error| request.diagnostics.annotate(error));
-        if result.is_err()
-            && !matches!(&result, Err(CheckerError::Remote { code, .. }) if code == "oversized_batch")
-        {
+        if result.is_err() {
             if let Some(built) = self.built.take() {
                 built.session.retire();
             }
@@ -476,17 +474,8 @@ impl EmbeddedChecker {
                 results,
                 resources: ResourceUsage::default(),
             };
-            if !this.preparing
-                && serde_json::to_vec(&result)
-                    .map_err(|e| error("protocol", e.to_string()))?
-                    .len()
-                    > 1024 * 1024
-            {
-                return Err(error(
-                    "oversized_batch",
-                    "embedded checker response exceeds 1 MiB; retry a smaller batch",
-                ));
-            }
+            // In-process answers have no JSON transport frame. In particular,
+            // one large printed type must not fail an already prepared project.
             this.returned_batch = !this.preparing;
             Ok(result)
         })

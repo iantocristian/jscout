@@ -13,11 +13,15 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import {
+  MAX_LINE_BYTES,
+  MAX_BATCH_RESPONSE_BYTES,
   PLAN_FRAME_MAX_BYTES,
   PROTOCOL_VERSION,
   chunkPlanMemberFiles,
   createPlanMemberResultPager,
   encodeMessage,
+  parseMessage,
+  writeMessage,
   takePlanMemberResultPage,
 } from "../src/protocol.mjs";
 import { inferredOptions } from "../src/inferred-options.mjs";
@@ -36,6 +40,21 @@ function sourceHash(text) {
 function sha256(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
+
+test("accepts protocol frames through 64 MiB and rejects larger frames", () => {
+  const message = { id: "large", kind: "test", payload: "" };
+  message.payload = "x".repeat(MAX_LINE_BYTES - Buffer.byteLength(encodeMessage(message)));
+  const line = encodeMessage(message);
+  assert.equal(Buffer.byteLength(line), 64 * 1024 * 1024);
+  assert.equal(parseMessage(line).message.payload.length, message.payload.length);
+  let writtenBytes = 0;
+  const stream = { write(value) { writtenBytes = Buffer.byteLength(value); } };
+  writeMessage(stream, message);
+  assert.equal(writtenBytes, MAX_LINE_BYTES);
+  assert.equal(parseMessage(`${line} `).error.code, "oversized_line");
+  message.payload += "x";
+  assert.throws(() => writeMessage(stream, message), /exceeds 64 MiB/u);
+});
 
 test("assigns explicit compiler semantics to each inferred family", () => {
   const shared = {
@@ -288,6 +307,44 @@ test("resolves nested, this-qualified, and optional member occurrences", async (
     assert.equal(message.result.projects[0].status, "resolved");
     assert.equal(message.result.projects[0].declarations[0].file, "main.ts");
   }
+  await checker.close();
+});
+
+test("retries a batch above 16 MiB and returns answers above the old frame limit", async (context) => {
+  const typeName = `Large${"x".repeat(40_000)}`;
+  const source = `interface ${typeName} { save(): void } declare const alpha: ${typeName}; alpha.save();`;
+  const root = fixture({
+    "main.ts": source,
+    "tsconfig.json": JSON.stringify({ compilerOptions: { noLib: true }, files: ["main.ts"] }),
+  });
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const checker = client(root);
+  context.after(() => checker.child.kill());
+  await checker.request("hello");
+  const query = queryFor(source, "alpha.save()", "alpha", "save");
+  const oversized = await checker.request("resolve_members", {
+    project_id: "tsconfig.json", queries: Array(512).fill(query),
+  });
+  assert.equal(oversized.kind, "error");
+  assert.equal(oversized.error.code, "oversized_batch");
+  assert.match(oversized.error.message, /exceeds 16 MiB/u);
+  const resolved = await checker.request("resolve_members", {
+    project_id: "tsconfig.json", queries: Array(256).fill(query),
+  });
+  assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved.error));
+  const bytes = Buffer.byteLength(JSON.stringify(resolved.result));
+  assert.ok(bytes > 4 * 1024 * 1024);
+  assert.ok(bytes <= MAX_BATCH_RESPONSE_BYTES);
+  assert.equal(resolved.result.results.length, 256);
+  for (const item of resolved.result.results) {
+    assert.equal(item.answer.status, "resolved");
+    assert.equal(item.answer.receiver_type, typeName);
+    assert.equal(item.answer.declarations.length, 1);
+  }
+  const validation = await checker.request("validate_project", {
+    project_id: "tsconfig.json", fingerprint: resolved.result.checker_input_fingerprint,
+  });
+  assert.equal(validation.result.valid, true);
   await checker.close();
 });
 
