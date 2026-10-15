@@ -5,6 +5,11 @@ does not measure retrieval quality or remote model latency. The older
 `bench/bench-aipipe.py` script is a provider-dependent retrieval evaluation and
 remains a separate workload.
 
+For full index plus the **embedded TSR** checker, see the
+[native PGO/profiling recipe](../../docs/performance-pgo.md) and
+[profiling findings and build comparison](../../docs/performance-pgo-results.md).
+The enrichment arm below remains a TypeScript-sidecar workload.
+
 ## Prerequisites
 
 - Rust and Cargo versions accepted by the repository.
@@ -141,3 +146,24 @@ make that cost visible.
 Do not run the full suite as a CI performance gate. Candidate schema/index
 experiments and platform-specific profilers are diagnostic follow-ups, not
 baseline scenarios.
+
+## Local sampling summaries
+
+Summarize a saved samply capture without a symbol server or uploading data:
+
+```sh
+node bench/perf/samply-summary.mjs /path/to/capture.json.gz \
+  --process jscout --top 30 > /path/to/capture-summary.json
+```
+
+The adjacent `capture.json.syms.json` is used automatically; `--symbols FILE`
+selects another sidecar. The report separates self/inclusive attribution and
+weights stacks with available thread CPU deltas, excluding the first delta per
+thread and retaining missing-data diagnostics. Sample counts alone are not CPU
+time, inclusive rows overlap, and profiler wall times are not benchmark results.
+
+The utilities have provider-free tests (no compiler builds or training runs):
+
+```sh
+node --test bench/perf/samply-summary.test.mjs scripts/build-pgo.test.mjs
+```

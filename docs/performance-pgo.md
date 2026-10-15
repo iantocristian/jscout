@@ -53,15 +53,17 @@ project completed. Do not accept timeout/error-only training. Abruptly killed
 processes may not flush their profiles.
 
 The helper refuses nonempty raw directories when instrumenting and changed
-source/toolchain/CPU settings when optimizing. It retains `merged.profdata` and
-refuses to overwrite it; start a new campaign for retraining. Keep source and
+source/toolchain/CPU settings between any campaign stages. Baseline is optional;
+the first stage establishes the shared `build-inputs.sha256` identity atomically,
+and each stage retains its own `build-<stage>-inputs.sha256`. It retains
+`merged.profdata` and refuses to overwrite it; start a new campaign for retraining. Keep source and
 Cargo settings unchanged throughout. Raw profiles must come only from that
 campaign's instrumented binary. The explicit Cargo target applies Rust flags to
 target dependencies without instrumenting host build scripts. `llvm-profdata`
 is resolved from the active Rust sysroot, not Apple's potentially different LLVM.
 Each stage retains compiler output in `build-<stage>.log`, including failures.
 The build identity includes the C/C++ compiler paths/versions and Apple SDK
-overrides; ambient C/C++ compiler/flag overrides are rejected.
+overrides; ambient Rust/C/C++ compiler, wrapper and flag overrides are rejected.
 This is not a hermetic build: untracked, ancestor or user-global Cargo
 configuration and installed toolchain/dependency files must remain unchanged.
 
@@ -98,10 +100,12 @@ Dependency-defined Cargo release settings are ignored; the root profile controls
 TSR too. Do not use sparse profile merging: preserving zero-count functions helps
 the optimizer distinguish cold code from missing coverage.
 
-Native C caveat from the initial macOS run: `cc` 1.4.0 passed generation flags to
+Native C caveat confirmed in the final macOS run: `cc` 1.4.0 passed generation flags to
 Apple Clang 21, so SQLite objects contained profiling counters. But Apple LLVM 21
 could not read Rust LLVM 22's merged profile format. `cc` warned that inherited
-`-fprofile-use` was unsupported and omitted it for bundled C compilation. Rust
+`-fprofile-use` was unsupported and omitted it for bundled C compilation. Check
+`build-optimize/<target>/release-perf/build/*/output` as well as the main build
+log: dependency build-script warnings may be absent from Cargo's console output. Rust
 and TSR still used the profile; SQLite execution counts in `merged.profdata`
 alone do **not** establish C PGO. Optimizing C as well requires a compatible Clang
 selected consistently before a fresh baseline/instrument/train/optimize campaign.
