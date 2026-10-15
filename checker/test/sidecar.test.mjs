@@ -13,15 +13,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import {
+  MAX_LINE_BYTES,
+  MAX_BATCH_RESPONSE_BYTES,
   PLAN_FRAME_MAX_BYTES,
   PROTOCOL_VERSION,
   chunkPlanMemberFiles,
   createPlanMemberResultPager,
   encodeMessage,
+  parseMessage,
+  writeMessage,
   takePlanMemberResultPage,
 } from "../src/protocol.mjs";
 import { inferredOptions } from "../src/inferred-options.mjs";
 import { loadRuntime } from "../src/runtime.mjs";
+import { MAX_RECEIVER_TYPE_BYTES, RECEIVER_TYPE_TRUNCATION } from "../src/receiver-text.mjs";
 
 const sidecar = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/main.mjs");
 const bundledTypeScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../node_modules/typescript");
@@ -36,6 +41,21 @@ function sourceHash(text) {
 function sha256(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
+
+test("accepts protocol frames through 64 MiB and rejects larger frames", () => {
+  const message = { id: "large", kind: "test", payload: "" };
+  message.payload = "x".repeat(MAX_LINE_BYTES - Buffer.byteLength(encodeMessage(message)));
+  const line = encodeMessage(message);
+  assert.equal(Buffer.byteLength(line), 64 * 1024 * 1024);
+  assert.equal(parseMessage(line).message.payload.length, message.payload.length);
+  let writtenBytes = 0;
+  const stream = { write(value) { writtenBytes = Buffer.byteLength(value); } };
+  writeMessage(stream, message);
+  assert.equal(writtenBytes, MAX_LINE_BYTES);
+  assert.equal(parseMessage(`${line} `).error.code, "oversized_line");
+  message.payload += "x";
+  assert.throws(() => writeMessage(stream, message), /exceeds 64 MiB/u);
+});
 
 test("assigns explicit compiler semantics to each inferred family", () => {
   const shared = {
@@ -290,6 +310,48 @@ test("resolves nested, this-qualified, and optional member occurrences", async (
   }
   await checker.close();
 });
+
+for (const noErrorTruncation of [false, true]) {
+  test(`bounds large receiver descriptions with noErrorTruncation=${noErrorTruncation}`, async (context) => {
+    const typeName = `Large${"x".repeat(40_000)}`;
+    const source = `interface ${typeName} { save(): void } declare const alpha: ${typeName}; alpha.save();`;
+    const root = fixture({
+      "main.ts": source,
+      "tsconfig.json": JSON.stringify({ compilerOptions: { noLib: true, noErrorTruncation }, files: ["main.ts"] }),
+    });
+    context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const checker = client(root);
+    context.after(() => checker.child.kill());
+    await checker.request("hello");
+    const query = queryFor(source, "alpha.save()", "alpha", "save");
+    const resolved = await checker.request("resolve_members", {
+      project_id: "tsconfig.json", queries: Array(512).fill(query),
+    });
+    assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved.error));
+    const bytes = Buffer.byteLength(JSON.stringify(resolved.result));
+    if (noErrorTruncation) assert.ok(bytes > 1024 * 1024);
+    assert.ok(bytes <= MAX_BATCH_RESPONSE_BYTES);
+    assert.equal(resolved.result.results.length, 512);
+    for (const item of resolved.result.results) {
+      assert.equal(item.answer.status, "resolved");
+      const display = item.answer.receiver_type;
+      const suffix = noErrorTruncation ? RECEIVER_TYPE_TRUNCATION : "...";
+      if (noErrorTruncation) {
+        assert.equal(Buffer.byteLength(display), MAX_RECEIVER_TYPE_BYTES);
+      } else {
+        assert.ok(Buffer.byteLength(display) < MAX_RECEIVER_TYPE_BYTES);
+      }
+      assert.ok(display.endsWith(suffix));
+      assert.ok(typeName.startsWith(display.slice(0, -suffix.length)));
+      assert.equal(item.answer.declarations.length, 1);
+    }
+    const validation = await checker.request("validate_project", {
+      project_id: "tsconfig.json", fingerprint: resolved.result.checker_input_fingerprint,
+    });
+    assert.equal(validation.result.valid, true);
+    await checker.close();
+  });
+}
 
 test("plans ownership without a Program and resolves a bounded project batch", async (context) => {
   const source = [

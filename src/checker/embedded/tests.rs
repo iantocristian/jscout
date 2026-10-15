@@ -338,6 +338,125 @@ fn prepared_batches_share_one_manifest_and_deadlines_retire_loaded_programs() {
 }
 
 #[test]
+fn large_receiver_descriptions_are_bounded_before_preparation() {
+    use crate::checker::protocol::{MAX_RECEIVER_TYPE_BYTES, RECEIVER_TYPE_TRUNCATION};
+    let type_name = format!("Large{}", "x".repeat(40_000));
+    let source = format!(
+        "interface {type_name} {{ ping(): void }} declare const receiver: {type_name}; receiver.ping();"
+    );
+    for no_error_truncation in [false, true] {
+        let config = format!(
+            r#"{{"compilerOptions":{{"noLib":true,"noErrorTruncation":{no_error_truncation}}},"files":["main.ts"]}}"#
+        );
+        let directory = fixture(&[("tsconfig.json", &config), ("main.ts", &source)]);
+        let query = query(&source, "main.ts", "receiver.ping()", "receiver", "ping");
+        let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
+        checker
+            .prepare_project("tsconfig.json", &[], std::slice::from_ref(&query), TIMEOUT)
+            .unwrap();
+        let prepared = checker.prepared.as_ref().unwrap().values().next().unwrap();
+        let display = prepared.answer.receiver_type.as_ref().unwrap();
+        let suffix = if no_error_truncation {
+            // A project can still disable compiler shortening; keep our byte cap.
+            assert_eq!(display.len(), MAX_RECEIVER_TYPE_BYTES);
+            RECEIVER_TYPE_TRUNCATION
+        } else {
+            // Normal compiler shortening must happen before our storage cap.
+            assert!(display.len() < MAX_RECEIVER_TYPE_BYTES);
+            "..."
+        };
+        assert!(type_name.starts_with(display.strip_suffix(suffix).unwrap()));
+        let expected_display = display.clone();
+        let result = checker
+            .resolve_members("tsconfig.json".into(), vec![], vec![query; 128], TIMEOUT)
+            .unwrap();
+        for answer in &result.results {
+            assert_eq!(answer.answer.status, "resolved");
+            assert_eq!(answer.answer.declarations.len(), 1);
+            assert_eq!(
+                answer.answer.declarations[0].file.as_deref(),
+                Some("main.ts")
+            );
+            assert_eq!(
+                answer.answer.receiver_type.as_ref().unwrap(),
+                &expected_display
+            );
+        }
+        assert!(
+            checker
+                .validate_project(
+                    "tsconfig.json".into(),
+                    result.checker_input_fingerprint,
+                    TIMEOUT
+                )
+                .unwrap()
+                .valid
+        );
+    }
+}
+
+#[test]
+fn prepared_answers_above_former_transport_limits_remain_usable() {
+    let source = "interface A { ping(): void } declare const receiver: A; receiver.ping();";
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"include":["*.ts"]}"#,
+        ),
+        ("first.ts", source),
+        ("second.ts", source),
+    ]);
+    let queries = ["first.ts", "second.ts"]
+        .map(|file| query(source, file, "receiver.ping()", "receiver", "ping"));
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
+    checker
+        .prepare_project("tsconfig.json", &[], &queries, TIMEOUT)
+        .unwrap();
+    // Simulate a large printed type without an expensive compiler fixture.
+    // Bypass producer normalization to exercise transport independence. Exceed
+    // the former 1 MiB batch and 4 MiB frame limits with one prepared answer.
+    // Real receiver descriptions are bounded separately before preparation.
+    let large_type = "x".repeat(4 * 1024 * 1024 + 1);
+    checker
+        .prepared
+        .as_mut()
+        .unwrap()
+        .get_mut(&query_key(&queries[0]).unwrap())
+        .unwrap()
+        .answer
+        .receiver_type = Some(large_type.clone());
+    let fingerprint = checker.built.as_ref().unwrap().fingerprint.clone();
+    for batch in [
+        queries.to_vec(),
+        queries[..1].to_vec(),
+        queries[1..].to_vec(),
+    ] {
+        let result = checker
+            .resolve_members("tsconfig.json".into(), vec![], batch.clone(), TIMEOUT)
+            .unwrap();
+        assert_eq!(result.results.len(), batch.len());
+        assert_eq!(result.checker_input_fingerprint, fingerprint);
+        if batch[0].file == "first.ts" {
+            assert!(serde_json::to_vec(&result).unwrap().len() > 4 * 1024 * 1024);
+            assert_eq!(
+                result.results[0].answer.receiver_type.as_ref(),
+                Some(&large_type)
+            );
+        }
+        for answer in &result.results {
+            assert_eq!(answer.answer.status, "resolved");
+            assert_eq!(answer.answer.declarations.len(), 1);
+        }
+    }
+    assert!(
+        checker
+            .validate_project("tsconfig.json".into(), fingerprint, TIMEOUT)
+            .unwrap()
+            .valid
+    );
+}
+
+#[test]
 fn source_edits_new_inputs_and_invalid_spans_are_rejected() {
     let source = "import { A } from './service'; declare const receiver: A; receiver.ping();";
     let directory = fixture(&[
@@ -854,4 +973,59 @@ fn compiler_panics_during_a_query_still_fail_and_retire_the_project() {
     );
     assert!(checker.built.is_none());
     assert!(checker.failed_files.is_empty());
+}
+
+#[test]
+fn sidecar_compiler_cut_surrogate_survives_rust_json_decoding() {
+    // Match the existing sidecar conformance probes: Cargo-only checkouts
+    // may omit Node dependencies; CI installs them before running these tests.
+    if !Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("checker/node_modules/typescript/lib/typescript.js")
+        .is_file()
+    {
+        eprintln!("sidecar Unicode regression requires npm ci --prefix checker");
+        return;
+    }
+    let source = format!(
+        "const icons = {{ value: \"{}🚀\", save() {{}} }} as const; icons.save();",
+        "x".repeat(297)
+    );
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+        ),
+        ("main.ts", &source),
+    ]);
+    let sidecar = Path::new(env!("CARGO_MANIFEST_DIR")).join("checker/src/main.mjs");
+    let mut checker = crate::checker::process::ProcessChecker::spawn(
+        Path::new("node"),
+        &sidecar,
+        directory.path(),
+    )
+    .unwrap();
+    let query = query(&source, "main.ts", "icons.save()", "icons", "save");
+    let result = checker
+        .resolve_members("tsconfig.json".into(), vec![], vec![query], TIMEOUT)
+        .unwrap();
+    assert_eq!(result.results[0].answer.status, "resolved");
+    assert_eq!(result.results[0].answer.declarations.len(), 1);
+    assert!(
+        result.results[0]
+            .answer
+            .receiver_type
+            .as_ref()
+            .unwrap()
+            .contains("�...")
+    );
+    assert!(
+        checker
+            .validate_project(
+                "tsconfig.json".into(),
+                result.checker_input_fingerprint,
+                TIMEOUT
+            )
+            .unwrap()
+            .valid
+    );
 }

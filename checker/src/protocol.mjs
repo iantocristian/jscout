@@ -1,7 +1,8 @@
 import readline from "node:readline";
 
 export const PROTOCOL_VERSION = 4;
-export const MAX_LINE_BYTES = 4 * 1024 * 1024;
+export const MAX_LINE_BYTES = 64 * 1024 * 1024;
+export const MAX_BATCH_RESPONSE_BYTES = 16 * 1024 * 1024;
 export const PLAN_FRAME_MAX_BYTES = 1024 * 1024;
 const PLAN_PAYLOAD_BYTES = 900 * 1024;
 
@@ -16,7 +17,7 @@ export function messageBytes(message) {
 export function writeMessage(stream, message) {
   const line = encodeMessage(message);
   if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
-    throw new RangeError("checker protocol line exceeds 4 MiB");
+    throw new RangeError("checker protocol line exceeds 64 MiB");
   }
   stream.write(line);
 }
@@ -119,7 +120,7 @@ export function errorPayload(code, message) {
 
 export function parseMessage(line) {
   if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
-    return { error: errorPayload("oversized_line", "checker protocol line exceeds 4 MiB") };
+    return { error: errorPayload("oversized_line", "checker protocol line exceeds 64 MiB") };
   }
   let message;
   try {

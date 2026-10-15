@@ -300,6 +300,23 @@ also makes resumed rows comparable to a freshly checked project. Preparation
 progress is reported every 128 calls; interruptions during preparation restart
 that preparation. Completed batches and projects retain the existing resume rules.
 
+Receiver type descriptions are display metadata. Both backends allow normal
+compiler shortening instead of forcing `NoTruncation`, and additionally cap them at
+4 KiB of UTF-8, including an explicit `... [truncated]` suffix when shortened,
+before retaining answers or staging facts. Normalization repairs lone UTF-16
+surrogates from sidecar printing and rewrites absolute import path fragments even
+when compiler shortening removes their closing quote. Declaration targets and
+confidence are unchanged. A project's `noErrorTruncation` option can still disable compiler
+shortening; jscout's 4 KiB cap applies regardless. This bounds retained text,
+not all temporary compiler allocations. Checker reuse semantics are
+versioned so prior unbounded answers are recomputed on the next enrichment.
+
+Embedded answers stay in process and have no serialized response-size cap. The
+sidecar accepts answer batches up to 16 MiB and protocol frames up to 64 MiB;
+larger batches are retried with fewer queries. A single answer above the sidecar
+batch limit still fails the project. Ownership planning remains paginated in
+1 MiB frames.
+
 Directory fingerprints retain all subdirectory names and TypeScript, JavaScript,
 and JSON file names. Unrelated documents, images, and metadata do not invalidate
 checker reuse; explicitly read files and failed lookups remain tracked regardless

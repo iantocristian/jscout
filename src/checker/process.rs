@@ -19,7 +19,7 @@ use super::protocol::{
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const INTERRUPTED_EXIT_CODE: i32 = 130;
-const MAX_PROTOCOL_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROTOCOL_LINE_BYTES: usize = 64 * 1024 * 1024;
 const PLAN_FRAME_MAX_BYTES: usize = 1024 * 1024;
 // Leave ample room for the version/id/kind envelope and JSON escaping. The
 // completed frame is also measured before it is written.
@@ -1001,9 +1001,9 @@ done
     }
 
     #[test]
-    fn logical_multi_megabyte_plan_is_split_into_bounded_frames() {
-        let logical_files = (0..12_000)
-            .map(|index| format!("logical/{index:05}/{}.ts", "segment".repeat(55)))
+    fn plan_larger_than_protocol_limit_is_split_into_bounded_frames() {
+        let logical_files = (0..180)
+            .map(|index| format!("logical/{index:05}/{}.ts", "segment".repeat(55_000)))
             .collect::<Vec<_>>();
         let logical_bytes = logical_files
             .iter()

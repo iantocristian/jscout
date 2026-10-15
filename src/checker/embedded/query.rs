@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tsr_ast::{NodeId, SyntaxKind as K};
-use tsr_checker::{Operation, type_flags, type_format_flags};
+use tsr_checker::{Operation, type_flags};
 use tsr_embed::{FileCache, Program, ProgramOptions, Session};
 use tsr_jsstring::JsString;
 use tsr_printer::emit_resolver::DeclarationEmitResolver;
@@ -380,7 +380,9 @@ fn normalize_type(root: &Path, text: &str) -> Result<String, CheckerError> {
     while let Some(start) = rest.find("import(\"") {
         output.push_str(&rest[..start + 8]);
         rest = &rest[start + 8..];
-        let Some(end) = rest.find('"') else { break };
+        // Compiler shortening can cut inside an import specifier. Normalize
+        // that trailing fragment too, without inventing a closing quote.
+        let end = rest.find('"').unwrap_or(rest.len());
         let specifier = &rest[..end];
         let path = Path::new(specifier);
         if path.is_absolute() {
@@ -400,7 +402,7 @@ fn normalize_type(root: &Path, text: &str) -> Result<String, CheckerError> {
         rest = &rest[end..];
     }
     output.push_str(rest);
-    Ok(output)
+    Ok(crate::checker::protocol::bounded_receiver_type(&output))
 }
 
 impl BuiltProject {
@@ -502,7 +504,7 @@ impl BuiltProject {
                 answer.declarations = sites.into_values().collect();
                 request.diagnostics.operation("type-printing");
                 let text = op
-                    .type_to_string_at(ty, Some(receiver), type_format_flags::NO_TRUNCATION)
+                    .type_to_string_at(ty, Some(receiver), 0)
                     .map_err(compiler_error)?;
                 answer.receiver_type = Some(normalize_type(
                     root,
@@ -537,5 +539,43 @@ impl BuiltProject {
         self.inputs = self.project.host.inputs()?;
         self.fingerprint = fingerprint(&self.project, &self.inputs)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiler_cut_import_paths_are_normalized_without_closing_quotes() {
+        let root = std::env::temp_dir().join("jscout-type-normalization/repo");
+        let inside = path_text(&root.join("src/module")).unwrap();
+        let outside = path_text(&root.with_file_name("repo-other").join("module")).unwrap();
+        for (specifier, expected) in [
+            (inside.as_str(), "src/module"),
+            (outside.as_str(), "outside:module"),
+            ("relative/module", "relative/module"),
+        ] {
+            for suffix in ["...", "\"", "\").Thing"] {
+                let text = format!("import(\"{specifier}{suffix}");
+                assert_eq!(
+                    normalize_type(&root, &text).unwrap(),
+                    format!("import(\"{expected}{suffix}")
+                );
+            }
+        }
+        assert_eq!(normalize_type(&root, "import(\"").unwrap(), "import(\"");
+        let text = format!("import(\"relative\").A | import(\"{outside}...");
+        assert_eq!(
+            normalize_type(&root, &text).unwrap(),
+            "import(\"relative\").A | import(\"outside:module..."
+        );
+        // A cut before the full root is known must still hide the absolute prefix.
+        let fragment = path_text(root.parent().unwrap()).unwrap();
+        let text = format!("import(\"{fragment}...");
+        assert_eq!(
+            normalize_type(&root, &text).unwrap(),
+            "import(\"outside:jscout-type-normalization..."
+        );
     }
 }
