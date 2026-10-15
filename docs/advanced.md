@@ -300,6 +300,13 @@ also makes resumed rows comparable to a freshly checked project. Preparation
 progress is reported every 128 calls; interruptions during preparation restart
 that preparation. Completed batches and projects retain the existing resume rules.
 
+Receiver type descriptions are display metadata. Both backends cap them at
+4 KiB of UTF-8, including an explicit `... [truncated]` suffix when shortened,
+before retaining answers or staging facts. Declaration targets and confidence
+are unchanged. This bounds retained text; the compiler may still allocate a
+larger temporary string while printing the type. Checker reuse semantics are
+versioned so prior unbounded answers are recomputed on the next enrichment.
+
 Embedded answers stay in process and have no serialized response-size cap. The
 sidecar accepts answer batches up to 16 MiB and protocol frames up to 64 MiB;
 larger batches are retried with fewer queries. A single answer above the sidecar

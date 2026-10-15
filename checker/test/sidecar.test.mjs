@@ -26,6 +26,7 @@ import {
 } from "../src/protocol.mjs";
 import { inferredOptions } from "../src/inferred-options.mjs";
 import { loadRuntime } from "../src/runtime.mjs";
+import { MAX_RECEIVER_TYPE_BYTES, RECEIVER_TYPE_TRUNCATION } from "../src/receiver-text.mjs";
 
 const sidecar = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/main.mjs");
 const bundledTypeScript = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../node_modules/typescript");
@@ -310,7 +311,7 @@ test("resolves nested, this-qualified, and optional member occurrences", async (
   await checker.close();
 });
 
-test("retries a batch above 16 MiB and returns answers above the old frame limit", async (context) => {
+test("bounds large receiver descriptions without losing batch declarations", async (context) => {
   const typeName = `Large${"x".repeat(40_000)}`;
   const source = `interface ${typeName} { save(): void } declare const alpha: ${typeName}; alpha.save();`;
   const root = fixture({
@@ -322,23 +323,19 @@ test("retries a batch above 16 MiB and returns answers above the old frame limit
   context.after(() => checker.child.kill());
   await checker.request("hello");
   const query = queryFor(source, "alpha.save()", "alpha", "save");
-  const oversized = await checker.request("resolve_members", {
-    project_id: "tsconfig.json", queries: Array(512).fill(query),
-  });
-  assert.equal(oversized.kind, "error");
-  assert.equal(oversized.error.code, "oversized_batch");
-  assert.match(oversized.error.message, /exceeds 16 MiB/u);
   const resolved = await checker.request("resolve_members", {
-    project_id: "tsconfig.json", queries: Array(256).fill(query),
+    project_id: "tsconfig.json", queries: Array(512).fill(query),
   });
   assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved.error));
   const bytes = Buffer.byteLength(JSON.stringify(resolved.result));
-  assert.ok(bytes > 4 * 1024 * 1024);
+  assert.ok(bytes > 1024 * 1024);
   assert.ok(bytes <= MAX_BATCH_RESPONSE_BYTES);
-  assert.equal(resolved.result.results.length, 256);
+  assert.equal(resolved.result.results.length, 512);
   for (const item of resolved.result.results) {
     assert.equal(item.answer.status, "resolved");
-    assert.equal(item.answer.receiver_type, typeName);
+    assert.equal(Buffer.byteLength(item.answer.receiver_type), MAX_RECEIVER_TYPE_BYTES);
+    assert.ok(item.answer.receiver_type.endsWith(RECEIVER_TYPE_TRUNCATION));
+    assert.ok(typeName.startsWith(item.answer.receiver_type.slice(0, -RECEIVER_TYPE_TRUNCATION.length)));
     assert.equal(item.answer.declarations.length, 1);
   }
   const validation = await checker.request("validate_project", {

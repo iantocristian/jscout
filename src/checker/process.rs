@@ -1001,15 +1001,15 @@ done
     }
 
     #[test]
-    fn logical_multi_megabyte_plan_is_split_into_bounded_frames() {
-        let logical_files = (0..12_000)
-            .map(|index| format!("logical/{index:05}/{}.ts", "segment".repeat(55)))
+    fn plan_larger_than_protocol_limit_is_split_into_bounded_frames() {
+        let logical_files = (0..180)
+            .map(|index| format!("logical/{index:05}/{}.ts", "segment".repeat(55_000)))
             .collect::<Vec<_>>();
         let logical_bytes = logical_files
             .iter()
             .map(|file| serde_json::to_vec(file).expect("path json").len())
             .sum::<usize>();
-        assert!(logical_bytes > 4 * PLAN_FRAME_MAX_BYTES);
+        assert!(logical_bytes > MAX_PROTOCOL_LINE_BYTES);
 
         let normalized = normalize_plan_files(logical_files).expect("unique logical files");
         let chunks = chunk_plan_files(&normalized).expect("bounded chunks");

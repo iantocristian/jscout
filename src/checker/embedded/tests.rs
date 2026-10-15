@@ -338,7 +338,58 @@ fn prepared_batches_share_one_manifest_and_deadlines_retire_loaded_programs() {
 }
 
 #[test]
-fn prepared_answers_above_sidecar_frame_limit_remain_usable() {
+fn large_receiver_descriptions_are_bounded_before_preparation() {
+    use crate::checker::protocol::{MAX_RECEIVER_TYPE_BYTES, RECEIVER_TYPE_TRUNCATION};
+    let type_name = format!("Large{}", "x".repeat(40_000));
+    let source = format!(
+        "interface {type_name} {{ ping(): void }} declare const receiver: {type_name}; receiver.ping();"
+    );
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+        ),
+        ("main.ts", &source),
+    ]);
+    let query = query(&source, "main.ts", "receiver.ping()", "receiver", "ping");
+    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
+    checker
+        .prepare_project("tsconfig.json", &[], std::slice::from_ref(&query), TIMEOUT)
+        .unwrap();
+    let prepared = checker.prepared.as_ref().unwrap().values().next().unwrap();
+    let display = prepared.answer.receiver_type.as_ref().unwrap();
+    assert_eq!(display.len(), MAX_RECEIVER_TYPE_BYTES);
+    assert!(display.ends_with(RECEIVER_TYPE_TRUNCATION));
+    assert!(type_name.starts_with(display.strip_suffix(RECEIVER_TYPE_TRUNCATION).unwrap()));
+    let result = checker
+        .resolve_members("tsconfig.json".into(), vec![], vec![query; 128], TIMEOUT)
+        .unwrap();
+    for answer in &result.results {
+        assert_eq!(answer.answer.status, "resolved");
+        assert_eq!(answer.answer.declarations.len(), 1);
+        assert_eq!(
+            answer.answer.declarations[0].file.as_deref(),
+            Some("main.ts")
+        );
+        assert_eq!(
+            answer.answer.receiver_type.as_ref().unwrap().len(),
+            MAX_RECEIVER_TYPE_BYTES
+        );
+    }
+    assert!(
+        checker
+            .validate_project(
+                "tsconfig.json".into(),
+                result.checker_input_fingerprint,
+                TIMEOUT
+            )
+            .unwrap()
+            .valid
+    );
+}
+
+#[test]
+fn prepared_answers_above_former_transport_limits_remain_usable() {
     let source = "interface A { ping(): void } declare const receiver: A; receiver.ping();";
     let directory = fixture(&[
         (
@@ -355,8 +406,9 @@ fn prepared_answers_above_sidecar_frame_limit_remain_usable() {
         .prepare_project("tsconfig.json", &[], &queries, TIMEOUT)
         .unwrap();
     // Simulate a large printed type without an expensive compiler fixture.
-    // Exceed even the sidecar's 4 MiB frame limit with one prepared answer:
-    // shrinking the batch cannot help, and embedded results need no JSON frame.
+    // Bypass producer normalization to exercise transport independence. Exceed
+    // the former 1 MiB batch and 4 MiB frame limits with one prepared answer.
+    // Real receiver descriptions are bounded separately before preparation.
     let large_type = "x".repeat(4 * 1024 * 1024 + 1);
     checker
         .prepared

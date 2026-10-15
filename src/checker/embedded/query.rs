@@ -400,7 +400,7 @@ fn normalize_type(root: &Path, text: &str) -> Result<String, CheckerError> {
         rest = &rest[end..];
     }
     output.push_str(rest);
-    Ok(output)
+    Ok(crate::checker::protocol::bounded_receiver_type(&output))
 }
 
 impl BuiltProject {

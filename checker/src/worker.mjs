@@ -6,6 +6,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { loadRuntime } from "./runtime.mjs";
+import { boundedReceiverType } from "./receiver-text.mjs";
 import { MAX_BATCH_RESPONSE_BYTES, PROTOCOL_VERSION } from "./protocol.mjs";
 
 const root = fs.realpathSync(workerData.root);
@@ -70,13 +71,13 @@ function normalizeOption(value) {
 // absolute repository prefix from `import("...")` type spellings and mask
 // any other machine-absolute path.
 function normalizeTypeText(text) {
-  return text.replace(/import\("([^"]+)"\)/gu, (_, spec) => {
+  return boundedReceiverType(text.replace(/import\("([^"]+)"\)/gu, (_, spec) => {
     if (!path.isAbsolute(spec)) return `import("${spec}")`;
     if (insideRoot(spec)) {
       return `import("${path.relative(root, spec).split(path.sep).join("/")}")`;
     }
     return `import("outside:${path.basename(spec)}")`;
-  });
+  }));
 }
 
 function digestText(text) {

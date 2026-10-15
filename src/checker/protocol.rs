@@ -269,6 +269,24 @@ pub struct ResourceUsage {
     pub heap_total_bytes: u64,
 }
 
+/// Display metadata only; never retain an unbounded compiler type spelling.
+pub const MAX_RECEIVER_TYPE_BYTES: usize = 4 * 1024;
+pub const RECEIVER_TYPE_TRUNCATION: &str = "... [truncated]";
+
+pub fn bounded_receiver_type(text: &str) -> String {
+    if text.len() <= MAX_RECEIVER_TYPE_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_RECEIVER_TYPE_BYTES - RECEIVER_TYPE_TRUNCATION.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut display = String::with_capacity(MAX_RECEIVER_TYPE_BYTES);
+    display.push_str(&text[..end]);
+    display.push_str(RECEIVER_TYPE_TRUNCATION);
+    display
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProjectAnswer {
     pub project_id: String,
@@ -336,6 +354,29 @@ pub fn encode(id: &str, message: &Outbound) -> serde_json::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_display_is_bounded_by_utf8_bytes_with_an_explicit_marker() {
+        for text in [
+            String::new(),
+            "ShortType".into(),
+            "x".repeat(MAX_RECEIVER_TYPE_BYTES),
+            "😀".repeat(MAX_RECEIVER_TYPE_BYTES / 4),
+        ] {
+            assert_eq!(bounded_receiver_type(&text), text);
+        }
+        for text in [
+            "x".repeat(MAX_RECEIVER_TYPE_BYTES + 1),
+            "😀".repeat(2048),
+            format!("{}é", "x".repeat(MAX_RECEIVER_TYPE_BYTES - 1)),
+        ] {
+            let display = bounded_receiver_type(&text);
+            assert!(display.len() <= MAX_RECEIVER_TYPE_BYTES);
+            let prefix = display.strip_suffix(RECEIVER_TYPE_TRUNCATION).unwrap();
+            assert!(text.starts_with(prefix));
+            assert_eq!(bounded_receiver_type(&display), display);
+        }
+    }
 
     #[test]
     fn protocol_frames_are_versioned_and_span_bound() {

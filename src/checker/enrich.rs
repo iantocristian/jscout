@@ -16,7 +16,7 @@ use super::protocol::{
 /// Checker answer normalization and stored confidence semantics participate in
 /// both exact-plan reuse and cross-snapshot project carry. Bump this whenever
 /// the same inputs could map to different facts or confidence.
-pub(super) const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v5\0";
+pub(super) const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v6\0";
 pub(super) const PROJECT_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"jscout-checker-project-plan-v1\0";
 pub(super) const ENRICH_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"jscout-checker-plan-v5\0";
 const ABSENT_INPUT_HASH: &str = "absent:v1";
@@ -4153,7 +4153,12 @@ fn map_occurrence(
                 Some(target) => outcome.facts.push(PendingFact {
                     occurrence: occurrence.clone(),
                     project_id: answer.project_id.clone(),
-                    receiver_type: answer.receiver_type.clone(),
+                    // Also bound answers from older/custom sidecars before copying
+                    // their display metadata into each target's pending fact.
+                    receiver_type: answer
+                        .receiver_type
+                        .as_deref()
+                        .map(super::protocol::bounded_receiver_type),
                     target,
                     confidence: String::new(),
                     input_fingerprint: answer.checker_input_fingerprint.clone(),

@@ -3927,11 +3927,15 @@ fn activation_applies_the_closed_candidate_threshold_across_projects() -> Result
         )?;
         for (index, declaration) in declarations[..candidate_count].iter().enumerate() {
             let project = format!("tsconfig.{index}.json");
-            let outcome = map_occurrence(
-                &conn,
-                &occurrence,
-                &[project_answer(&project, vec![declaration.clone()])],
-            )?;
+            // Model an older/custom sidecar returning a multi-MiB display type.
+            // Only the description may change; all targets and confidence survive.
+            let mut answer = project_answer(&project, vec![declaration.clone()]);
+            answer.receiver_type = Some("😀".repeat(1024 * 1024));
+            let outcome = map_occurrence(&conn, &occurrence, &[answer])?;
+            assert!(outcome.facts.iter().all(|fact| {
+                fact.receiver_type.as_ref().unwrap().len()
+                    <= super::super::protocol::MAX_RECEIVER_TYPE_BYTES
+            }));
             stage_batch(
                 &conn,
                 batch_id,
@@ -3959,6 +3963,11 @@ fn activation_applies_the_closed_candidate_threshold_across_projects() -> Result
                 .facts_published,
             candidate_count
         );
+        let max_stored_bytes: i64 = conn.query_row(
+            "SELECT max(length(CAST(receiver_type AS BLOB))) FROM checker_enrichments WHERE batch_id=?1",
+            [batch_id], |row| row.get(0),
+        )?;
+        assert!(max_stored_bytes <= super::super::protocol::MAX_RECEIVER_TYPE_BYTES as i64);
         crate::structural::rebuild_projection(&conn, &snapshot)?;
         let mut statement = conn.prepare(
             "SELECT confidence, detail_json FROM resolved_edges
@@ -3972,6 +3981,14 @@ fn activation_applies_the_closed_candidate_threshold_across_projects() -> Result
         assert_eq!(edges.len(), candidate_count);
         for (confidence, detail) in edges {
             assert_eq!(confidence, expected);
+            let detail_value: serde_json::Value = serde_json::from_str(&detail)?;
+            let types = detail_value["receiverTypes"].as_array().unwrap();
+            assert!(!types.is_empty());
+            for value in types {
+                let display = value.as_str().unwrap();
+                assert!(display.len() <= super::super::protocol::MAX_RECEIVER_TYPE_BYTES);
+                assert!(display.ends_with(super::super::protocol::RECEIVER_TYPE_TRUNCATION));
+            }
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&detail)?["candidateCount"],
                 candidate_count
