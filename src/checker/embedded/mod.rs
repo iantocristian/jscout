@@ -131,6 +131,7 @@ impl Request {
 pub struct EmbeddedChecker {
     root: PathBuf,
     discovery: Option<projects::Discovery>,
+    planned_project: Option<Arc<projects::Project>>,
     built: Option<query::BuiltProject>,
     returned_batch: bool,
     preparing: bool,
@@ -138,6 +139,35 @@ pub struct EmbeddedChecker {
     interrupts_registered: bool,
     diagnostics: bool,
     failed_files: BTreeMap<String, RemoteError>,
+}
+
+/// Immutable configured-project seeds for one enrichment invocation. Workers
+/// fork their observations into independent live hosts before loading a program;
+/// neither a compiler session nor its mutable filesystem cache is shared.
+pub(super) struct ProjectPlan {
+    root: PathBuf,
+    projects: BTreeMap<String, Arc<projects::Project>>,
+}
+
+impl ProjectPlan {
+    pub(super) fn checker(
+        &self,
+        project_id: &str,
+        diagnostics: bool,
+    ) -> Result<EmbeddedChecker, CheckerError> {
+        let mut checker = EmbeddedChecker::new(&self.root, diagnostics)?;
+        if !project_id.starts_with("inferred:") {
+            checker.planned_project = Some(
+                self.projects
+                    .get(project_id)
+                    .ok_or_else(|| {
+                        error("project_not_found", "project missing from admitted plan")
+                    })?
+                    .clone(),
+            );
+        }
+        Ok(checker)
+    }
 }
 
 impl EmbeddedChecker {
@@ -149,6 +179,7 @@ impl EmbeddedChecker {
         Ok(Self {
             root,
             discovery: None,
+            planned_project: None,
             built: None,
             returned_batch: false,
             preparing: false,
@@ -156,6 +187,19 @@ impl EmbeddedChecker {
             interrupts_registered: false,
             diagnostics,
             failed_files: BTreeMap::new(),
+        })
+    }
+
+    pub(super) fn take_project_plan(&mut self) -> Option<ProjectPlan> {
+        let discovery = self.discovery.take()?;
+        Some(ProjectPlan {
+            root: self.root.clone(),
+            projects: discovery
+                .projects
+                .into_iter()
+                .filter(|(id, _)| !id.starts_with("inferred:"))
+                .map(|(id, project)| (id, Arc::new(project)))
+                .collect(),
         })
     }
 
@@ -200,6 +244,7 @@ impl EmbeddedChecker {
                 built.session.retire();
             }
             self.discovery = None;
+            self.planned_project = None;
             self.returned_batch = false;
             self.prepared = None;
             self.failed_files.clear();
@@ -350,6 +395,14 @@ impl EmbeddedChecker {
                         project_files,
                         request,
                     )?
+                } else if let Some(project) = this.planned_project.take() {
+                    if project.summary.project_id != project_id {
+                        return Err(error(
+                            "project_mismatch",
+                            "project differs from admitted plan",
+                        ));
+                    }
+                    project.fork(request)?
                 } else {
                     let mut discovery = projects::discover(&this.root, request)?;
                     discovery.projects.remove(&project_id).ok_or_else(|| {

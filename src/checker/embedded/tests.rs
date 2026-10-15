@@ -252,6 +252,316 @@ fn ownership_honors_extends_and_tooling_without_building_programs() {
     );
 }
 
+fn invocation_plan(root: &Path, files: &[&str]) -> ProjectPlan {
+    let mut planner = EmbeddedChecker::new(root, false).unwrap();
+    planner
+        .plan_members(
+            files.iter().map(|file| (*file).into()).collect(),
+            TIMEOUT,
+            true,
+        )
+        .unwrap();
+    assert!(planner.built.is_none());
+    let plan = planner.take_project_plan().unwrap();
+    assert!(planner.take_project_plan().is_none());
+    plan
+}
+
+fn resolve_with_validation(
+    checker: &mut EmbeddedChecker,
+    project: &str,
+    query: MemberQuery,
+) -> (MemberBatchResult, ProjectValidationResult) {
+    let result = checker
+        .resolve_members(project.into(), vec![], vec![query], TIMEOUT)
+        .unwrap();
+    assert_eq!(result.results[0].answer.status, "resolved");
+    assert_eq!(result.results[0].answer.declarations.len(), 1);
+    let validation = checker
+        .validate_project(
+            project.into(),
+            result.checker_input_fingerprint.clone(),
+            TIMEOUT,
+        )
+        .unwrap();
+    assert!(validation.valid);
+    (result, validation)
+}
+
+fn checked_snapshot(
+    (result, validation): (MemberBatchResult, ProjectValidationResult),
+) -> serde_json::Value {
+    let inputs = validation
+        .inputs
+        .into_iter()
+        .map(|input| (input.path, input.source_hash))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "result": result,
+        "validation": (validation.project_id, validation.fingerprint, validation.valid, inputs),
+    })
+}
+
+#[test]
+fn invocation_plan_workers_and_retries_match_fresh_results_and_manifests() {
+    let source = "import { A } from './service'; declare const receiver: A; receiver.ping();";
+    let directory = fixture(&[
+        (
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"noLib":true,"strict":true}}"#,
+        ),
+        (
+            "first/tsconfig.json",
+            r#"{"extends":"../tsconfig.base.json","files":["main.ts"]}"#,
+        ),
+        (
+            "second/tsconfig.json",
+            r#"{"extends":"../tsconfig.base.json","files":["main.ts"]}"#,
+        ),
+        ("first/main.ts", source),
+        ("second/main.ts", source),
+        ("first/service.ts", "export interface A { ping(): void }"),
+        ("second/service.ts", "export interface A { ping(): number }"),
+    ]);
+    let cases = [
+        ("first/tsconfig.json", "first/main.ts"),
+        ("second/tsconfig.json", "second/main.ts"),
+    ];
+    let plan = invocation_plan(directory.path(), &["first/main.ts", "second/main.ts"]);
+    let seed_inputs = || {
+        plan.projects
+            .iter()
+            .map(|(id, project)| {
+                (
+                    id.clone(),
+                    project
+                        .host
+                        .inputs()
+                        .unwrap()
+                        .into_iter()
+                        .map(|input| (input.path, input.source_hash))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = seed_inputs();
+    let expected = cases
+        .iter()
+        .map(|(project, file)| {
+            let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
+            checked_snapshot(resolve_with_validation(
+                &mut checker,
+                project,
+                query(source, file, "receiver.ping()", "receiver", "ping"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let ready = std::sync::Barrier::new(cases.len());
+    let actual = std::thread::scope(|scope| {
+        let workers = cases
+            .iter()
+            .map(|(project, file)| {
+                let plan = &plan;
+                let ready = &ready;
+                scope.spawn(move || {
+                    let query = query(source, file, "receiver.ping()", "receiver", "ping");
+                    let mut checker = plan.checker(project, false).unwrap();
+                    ready.wait();
+                    if *project == "first/tsconfig.json" {
+                        assert!(matches!(
+                            checker.resolve_members(
+                                (*project).into(),
+                                vec![],
+                                vec![query.clone()],
+                                Duration::ZERO,
+                            ),
+                            Err(CheckerError::Timeout(_))
+                        ));
+                        // A failed worker must not poison the admitted seed or
+                        // the concurrently loading project. Retry from the plan.
+                        checker = plan.checker(project, false).unwrap();
+                    }
+                    let result = checked_snapshot(resolve_with_validation(
+                        &mut checker,
+                        project,
+                        query.clone(),
+                    ));
+                    assert!(!Arc::ptr_eq(
+                        &checker.built.as_ref().unwrap().project.host,
+                        &plan.projects[*project].host,
+                    ));
+                    let mut retry = plan.checker(project, false).unwrap();
+                    assert_eq!(
+                        result,
+                        checked_snapshot(resolve_with_validation(&mut retry, project, query)),
+                    );
+                    result
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(actual, expected);
+    assert_eq!(
+        seed_inputs(),
+        before,
+        "loading must not mutate the shared plan"
+    );
+}
+
+#[test]
+fn invocation_plan_does_not_admit_a_later_configured_project() {
+    let source = "export interface A { ping(): void } declare const receiver: A; receiver.ping();";
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+        ),
+        ("main.ts", source),
+        ("later/main.ts", source),
+    ]);
+    let plan = invocation_plan(directory.path(), &["main.ts"]);
+    fs::write(
+        directory.path().join("later/tsconfig.json"),
+        r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        plan.checker("later/tsconfig.json", false),
+        Err(CheckerError::Remote { code, .. }) if code == "project_not_found"
+    ));
+    resolve_with_validation(
+        &mut plan.checker("tsconfig.json", false).unwrap(),
+        "tsconfig.json",
+        query(source, "main.ts", "receiver.ping()", "receiver", "ping"),
+    );
+    // Independent discovery sees the new project; the invocation plan does not.
+    resolve_with_validation(
+        &mut EmbeddedChecker::new(directory.path(), false).unwrap(),
+        "later/tsconfig.json",
+        query(
+            source,
+            "later/main.ts",
+            "receiver.ping()",
+            "receiver",
+            "ping",
+        ),
+    );
+}
+
+#[test]
+fn invocation_plan_rejects_config_extends_and_membership_changes_before_loading() {
+    let source = "export interface A { ping(): void } declare const receiver: A; receiver.ping();";
+    for (path, replacement) in [
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"files":[]}"#,
+        ),
+        (
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"noLib":true,"strict":true}}"#,
+        ),
+        ("src/added.ts", "export const added = 1;"),
+    ] {
+        let directory = fixture(&[
+            (
+                "tsconfig.base.json",
+                r#"{"compilerOptions":{"noLib":true}}"#,
+            ),
+            (
+                "tsconfig.json",
+                r#"{"extends":"./tsconfig.base.json","include":["src/*.ts"]}"#,
+            ),
+            ("src/main.ts", source),
+        ]);
+        let plan = invocation_plan(directory.path(), &["src/main.ts"]);
+        fs::write(directory.path().join(path), replacement).unwrap();
+        let mut checker = plan.checker("tsconfig.json", false).unwrap();
+        let result = checker.resolve_members(
+            "tsconfig.json".into(),
+            vec![],
+            vec![query(
+                source,
+                "src/main.ts",
+                "receiver.ping()",
+                "receiver",
+                "ping",
+            )],
+            TIMEOUT,
+        );
+        assert!(
+            matches!(&result, Err(CheckerError::Remote { code, .. }) if code == "checker_input_changed"),
+            "{path}: {result:?}"
+        );
+        assert!(checker.built.is_none(), "{path}");
+    }
+}
+
+#[test]
+fn invocation_plan_loads_dependencies_live_and_validates_them_after_loading() {
+    let source = "import { A } from './service'; declare const receiver: A; receiver.ping();";
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+        ),
+        ("main.ts", source),
+        ("service.ts", "export interface A { ping(): void }"),
+    ]);
+    let plan = invocation_plan(directory.path(), &["main.ts"]);
+    let dependency =
+        path_text(&fs::canonicalize(directory.path().join("service.ts")).unwrap()).unwrap();
+    assert!(
+        plan.projects["tsconfig.json"]
+            .host
+            .inputs()
+            .unwrap()
+            .iter()
+            .all(|input| input.path != dependency)
+    );
+    let query = query(source, "main.ts", "receiver.ping()", "receiver", "ping");
+    let mut first = plan.checker("tsconfig.json", false).unwrap();
+    let (original, validation) =
+        resolve_with_validation(&mut first, "tsconfig.json", query.clone());
+    assert!(
+        validation
+            .inputs
+            .iter()
+            .any(|input| input.path == dependency)
+    );
+    fs::write(
+        directory.path().join("service.ts"),
+        "export interface A { ping(): number }",
+    )
+    .unwrap();
+    assert!(
+        !first
+            .validate_project(
+                "tsconfig.json".into(),
+                original.checker_input_fingerprint.clone(),
+                TIMEOUT
+            )
+            .unwrap()
+            .valid
+    );
+    let mut second = plan.checker("tsconfig.json", false).unwrap();
+    let (updated, _) = resolve_with_validation(&mut second, "tsconfig.json", query.clone());
+    assert_ne!(
+        updated.checker_input_fingerprint,
+        original.checker_input_fingerprint
+    );
+    let mut fresh = EmbeddedChecker::new(directory.path(), false).unwrap();
+    let (expected, _) = resolve_with_validation(&mut fresh, "tsconfig.json", query);
+    assert_eq!(
+        serde_json::to_value(updated).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+}
+
 #[test]
 fn malformed_configs_are_reported_and_orphans_are_bounded() {
     let directory = fixture(&[

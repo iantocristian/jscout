@@ -96,6 +96,93 @@ fn dirty_checker_inventory_excludes_ineligible_formats_and_documentation() -> Re
 }
 
 #[test]
+fn package_gate_revalidation_rediscovers_unselected_configured_ownership() -> Result<()> {
+    // Gate revalidation registers the checker's process-wide Ctrl-C handler.
+    // Keep it separate from gateway tests registering their own handler.
+    const CHILD: &str = "JSCOUT_TEST_TSR_PACKAGE_GATE_CHILD";
+    const TEST: &str = "checker::enrich::tests::package_gate_revalidation_rediscovers_unselected_configured_ownership";
+    if std::env::var(CHILD).as_deref() != Ok(TEST) {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([TEST, "--exact", "--nocapture"])
+            .env(CHILD, TEST)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    for create_project in [false, true] {
+        let repo = tempfile::tempdir()?;
+        let root = fs::canonicalize(repo.path())?;
+        fs::write(root.join("package.json"), r#"{"name":"gate-regression"}"#)?;
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+        )?;
+        fs::write(root.join("unselected.ts"), "export const unselected = 1;")?;
+        fs::write(root.join("other.ts"), "export const other = 1;")?;
+        if !create_project {
+            fs::write(
+                root.join("tsconfig.additional.json"),
+                r#"{"compilerOptions":{"noLib":true},"files":["other.ts"]}"#,
+            )?;
+        }
+        let (conn, _) = indexed(
+            &root,
+            "export class CardTable { insert(): void {} }\n\
+             const card = new CardTable(); card.insert();\n",
+        )?;
+        let occurrences = load_occurrences(&conn)?;
+        assert!(!occurrences.is_empty());
+        assert!(
+            occurrences
+                .iter()
+                .all(|occurrence| occurrence.file == "main.ts")
+        );
+        let options = EnrichOptions {
+            backend: crate::checker::Backend::Tsr { diagnostics: false },
+            timeout: Duration::from_secs(60),
+            ..options()
+        };
+        let inventory = super::super::package_gate::inventory_paths(&conn)?;
+        assert_eq!(inventory, ["main.ts", "other.ts", "unselected.ts"]);
+        let mut planner =
+            crate::checker::launch(&root, None, None, "/missing-node", options.backend)?;
+        let protocol = planner.protocol_version();
+        let (ownership, identity) =
+            plan_inventory_ownership(&mut planner, &inventory, options.timeout)?;
+        let gate =
+            super::super::package_gate::evaluate(&root, &conn, &ownership, options.include_all)?;
+        drop(planner);
+        revalidate_package_gate(
+            &root, &conn, &inventory, &gate, &identity, protocol, &options,
+        )?;
+
+        // The selected project's configuration and all source files stay fixed.
+        // Only a non-selected file acquires another configured owner.
+        fs::write(
+            root.join("tsconfig.additional.json"),
+            r#"{"compilerOptions":{"noLib":true},"files":["other.ts","unselected.ts"]}"#,
+        )?;
+        gate.validate_fresh()?; // Package-manifest observations cannot catch this.
+        let error = revalidate_package_gate(
+            &root, &conn, &inventory, &gate, &identity, protocol, &options,
+        )
+        .expect_err("activation must freshly discover ownership outside selected projects");
+        assert!(
+            error
+                .to_string()
+                .contains("package ownership policy changed"),
+            "new project={create_project}: {error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn occurrence_loading_excludes_checker_ineligible_code_formats() -> Result<()> {
     let repo = tempfile::tempdir()?;
     let conn = crate::store::open(repo.path())?;
@@ -416,6 +503,7 @@ fn execute_with_fake(
     let result = execute_project(
         root,
         &execution_options,
+        None,
         conn,
         batch_id,
         project_id,

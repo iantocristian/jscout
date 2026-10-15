@@ -611,6 +611,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
     {
         bail!("checker identity changed during final package ownership planning");
     }
+    let prepared_projects = planner.take_project_plan();
     drop(planner);
     let returned_files = ownership
         .files
@@ -988,6 +989,7 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
                 execute_project(
                     &canonical_root,
                     options,
+                    prepared_projects.as_ref(),
                     &worker,
                     batch_id,
                     job.project_id,
@@ -1099,6 +1101,9 @@ pub fn enrich(root: &Path, options: &EnrichOptions<'_>) -> Result<EnrichReport> 
             Ok(())
         },
     )?;
+    // Release parsed configurations and discovery's filesystem cache before
+    // the independent, fresh package-policy inventory below.
+    drop(prepared_projects);
 
     if super::process::cancellation_pending() {
         bail!("checker enrichment interrupted before activation; staged work retained");
@@ -3128,6 +3133,7 @@ struct ProjectMetrics {
 fn execute_project(
     root: &Path,
     options: &EnrichOptions<'_>,
+    prepared_projects: Option<&super::embedded::ProjectPlan>,
     conn: &Connection,
     batch_id: i64,
     project_id: &str,
@@ -3166,6 +3172,7 @@ fn execute_project(
         let mut execution = execute_project(
             root,
             options,
+            prepared_projects,
             conn,
             batch_id,
             project_id,
@@ -3187,7 +3194,12 @@ fn execute_project(
         return Ok(execution);
     }
     crate::progress::stage(format!("starting checker project {project_id}"), None);
-    let mut checker = super::launch(root, options.sidecar, None, options.node, options.backend)?;
+    let mut checker = match (options.backend, prepared_projects) {
+        (super::Backend::Tsr { diagnostics }, Some(plan)) => {
+            super::Checker::Tsr(Box::new(plan.checker(project_id, diagnostics)?))
+        }
+        _ => super::launch(root, options.sidecar, None, options.node, options.backend)?,
+    };
     if register_interrupts {
         checker
             .register_interrupts()
@@ -3311,6 +3323,7 @@ fn execute_project(
                     let mut execution = execute_project(
                         root,
                         options,
+                        prepared_projects,
                         conn,
                         batch_id,
                         project_id,

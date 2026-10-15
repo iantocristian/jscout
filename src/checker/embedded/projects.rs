@@ -23,6 +23,17 @@ pub struct Project {
     pub roots: BTreeSet<PathBuf>,
 }
 
+impl Project {
+    pub fn fork(&self, request: &Arc<Request>) -> Result<Self, CheckerError> {
+        Ok(Self {
+            summary: self.summary.clone(),
+            config: self.config.clone(),
+            host: Arc::new(self.host.fork(request)?),
+            roots: self.roots.clone(),
+        })
+    }
+}
+
 pub struct Discovery {
     pub projects: BTreeMap<String, Project>,
     pub owners: BTreeMap<PathBuf, Vec<String>>,
