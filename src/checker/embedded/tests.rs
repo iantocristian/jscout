@@ -974,3 +974,58 @@ fn compiler_panics_during_a_query_still_fail_and_retire_the_project() {
     assert!(checker.built.is_none());
     assert!(checker.failed_files.is_empty());
 }
+
+#[test]
+fn sidecar_compiler_cut_surrogate_survives_rust_json_decoding() {
+    // Match the existing sidecar conformance probes: Cargo-only checkouts
+    // may omit Node dependencies; CI installs them before running these tests.
+    if !Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("checker/node_modules/typescript/lib/typescript.js")
+        .is_file()
+    {
+        eprintln!("sidecar Unicode regression requires npm ci --prefix checker");
+        return;
+    }
+    let source = format!(
+        "const icons = {{ value: \"{}🚀\", save() {{}} }} as const; icons.save();",
+        "x".repeat(297)
+    );
+    let directory = fixture(&[
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
+        ),
+        ("main.ts", &source),
+    ]);
+    let sidecar = Path::new(env!("CARGO_MANIFEST_DIR")).join("checker/src/main.mjs");
+    let mut checker = crate::checker::process::ProcessChecker::spawn(
+        Path::new("node"),
+        &sidecar,
+        directory.path(),
+    )
+    .unwrap();
+    let query = query(&source, "main.ts", "icons.save()", "icons", "save");
+    let result = checker
+        .resolve_members("tsconfig.json".into(), vec![], vec![query], TIMEOUT)
+        .unwrap();
+    assert_eq!(result.results[0].answer.status, "resolved");
+    assert_eq!(result.results[0].answer.declarations.len(), 1);
+    assert!(
+        result.results[0]
+            .answer
+            .receiver_type
+            .as_ref()
+            .unwrap()
+            .contains("�...")
+    );
+    assert!(
+        checker
+            .validate_project(
+                "tsconfig.json".into(),
+                result.checker_input_fingerprint,
+                TIMEOUT
+            )
+            .unwrap()
+            .valid
+    );
+}

@@ -16,7 +16,7 @@ use super::protocol::{
 /// Checker answer normalization and stored confidence semantics participate in
 /// both exact-plan reuse and cross-snapshot project carry. Bump this whenever
 /// the same inputs could map to different facts or confidence.
-pub(super) const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v7\0";
+pub(super) const CHECKER_SEMANTICS_FINGERPRINT: &[u8] = b"jscout-checker-semantics-v8\0";
 pub(super) const PROJECT_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"jscout-checker-project-plan-v1\0";
 pub(super) const ENRICH_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"jscout-checker-plan-v5\0";
 const ABSENT_INPUT_HASH: &str = "absent:v1";

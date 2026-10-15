@@ -303,8 +303,10 @@ that preparation. Completed batches and projects retain the existing resume rule
 Receiver type descriptions are display metadata. Both backends allow normal
 compiler shortening instead of forcing `NoTruncation`, and additionally cap them at
 4 KiB of UTF-8, including an explicit `... [truncated]` suffix when shortened,
-before retaining answers or staging facts. Declaration targets and confidence
-are unchanged. A project's `noErrorTruncation` option can still disable compiler
+before retaining answers or staging facts. Normalization repairs lone UTF-16
+surrogates from sidecar printing and rewrites absolute import path fragments even
+when compiler shortening removes their closing quote. Declaration targets and
+confidence are unchanged. A project's `noErrorTruncation` option can still disable compiler
 shortening; jscout's 4 KiB cap applies regardless. This bounds retained text,
 not all temporary compiler allocations. Checker reuse semantics are
 versioned so prior unbounded answers are recomputed on the next enrichment.
