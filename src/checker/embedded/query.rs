@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use tsr_ast::{NodeId, SyntaxKind as K};
 use tsr_checker::{Operation, type_flags};
-use tsr_embed::{FileCache, Program, ProgramOptions, Session};
+use tsr_compiler::CompilerCheckerPool;
+use tsr_embed::{FileCache, Program, ProgramOptions};
 use tsr_jsstring::JsString;
 use tsr_printer::emit_resolver::DeclarationEmitResolver;
 use tsr_vfs::FileSystem;
@@ -20,9 +21,13 @@ use crate::checker::protocol::{
 type Spans = [i64; 6];
 type Calls = HashMap<Spans, (NodeId, NodeId)>;
 
+mod parallel;
+
 pub struct BuiltProject {
     pub project: Project,
-    pub session: Session,
+    program: Arc<Program>,
+    pool: CompilerCheckerPool,
+    checker_indices: HashMap<NodeId, usize>,
     pub fingerprint: String,
     pub inputs: Vec<CheckerInputFile>,
     calls: HashMap<PathBuf, Calls>,
@@ -35,6 +40,7 @@ fn compiler_error(error: impl std::fmt::Display) -> CheckerError {
 pub fn build(
     root: &Path,
     project: Project,
+    checkers: usize,
     request: &Arc<Request>,
 ) -> Result<BuiltProject, CheckerError> {
     request
@@ -43,27 +49,46 @@ pub fn build(
     request.check()?;
     project.host.set_request(request.clone());
     let counters = tsr_arena::Counters::new();
+    // Scheduling is invocation-local, not part of the repository's compiler
+    // configuration or semantic input fingerprint.
+    let mut config = project.config.clone();
+    config.options.checkers = Some(checkers as isize);
     let program = Program::load_live(
         ProgramOptions {
-            config: project.config.clone(),
+            config,
             host: project.host.clone(),
             current_directory: JsString::from_bytes(path_text(root)?.as_bytes()),
             default_library_path: JsString::from_bytes(tsr_bundled::LIB_PATH),
             skip_module_resolution: false,
-            single_threaded: tsr_core::Tristate::TRUE,
+            single_threaded: if checkers == 1 {
+                tsr_core::Tristate::TRUE
+            } else {
+                tsr_core::Tristate::FALSE
+            },
         },
         &mut FileCache::new(),
         &counters,
     )
     .map_err(compiler_error)?;
     request.check()?;
-    let session = Session::from_program(Arc::new(program), &counters);
+    let program = Arc::new(program);
+    let pool = CompilerCheckerPool::new(program.clone(), &counters);
     request.diagnostics.operation("checker-initialize");
-    session.checker().map_err(compiler_error)?;
+    let checker_indices = program
+        .files()
+        .iter()
+        .zip(
+            &pool
+                .association_plan()
+                .map_err(compiler_error)?
+                .associations,
+        )
+        .map(|(file, &checker)| (file.source(), checker))
+        .collect();
     // Declaration paths are part of the answer. Observe their symlinks before
     // the first batch so later queries cannot expand the input identity.
     request.diagnostics.operation("declaration-source-paths");
-    for file in session.program().files() {
+    for file in program.files() {
         request.check()?;
         let source = file.bound().view().source_file().map_err(compiler_error)?;
         if !tsr_bundled::is_bundled(source.file_name()) {
@@ -79,7 +104,9 @@ pub fn build(
     let fingerprint = fingerprint(&project, &inputs)?;
     Ok(BuiltProject {
         project,
-        session,
+        program,
+        pool,
+        checker_indices,
         inputs,
         fingerprint,
         calls: HashMap::new(),
@@ -311,8 +338,7 @@ fn declaration(
         source = parent;
     }
     let file = built
-        .session
-        .program()
+        .program
         .files()
         .iter()
         .find(|file| file.source() == source)
@@ -406,11 +432,12 @@ fn normalize_type(root: &Path, text: &str) -> Result<String, CheckerError> {
 }
 
 impl BuiltProject {
-    pub fn resolve(
-        &mut self,
+    fn resolve(
+        &self,
         root: &Path,
         query: &MemberQuery,
         request: &Request,
+        op: &mut Operation<'_>,
     ) -> Result<MemberProjectResult, CheckerError> {
         request.diagnostics.query(query, "validate-source");
         request.check()?;
@@ -444,33 +471,19 @@ impl BuiltProject {
         };
         {
             request.diagnostics.operation("call-lookup");
-            let file = self
-                .session
-                .program()
-                .source_file(path_text(&path)?.as_bytes())
+            let &(call, member) = self
+                .calls
+                .get(&path)
+                .and_then(|calls| calls.get(&spans))
                 .ok_or_else(|| {
                     error(
-                        "project_mismatch",
-                        "owned query source is absent from the compiler program",
+                        "span_mismatch",
+                        format!(
+                            "exact indexed member-call occurrence not found: {}",
+                            query.file
+                        ),
                     )
                 })?;
-            if !self.calls.contains_key(&path) {
-                self.calls.insert(
-                    path.clone(),
-                    calls(file, &self.project.host, &path, request)?,
-                );
-            }
-            let &(call, member) = self.calls[&path].get(&spans).ok_or_else(|| {
-                error(
-                    "span_mismatch",
-                    format!(
-                        "exact indexed member-call occurrence not found: {}",
-                        query.file
-                    ),
-                )
-            })?;
-            request.diagnostics.operation("checker-operation");
-            let mut op = self.session.operation().map_err(compiler_error)?;
             request.diagnostics.operation("receiver-node");
             let receiver = op
                 .node(member)
@@ -485,11 +498,11 @@ impl BuiltProject {
             request.diagnostics.operation("receiver-type-flags");
             if op.type_flags(ty).map_err(compiler_error)? & type_flags::ANY_OR_UNKNOWN == 0 {
                 request.diagnostics.operation("declaration-resolution");
-                let nodes = declarations(&mut op, ty, member, call)?;
+                let nodes = declarations(op, ty, member, call)?;
                 request.diagnostics.operation("declaration-site");
                 let mut sites = BTreeMap::new();
                 for node in nodes {
-                    let site = declaration(root, self, &op, node)?;
+                    let site = declaration(root, self, op, node)?;
                     sites.insert(
                         (
                             site.file.clone(),
@@ -523,15 +536,18 @@ impl BuiltProject {
         })
     }
 
-    pub fn restart_checker(&mut self, request: &Request) -> Result<(), CheckerError> {
+    pub fn retire(&self) {
+        self.pool.generation().retire();
+    }
+
+    fn restart_checker(&mut self, request: &Request) -> Result<(), CheckerError> {
         request
             .diagnostics
             .project(&self.project.summary.project_id, "checker-recovery");
         request.check()?;
-        let program = Arc::clone(self.session.program());
-        self.session.retire();
-        self.session = Session::from_program(program, &tsr_arena::Counters::new());
-        self.session.checker().map_err(compiler_error)?;
+        self.retire();
+        self.pool = CompilerCheckerPool::new(self.program.clone(), &tsr_arena::Counters::new());
+        self.pool.checkers().map_err(compiler_error)?;
         request.check()
     }
 

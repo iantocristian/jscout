@@ -15,6 +15,7 @@ pub enum Backend {
     TypeScript,
     Tsr {
         diagnostics: bool,
+        checkers: usize,
     },
 }
 
@@ -25,6 +26,13 @@ impl Backend {
             Self::Tsr { .. } => "tsr-embedded",
         }
     }
+
+    pub const fn checkers_per_project(self) -> usize {
+        match self {
+            Self::TypeScript => 1,
+            Self::Tsr { checkers, .. } => checkers,
+        }
+    }
 }
 
 pub enum Checker {
@@ -33,11 +41,10 @@ pub enum Checker {
 }
 
 impl Checker {
-    pub fn embedded(root: &Path, diagnostics: bool) -> Result<Self, CheckerError> {
-        Ok(Self::Tsr(Box::new(EmbeddedChecker::new(
-            root,
-            diagnostics,
-        )?)))
+    pub fn embedded(root: &Path, diagnostics: bool, checkers: usize) -> Result<Self, CheckerError> {
+        let mut checker = EmbeddedChecker::new(root, diagnostics)?;
+        checker.configure_checkers(checkers)?;
+        Ok(Self::Tsr(Box::new(checker)))
     }
 
     pub fn protocol_version(&self) -> u32 {

@@ -209,7 +209,18 @@ and `maxTokens` are accepted; prefer the snake_case TOML names above.
 | Key | Default | Meaning and constraints |
 | --- | --- | --- |
 | `checker.jobs` | `1` | Limit of 1–16 concurrent checker projects for `enrich` and `watch --enrich`. `--checker-jobs N` overrides it. More workers use more memory; restart watch after changes. |
+| `checker.checkers_per_project` | `1` | Maximum query checkers per active embedded TSR project, 1–16. `--checkers-per-project N` overrides it. Ignored by the TypeScript sidecar; restart watch after changes. |
 | `experimental.tsr` | `false` | Use the embedded TSR compiler for `enrich`, `checker doctor`, `watch --enrich`, and `scout repository` checker inventory. Compiler and standard libraries are linked into the binary; checker execution needs no Node or sidecar. Deadlines are cooperative. |
+
+These are independent controls: `jobs = 2` and `checkers_per_project = 4` allow up
+to eight query checkers across two projects. Each project's effective pool is
+further capped by distinct selected files in its first preparation batch. Queries
+from one file stay on one checker, so a single selected file remains serial.
+Checkers share the program but retain independent semantic caches, increasing memory use.
+An effective pool above one also enables parallel loading, whose worker bound is
+`max(4, available CPUs)` per project, independent of the query-checker limit.
+Neither setting is a process-wide thread cap. Leave both at `1` for serial project
+and query execution; changing either alone does not invalidate reusable checker results.
 
 To enable it for this repository:
 

@@ -143,7 +143,10 @@ fn package_gate_revalidation_rediscovers_unselected_configured_ownership() -> Re
                 .all(|occurrence| occurrence.file == "main.ts")
         );
         let options = EnrichOptions {
-            backend: crate::checker::Backend::Tsr { diagnostics: false },
+            backend: crate::checker::Backend::Tsr {
+                diagnostics: false,
+                checkers: 1,
+            },
             timeout: Duration::from_secs(60),
             ..options()
         };
@@ -4476,20 +4479,26 @@ fn configured_tsr_failure_publishes_healthy_facts_and_invalidates_failed_resumed
     // Full enrichment installs a process-wide Ctrl-C handler. Isolate this
     // test from gateway tests that install their own handler in the parent.
     const CHILD: &str = "JSCOUT_TEST_TSR_FILE_FAILURE_CHILD";
+    const CHECKERS: &str = "JSCOUT_TEST_TSR_FILE_FAILURE_CHECKERS";
     const TEST: &str = "checker::enrich::tests::configured_tsr_failure_publishes_healthy_facts_and_invalidates_failed_resumed_files";
     if std::env::var(CHILD).as_deref() != Ok(TEST) {
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([TEST, "--exact", "--nocapture"])
-            .env(CHILD, TEST)
-            .output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed; 0 failed"),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        for checkers in [1, 2] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([TEST, "--exact", "--nocapture"])
+                .env(CHILD, TEST)
+                .env(CHECKERS, checkers.to_string())
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "{checkers} checkers: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         return Ok(());
     }
+    let checkers: usize = std::env::var(CHECKERS)?.parse()?;
+    assert!([1, 2].contains(&checkers));
     let repo = tempfile::tempdir()?;
     fs::write(
         repo.path().join("tsconfig.json"),
@@ -4501,7 +4510,10 @@ fn configured_tsr_failure_publishes_healthy_facts_and_invalidates_failed_resumed
     let conn = crate::store::open(repo.path())?;
     crate::indexer::index_repo(repo.path(), &conn)?;
     let options = EnrichOptions {
-        backend: crate::checker::Backend::Tsr { diagnostics: false },
+        backend: crate::checker::Backend::Tsr {
+            diagnostics: false,
+            checkers,
+        },
         timeout: Duration::from_secs(60),
         include_all: true,
         ..options()

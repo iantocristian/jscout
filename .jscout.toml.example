@@ -13,6 +13,12 @@ tsr = false
 # Accepted range: 1–16. Restart watch after changing this setting; --checker-jobs overrides it.
 [checker]
 jobs = 1
+# Maximum embedded TSR query checkers per project (1–16); ignored by the TypeScript sidecar.
+# --checkers-per-project overrides it. Restart watch after changes.
+# Capped by distinct selected files in the first preparation batch; one file stays serial.
+# An effective pool above 1 enables loader threads bounded by max(4, available CPUs),
+# independently of this limit. jobs × checkers_per_project bounds only query checkers.
+checkers_per_project = 1
 
 [database]
 path = ".jscout.db"

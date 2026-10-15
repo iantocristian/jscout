@@ -57,6 +57,7 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct CheckerFileConfig {
     jobs: Option<usize>,
+    checkers_per_project: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1053,8 +1054,15 @@ impl RuntimeConfig {
         };
         let checker = CheckerSettings {
             jobs: resolver.configured_or("checker.jobs", raw.checker.jobs, 1),
+            checkers_per_project: resolver.configured_or(
+                "checker.checkers_per_project",
+                raw.checker.checkers_per_project,
+                1,
+            ),
         };
         crate::checker::validate_jobs(checker.jobs).context("invalid checker.jobs")?;
+        crate::checker::validate_checkers_per_project(checker.checkers_per_project)
+            .context("invalid checker.checkers_per_project")?;
         let effective = EffectiveConfig {
             checker,
             experimental,

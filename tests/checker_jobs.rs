@@ -220,6 +220,33 @@ fn checker_jobs_rejects_zero_and_config_reports_the_value() {
 }
 
 #[test]
+fn embedded_checkers_per_project_cli_overrides_config() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join(".jscout.toml"),
+        "version=1\n[experimental]\ntsr=true\n[checker]\ncheckers_per_project=2\n",
+    )
+    .unwrap();
+    for (extra, expected) in [
+        (Vec::new(), "2"),
+        (vec!["--checkers-per-project", "4"], "4"),
+    ] {
+        let mut args = vec!["--no-progress", "checker", "doctor"];
+        args.extend(extra);
+        let output = invoke(repo.path(), &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("query checkers per project: {expected}"))
+        );
+    }
+}
+
+#[test]
 fn parallel_project_failure_preserves_healthy_work_and_resumes() {
     let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
@@ -303,7 +330,11 @@ fn watch_uses_cli_worker_count_and_publishes_parallel_enrichment() {
         )
         .unwrap();
     }
-    fs::write(root.join(".jscout.toml"), "version=1\n[checker]\njobs=1\n").unwrap();
+    fs::write(
+        root.join(".jscout.toml"),
+        "version=1\n[checker]\njobs=1\ncheckers_per_project=2\n",
+    )
+    .unwrap();
     struct Watch(std::process::Child);
     impl Drop for Watch {
         fn drop(&mut self) {
@@ -316,6 +347,8 @@ fn watch_uses_cli_worker_count_and_publishes_parallel_enrichment() {
             .args([
                 "--experimental-tsr",
                 "--checker-jobs",
+                "3",
+                "--checkers-per-project",
                 "3",
                 "watch",
                 "--enrich",
@@ -350,6 +383,11 @@ fn watch_uses_cli_worker_count_and_publishes_parallel_enrichment() {
         }
     }
     assert!(lines.iter().any(|line| line.contains("checker_jobs=3")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("checkers_per_project=3"))
+    );
     assert!(
         lines
             .iter()

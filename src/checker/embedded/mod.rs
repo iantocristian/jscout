@@ -80,6 +80,7 @@ pub fn identity() -> TypeScriptIdentity {
             include_bytes!("diagnostics.rs"),
             include_bytes!("projects.rs"),
             include_bytes!("query.rs"),
+            include_bytes!("query/parallel.rs"),
             include_bytes!("host.rs"),
         ] {
             hash.update(&(bytes.len() as u64).to_le_bytes());
@@ -126,6 +127,15 @@ impl Request {
         }
         Ok(())
     }
+
+    /// Keep one request deadline across a wave while isolating query context.
+    fn worker(&self) -> Arc<Self> {
+        Arc::new(Self {
+            deadline: self.deadline,
+            timeout: self.timeout,
+            diagnostics: self.diagnostics.fork(),
+        })
+    }
 }
 
 pub struct EmbeddedChecker {
@@ -138,6 +148,7 @@ pub struct EmbeddedChecker {
     prepared: Option<BTreeMap<String, MemberProjectResult>>,
     interrupts_registered: bool,
     diagnostics: bool,
+    checkers: usize,
     failed_files: BTreeMap<String, RemoteError>,
 }
 
@@ -186,8 +197,22 @@ impl EmbeddedChecker {
             prepared: None,
             interrupts_registered: false,
             diagnostics,
+            checkers: 1,
             failed_files: BTreeMap::new(),
         })
+    }
+
+    pub(super) fn configure_checkers(&mut self, checkers: usize) -> Result<(), CheckerError> {
+        super::validate_checkers_per_project(checkers)
+            .map_err(|failure| error("protocol", failure.to_string()))?;
+        if self.built.is_some() {
+            return Err(error(
+                "protocol",
+                "checker count must be set before loading a project",
+            ));
+        }
+        self.checkers = checkers;
+        Ok(())
     }
 
     pub(super) fn take_project_plan(&mut self) -> Option<ProjectPlan> {
@@ -241,7 +266,7 @@ impl EmbeddedChecker {
         let result = result.map_err(|error| request.diagnostics.annotate(error));
         if result.is_err() {
             if let Some(built) = self.built.take() {
-                built.session.retire();
+                built.retire();
             }
             self.discovery = None;
             self.planned_project = None;
@@ -325,11 +350,12 @@ impl EmbeddedChecker {
                 format!("checker preparation: {project_id}"),
                 Some(queries.len()),
             );
-            for batch in queries.chunks(128) {
+            let ordered = preparation_order(queries, self.checkers);
+            for batch in ordered.chunks(128) {
                 let result = self.resolve_members(
                     project_id.into(),
                     project_files.to_vec(),
-                    batch.to_vec(),
+                    batch.iter().map(|query| (*query).clone()).collect(),
                     timeout,
                 )?;
                 for (query, answer) in batch.iter().zip(result.results) {
@@ -412,7 +438,14 @@ impl EmbeddedChecker {
                         )
                     })?
                 };
-                this.built = Some(query::build(&this.root, project, request)?);
+                // Preparation spreads its first wave across selected files.
+                // Avoid allocating extra semantic caches for tiny scopes.
+                let files = queries
+                    .iter()
+                    .map(|query| &query.file)
+                    .collect::<BTreeSet<_>>();
+                let checkers = this.checkers.min(files.len());
+                this.built = Some(query::build(&this.root, project, checkers, request)?);
                 this.discovery = None;
             }
             let built = this.built.as_mut().expect("loaded project");
@@ -440,67 +473,31 @@ impl EmbeddedChecker {
                 }
                 by_file.entry(query.file.clone()).or_default().push(index);
             }
-            let mut results = vec![None; queries.len()];
-            for (file, indices) in &by_file {
-                // Quarantine also overrides earlier prepared successes from
-                // this file, even when replay uses different batch boundaries.
-                let mut failure = this.failed_files.get(file).cloned();
-                for &index in indices {
-                    if failure.is_some() {
-                        break;
-                    }
-                    let result = match &this.prepared {
-                        Some(prepared) => {
-                            request
-                                .diagnostics
-                                .query(&queries[index], "prepared-answer");
-                            prepared
-                                .get(&query_key(&queries[index])?)
-                                .cloned()
-                                .ok_or_else(|| {
-                                    error(
-                                        "protocol",
-                                        "query was not included in project preparation",
-                                    )
-                                })
+            let results = if let Some(prepared) = &this.prepared {
+                queries
+                    .iter()
+                    .map(|query| {
+                        request.diagnostics.query(query, "prepared-answer");
+                        request.check()?;
+                        // A later failure quarantines earlier prepared successes,
+                        // including when replay uses different batch boundaries.
+                        if let Some(failure) = this.failed_files.get(&query.file) {
+                            return Ok(failed_result(&project_id, query, failure.clone()));
                         }
-                        None => built.resolve(&this.root, &queries[index], request),
-                    };
-                    match result {
-                        Ok(result) => results[index] = Some(result),
-                        Err(CheckerError::Remote { code, message })
-                            if code == "checker_failure"
-                                || project_id.starts_with("inferred:")
-                                    && ["invalid_span", "span_mismatch"]
-                                        .contains(&code.as_str()) =>
-                        {
-                            let CheckerError::Remote { code, message } = request
-                                .diagnostics
-                                .annotate(CheckerError::Remote { code, message })
-                            else {
-                                unreachable!("annotation preserves remote errors");
-                            };
-                            // A returned compiler error can leave query caches
-                            // incomplete. Keep the loaded program, but use a new
-                            // checker before attempting a healthy sibling file.
-                            if code == "checker_failure" {
-                                built.restart_checker(request)?;
-                            }
-                            let error = RemoteError { code, message };
-                            this.failed_files.insert(file.clone(), error.clone());
-                            failure = Some(error);
-                            break;
-                        }
-                        Err(failure) => return Err(failure),
-                    }
-                }
-                if let Some(failure) = failure {
-                    for &index in indices {
-                        results[index] =
-                            Some(failed_result(&project_id, &queries[index], failure.clone()));
-                    }
-                }
-            }
+                        prepared.get(&query_key(query)?).cloned().ok_or_else(|| {
+                            error("protocol", "query was not included in project preparation")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, CheckerError>>()?
+            } else {
+                built.resolve_batch(
+                    &this.root,
+                    &queries,
+                    &by_file,
+                    &mut this.failed_files,
+                    request,
+                )?
+            };
             request.diagnostics.project(&project_id, "input-manifest");
             built.refresh_manifest()?;
             if !this.preparing && this.returned_batch && built.fingerprint != previous_fingerprint {
@@ -511,8 +508,7 @@ impl EmbeddedChecker {
             }
             let results = results
                 .into_iter()
-                .map(|result| {
-                    let mut result = result.expect("every query resolved or failed");
+                .map(|mut result| {
                     result
                         .answer
                         .checker_input_fingerprint
@@ -594,6 +590,26 @@ fn query_key(query: &MemberQuery) -> Result<String, CheckerError> {
     serde_json::to_string(query).map_err(|e| error("protocol", e.to_string()))
 }
 
+/// Spread a bounded preparation wave over files without changing query order
+/// within a file. TSR assigns each file to one checker for cache locality.
+fn preparation_order(queries: &[MemberQuery], checkers: usize) -> Vec<&MemberQuery> {
+    if checkers == 1 {
+        return queries.iter().collect();
+    }
+    let mut files = BTreeMap::<&str, std::collections::VecDeque<&MemberQuery>>::new();
+    for query in queries {
+        files.entry(&query.file).or_default().push_back(query);
+    }
+    let mut ordered = Vec::with_capacity(queries.len());
+    while !files.is_empty() {
+        files.retain(|_, pending| {
+            ordered.push(pending.pop_front().expect("nonempty file queue"));
+            !pending.is_empty()
+        });
+    }
+    ordered
+}
+
 impl Drop for EmbeddedChecker {
     fn drop(&mut self) {
         if self.interrupts_registered {
@@ -602,6 +618,8 @@ impl Drop for EmbeddedChecker {
     }
 }
 
+#[cfg(test)]
+mod parallel_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

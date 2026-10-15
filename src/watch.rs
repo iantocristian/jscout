@@ -1644,7 +1644,7 @@ fn watch_startup_log(
     watch_policy_fingerprint: &str,
 ) -> String {
     format!(
-        "watch root={} database={} jscout_version={} binary_fingerprint={} config_fingerprint={} config_loaded={} config_reload=docs-indexing-only checker_policy_fingerprint={} watch_policy_fingerprint={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={} docs_freshness={} checker_jobs={}",
+        "watch root={} database={} jscout_version={} binary_fingerprint={} config_fingerprint={} config_loaded={} config_reload=docs-indexing-only checker_policy_fingerprint={} watch_policy_fingerprint={} debounce_ms={} reconcile_seconds={} embed={} product={} enrich={} docs_freshness={} checker_jobs={} checkers_per_project={}",
         root.display(),
         database.display(),
         env!("CARGO_PKG_VERSION"),
@@ -1660,6 +1660,7 @@ fn watch_startup_log(
         options.enrich_on_change,
         options.docs_freshness,
         options.checker_jobs,
+        options.checker_backend.checkers_per_project(),
     )
 }
 
@@ -1727,6 +1728,11 @@ fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
         "checker_backend",
         options.checker_backend.name(),
     );
+    field(
+        &mut hasher,
+        "checkers_per_project",
+        &options.checker_backend.checkers_per_project().to_string(),
+    );
     field(&mut hasher, "timing", &options.timing.to_string());
     field(&mut hasher, "debug", &options.debug.to_string());
     field(
@@ -1744,6 +1750,7 @@ fn effective_watch_policy_fingerprint(options: &WatchOptions<'_>) -> String {
 
 fn validate_options(options: &WatchOptions<'_>) -> Result<()> {
     checker::validate_jobs(options.checker_jobs)?;
+    checker::validate_checkers_per_project(options.checker_backend.checkers_per_project())?;
     if options.config_explicit && options.config_path.is_none() {
         bail!("explicit watch configuration path is missing");
     }

@@ -109,7 +109,10 @@ fn embedded_queries_match_typescript_on_shared_fixtures() {
             Some(Path::new("/missing-sidecar")),
             None,
             "/missing-node",
-            Backend::Tsr { diagnostics: false },
+            Backend::Tsr {
+                diagnostics: false,
+                checkers: 1,
+            },
         )
         .unwrap();
         let plan = embedded

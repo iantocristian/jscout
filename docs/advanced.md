@@ -1132,7 +1132,7 @@ present at the Cargo.toml version with a binary whose actual architecture
 matches its target. npm prompts for the one-time password, so no token is
 created. Provenance begins with the first release published by the workflow.
 
-## Checker project concurrency
+## Checker concurrency
 
 `jscout --experimental-tsr --checker-jobs 4 watch ROOT --enrich` runs up to four
 checker projects concurrently. The same option works for `enrich` and the default
@@ -1151,6 +1151,31 @@ Increasing the limit does not split a single project, parallelize initial
 selection/planning, or repair compiler inference failures. Each additional
 active project can require another compiler's worth of memory. Changing only
 the worker count does not invalidate reusable checker results.
+
+For embedded TSR, `--checkers-per-project N` separately enables parallel queries
+within each project. Persist it as `[checker] checkers_per_project = 4`; it defaults
+to `1` and accepts 1–16. It is ignored by the TypeScript sidecar. For example:
+
+```toml
+[experimental]
+tsr = true
+
+[checker]
+jobs = 1
+checkers_per_project = 4
+```
+
+This runs one project at a time, with up to four query checkers sharing that
+project's program, capped further by distinct selected files in the first
+preparation batch. File affinity keeps every query from one file on one checker;
+a single selected file therefore stays serial. Each checker retains independent
+semantic caches, so more checkers still cost memory. An effective pool above one
+also enables TSR's parallel loader, bounded by `max(4, available CPUs)` per project,
+independently of the query-checker limit. With multiple project workers, that limit
+multiplies (`jobs = 2`, `checkers_per_project = 4` permits up to eight query checkers).
+Neither setting is a process-wide thread or memory cap.
+Restart watch after changing either setting; changes alone do not invalidate
+reusable checker results. The default of one for both retains serial project and query execution.
 
 Enrichment JSON labels its memory counters `peak_project_rss_bytes` and
 `peak_project_heap_bytes` (formerly `peak_rss_bytes` and `peak_heap_bytes`).

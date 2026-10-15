@@ -3195,8 +3195,16 @@ fn execute_project(
     }
     crate::progress::stage(format!("starting checker project {project_id}"), None);
     let mut checker = match (options.backend, prepared_projects) {
-        (super::Backend::Tsr { diagnostics }, Some(plan)) => {
-            super::Checker::Tsr(Box::new(plan.checker(project_id, diagnostics)?))
+        (
+            super::Backend::Tsr {
+                diagnostics,
+                checkers,
+            },
+            Some(plan),
+        ) => {
+            let mut checker = plan.checker(project_id, diagnostics)?;
+            checker.configure_checkers(checkers)?;
+            super::Checker::Tsr(Box::new(checker))
         }
         _ => super::launch(root, options.sidecar, None, options.node, options.backend)?,
     };
