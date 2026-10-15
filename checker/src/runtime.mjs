@@ -48,7 +48,7 @@ export async function loadRuntime(root, onChild = () => {}) {
       isImplementation: (checker, declaration) => ts.isFunctionLike(declaration)
         && checker.isImplementationOfOverload(declaration) === true,
       signatureDeclaration: (checker, call) => checker.getResolvedSignature(call)?.getDeclaration(),
-      typeToString: (checker, type, node) => checker.typeToString(type, node, ts.TypeFormatFlags.NoTruncation),
+      typeToString: (checker, type, node) => checker.typeToString(type, node, 0),
     };
   }
   try {
@@ -156,7 +156,7 @@ async function nativeRuntime(root, require, common, onChild) {
       || ast.isFunctionDeclaration(declaration) || ast.isConstructorDeclaration(declaration))
       && declaration.body !== undefined,
     signatureDeclaration: (checker, call) => checker.getResolvedSignature(call)?.declaration?.resolve(),
-    typeToString: (checker, type, node) => checker.typeToString(type, node, native.NodeBuilderFlags.NoTruncation),
+    typeToString: (checker, type, node) => checker.typeToString(type, node, 0),
     close,
   };
 }

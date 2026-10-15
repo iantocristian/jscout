@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tsr_ast::{NodeId, SyntaxKind as K};
-use tsr_checker::{Operation, type_flags, type_format_flags};
+use tsr_checker::{Operation, type_flags};
 use tsr_embed::{FileCache, Program, ProgramOptions, Session};
 use tsr_jsstring::JsString;
 use tsr_printer::emit_resolver::DeclarationEmitResolver;
@@ -502,7 +502,7 @@ impl BuiltProject {
                 answer.declarations = sites.into_values().collect();
                 request.diagnostics.operation("type-printing");
                 let text = op
-                    .type_to_string_at(ty, Some(receiver), type_format_flags::NO_TRUNCATION)
+                    .type_to_string_at(ty, Some(receiver), 0)
                     .map_err(compiler_error)?;
                 answer.receiver_type = Some(normalize_type(
                     root,

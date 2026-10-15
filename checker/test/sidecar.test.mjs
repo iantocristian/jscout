@@ -311,39 +311,47 @@ test("resolves nested, this-qualified, and optional member occurrences", async (
   await checker.close();
 });
 
-test("bounds large receiver descriptions without losing batch declarations", async (context) => {
-  const typeName = `Large${"x".repeat(40_000)}`;
-  const source = `interface ${typeName} { save(): void } declare const alpha: ${typeName}; alpha.save();`;
-  const root = fixture({
-    "main.ts": source,
-    "tsconfig.json": JSON.stringify({ compilerOptions: { noLib: true }, files: ["main.ts"] }),
+for (const noErrorTruncation of [false, true]) {
+  test(`bounds large receiver descriptions with noErrorTruncation=${noErrorTruncation}`, async (context) => {
+    const typeName = `Large${"x".repeat(40_000)}`;
+    const source = `interface ${typeName} { save(): void } declare const alpha: ${typeName}; alpha.save();`;
+    const root = fixture({
+      "main.ts": source,
+      "tsconfig.json": JSON.stringify({ compilerOptions: { noLib: true, noErrorTruncation }, files: ["main.ts"] }),
+    });
+    context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const checker = client(root);
+    context.after(() => checker.child.kill());
+    await checker.request("hello");
+    const query = queryFor(source, "alpha.save()", "alpha", "save");
+    const resolved = await checker.request("resolve_members", {
+      project_id: "tsconfig.json", queries: Array(512).fill(query),
+    });
+    assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved.error));
+    const bytes = Buffer.byteLength(JSON.stringify(resolved.result));
+    if (noErrorTruncation) assert.ok(bytes > 1024 * 1024);
+    assert.ok(bytes <= MAX_BATCH_RESPONSE_BYTES);
+    assert.equal(resolved.result.results.length, 512);
+    for (const item of resolved.result.results) {
+      assert.equal(item.answer.status, "resolved");
+      const display = item.answer.receiver_type;
+      const suffix = noErrorTruncation ? RECEIVER_TYPE_TRUNCATION : "...";
+      if (noErrorTruncation) {
+        assert.equal(Buffer.byteLength(display), MAX_RECEIVER_TYPE_BYTES);
+      } else {
+        assert.ok(Buffer.byteLength(display) < MAX_RECEIVER_TYPE_BYTES);
+      }
+      assert.ok(display.endsWith(suffix));
+      assert.ok(typeName.startsWith(display.slice(0, -suffix.length)));
+      assert.equal(item.answer.declarations.length, 1);
+    }
+    const validation = await checker.request("validate_project", {
+      project_id: "tsconfig.json", fingerprint: resolved.result.checker_input_fingerprint,
+    });
+    assert.equal(validation.result.valid, true);
+    await checker.close();
   });
-  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const checker = client(root);
-  context.after(() => checker.child.kill());
-  await checker.request("hello");
-  const query = queryFor(source, "alpha.save()", "alpha", "save");
-  const resolved = await checker.request("resolve_members", {
-    project_id: "tsconfig.json", queries: Array(512).fill(query),
-  });
-  assert.equal(resolved.kind, "resolve_members_result", JSON.stringify(resolved.error));
-  const bytes = Buffer.byteLength(JSON.stringify(resolved.result));
-  assert.ok(bytes > 1024 * 1024);
-  assert.ok(bytes <= MAX_BATCH_RESPONSE_BYTES);
-  assert.equal(resolved.result.results.length, 512);
-  for (const item of resolved.result.results) {
-    assert.equal(item.answer.status, "resolved");
-    assert.equal(Buffer.byteLength(item.answer.receiver_type), MAX_RECEIVER_TYPE_BYTES);
-    assert.ok(item.answer.receiver_type.endsWith(RECEIVER_TYPE_TRUNCATION));
-    assert.ok(typeName.startsWith(item.answer.receiver_type.slice(0, -RECEIVER_TYPE_TRUNCATION.length)));
-    assert.equal(item.answer.declarations.length, 1);
-  }
-  const validation = await checker.request("validate_project", {
-    project_id: "tsconfig.json", fingerprint: resolved.result.checker_input_fingerprint,
-  });
-  assert.equal(validation.result.valid, true);
-  await checker.close();
-});
+}
 
 test("plans ownership without a Program and resolves a bounded project batch", async (context) => {
   const source = [

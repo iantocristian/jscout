@@ -344,48 +344,55 @@ fn large_receiver_descriptions_are_bounded_before_preparation() {
     let source = format!(
         "interface {type_name} {{ ping(): void }} declare const receiver: {type_name}; receiver.ping();"
     );
-    let directory = fixture(&[
-        (
-            "tsconfig.json",
-            r#"{"compilerOptions":{"noLib":true},"files":["main.ts"]}"#,
-        ),
-        ("main.ts", &source),
-    ]);
-    let query = query(&source, "main.ts", "receiver.ping()", "receiver", "ping");
-    let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
-    checker
-        .prepare_project("tsconfig.json", &[], std::slice::from_ref(&query), TIMEOUT)
-        .unwrap();
-    let prepared = checker.prepared.as_ref().unwrap().values().next().unwrap();
-    let display = prepared.answer.receiver_type.as_ref().unwrap();
-    assert_eq!(display.len(), MAX_RECEIVER_TYPE_BYTES);
-    assert!(display.ends_with(RECEIVER_TYPE_TRUNCATION));
-    assert!(type_name.starts_with(display.strip_suffix(RECEIVER_TYPE_TRUNCATION).unwrap()));
-    let result = checker
-        .resolve_members("tsconfig.json".into(), vec![], vec![query; 128], TIMEOUT)
-        .unwrap();
-    for answer in &result.results {
-        assert_eq!(answer.answer.status, "resolved");
-        assert_eq!(answer.answer.declarations.len(), 1);
-        assert_eq!(
-            answer.answer.declarations[0].file.as_deref(),
-            Some("main.ts")
+    for no_error_truncation in [false, true] {
+        let config = format!(
+            r#"{{"compilerOptions":{{"noLib":true,"noErrorTruncation":{no_error_truncation}}},"files":["main.ts"]}}"#
         );
-        assert_eq!(
-            answer.answer.receiver_type.as_ref().unwrap().len(),
-            MAX_RECEIVER_TYPE_BYTES
+        let directory = fixture(&[("tsconfig.json", &config), ("main.ts", &source)]);
+        let query = query(&source, "main.ts", "receiver.ping()", "receiver", "ping");
+        let mut checker = EmbeddedChecker::new(directory.path(), false).unwrap();
+        checker
+            .prepare_project("tsconfig.json", &[], std::slice::from_ref(&query), TIMEOUT)
+            .unwrap();
+        let prepared = checker.prepared.as_ref().unwrap().values().next().unwrap();
+        let display = prepared.answer.receiver_type.as_ref().unwrap();
+        let suffix = if no_error_truncation {
+            // A project can still disable compiler shortening; keep our byte cap.
+            assert_eq!(display.len(), MAX_RECEIVER_TYPE_BYTES);
+            RECEIVER_TYPE_TRUNCATION
+        } else {
+            // Normal compiler shortening must happen before our storage cap.
+            assert!(display.len() < MAX_RECEIVER_TYPE_BYTES);
+            "..."
+        };
+        assert!(type_name.starts_with(display.strip_suffix(suffix).unwrap()));
+        let expected_display = display.clone();
+        let result = checker
+            .resolve_members("tsconfig.json".into(), vec![], vec![query; 128], TIMEOUT)
+            .unwrap();
+        for answer in &result.results {
+            assert_eq!(answer.answer.status, "resolved");
+            assert_eq!(answer.answer.declarations.len(), 1);
+            assert_eq!(
+                answer.answer.declarations[0].file.as_deref(),
+                Some("main.ts")
+            );
+            assert_eq!(
+                answer.answer.receiver_type.as_ref().unwrap(),
+                &expected_display
+            );
+        }
+        assert!(
+            checker
+                .validate_project(
+                    "tsconfig.json".into(),
+                    result.checker_input_fingerprint,
+                    TIMEOUT
+                )
+                .unwrap()
+                .valid
         );
     }
-    assert!(
-        checker
-            .validate_project(
-                "tsconfig.json".into(),
-                result.checker_input_fingerprint,
-                TIMEOUT
-            )
-            .unwrap()
-            .valid
-    );
 }
 
 #[test]
