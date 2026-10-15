@@ -3919,16 +3919,25 @@ fn activate_staging_batch(
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut inputs = BTreeMap::<(String, String), String>::new();
+        let mut inputs = BTreeMap::<(String, String, Option<u8>), String>::new();
         for input in input_rows {
-            let key = (input.kind, input.path);
+            // TSR hashes the operations a project observed, not just file
+            // contents. Different masks on one path are compatible; conflicting
+            // answers to the same operations are not. Revalidate every retained
+            // signature below, including paths observed with multiple masks.
+            let observation_mask = input
+                .source_hash
+                .strip_prefix(super::embedded::host::INPUT_PREFIX)
+                .and_then(|signature| signature.split_once(':'))
+                .and_then(|(mask, _)| mask.parse::<u8>().ok());
+            let key = (input.kind, input.path, observation_mask);
             if let Some(previous) = inputs.insert(key, input.source_hash.clone())
                 && previous != input.source_hash
             {
                 bail!("checker projects disagreed on one input hash; staged work retained");
             }
         }
-        for ((kind, path), source_hash) in inputs {
+        for ((kind, path, _), source_hash) in inputs {
             let input = ValidatedInput {
                 kind,
                 path,

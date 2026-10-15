@@ -2712,6 +2712,183 @@ fn seed_active_checker_batch(
     Ok(batch_id)
 }
 
+fn observed_input_hash(path: &Path, mask: u8) -> String {
+    let expected = format!(
+        "{}{mask}:{}",
+        super::super::embedded::host::INPUT_PREFIX,
+        "0".repeat(64)
+    );
+    super::super::embedded::host::fresh_signature(path, &expected).expect("valid observation mask")
+}
+
+fn stage_shared_input(
+    root: &Path,
+    conn: &Connection,
+    input_path: &Path,
+    hashes: &[String; 2],
+) -> Result<i64> {
+    let occurrence = occurrence(conn)?;
+    let projects = ["a/tsconfig.json", "b/tsconfig.json"]
+        .into_iter()
+        .map(|project| (project.to_string(), vec![occurrence.clone()]))
+        .collect::<BTreeMap<_, _>>();
+    let batch_id = open_staging_batch(
+        conn,
+        &StagingPlan {
+            snapshot: &crate::structural::current_snapshot(conn)?,
+            plan_fingerprint: "observation-plan",
+            checker: &super::super::embedded::identity(),
+            protocol: super::super::protocol::PROTOCOL_VERSION,
+            selected_occurrences: 1,
+            projects: &projects,
+            project_fingerprints: &test_project_fingerprints(&projects),
+            force_new: true,
+        },
+    )?;
+    for (project, hash) in projects.keys().zip(hashes) {
+        let mut answer = project_answer(project, Vec::new());
+        answer.status = "unknown".into();
+        answer.receiver_type = None;
+        let outcome = map_occurrence(conn, &occurrence, &[answer])?;
+        stage_batch(
+            conn,
+            batch_id,
+            project,
+            std::slice::from_ref(&occurrence),
+            &outcome.facts,
+            &outcome.projects,
+        )?;
+        complete_project(
+            root,
+            conn,
+            batch_id,
+            project,
+            &format!("{project}-inputs"),
+            &[super::super::protocol::CheckerInputFile {
+                path: input_path.to_string_lossy().into_owned(),
+                source_hash: hash.clone(),
+            }],
+            0,
+            0,
+        )?;
+    }
+    Ok(batch_id)
+}
+
+#[test]
+fn activation_accepts_and_reuses_distinct_tsr_observation_masks() -> Result<()> {
+    for (name, masks) in [
+        ("dependency.json", [9, 11]),
+        ("types", [2, 14]),
+        ("missing.json", [2, 3]),
+    ] {
+        let repo = tempfile::tempdir()?;
+        let source = "export class CardTable { insert(): void {} }\n\
+                      const card = new CardTable(); card.insert();\n";
+        let (conn, _) = indexed(repo.path(), source)?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        fs::write(repo.path().join("dependency.json"), "{}")?;
+        fs::create_dir(repo.path().join("types"))?;
+        let path = repo.path().join(name);
+        let hashes = masks.map(|mask| observed_input_hash(&path, mask));
+        assert_ne!(hashes[0], hashes[1]);
+        let batch_id = stage_shared_input(repo.path(), &conn, &path, &hashes)?;
+        activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false, None)?;
+        let projects = ["a/tsconfig.json".to_string(), "b/tsconfig.json".to_string()];
+        assert_eq!(
+            reusable_completed_batch(
+                &conn,
+                &snapshot,
+                "observation-plan",
+                projects.iter(),
+                &mut InputFreshnessCache::new(repo.path()),
+            )?,
+            Some(batch_id),
+            "both observation masks must remain reusable after publication"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn activation_rejects_conflicting_same_mask_and_plain_input_hashes() -> Result<()> {
+    let repo = tempfile::tempdir()?;
+    let (conn, _) = indexed(
+        repo.path(),
+        "export class CardTable { insert(): void {} }\n\
+         const card = new CardTable(); card.insert();\n",
+    )?;
+    let snapshot = crate::structural::current_snapshot(&conn)?;
+    let path = repo.path().join("dependency.json");
+    fs::write(&path, "old")?;
+    let old_observed = observed_input_hash(&path, 3);
+    fs::write(&path, "new")?;
+    for hashes in [
+        [old_observed, observed_input_hash(&path, 3)],
+        [
+            blake3::hash(b"old").to_hex().to_string(),
+            blake3::hash(b"new").to_hex().to_string(),
+        ],
+    ] {
+        let batch_id = stage_shared_input(repo.path(), &conn, &path, &hashes)?;
+        let error = activate_staging_batch(repo.path(), &conn, batch_id, &snapshot, false, None)
+            .expect_err("same observation scope cannot have different hashes");
+        assert!(error.to_string().contains("projects disagreed"), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn activation_revalidates_every_tsr_mask_and_retains_staging_on_change() -> Result<()> {
+    for masks in [[1, 3], [3, 1]] {
+        let repo = tempfile::tempdir()?;
+        let (conn, _) = indexed(
+            repo.path(),
+            "export class CardTable { insert(): void {} }\n\
+             const card = new CardTable(); card.insert();\n",
+        )?;
+        let snapshot = crate::structural::current_snapshot(&conn)?;
+        let path = repo.path().join("dependency.json");
+        fs::write(&path, "old")?;
+        let stale = observed_input_hash(&path, masks[0]);
+        fs::write(&path, "new")?;
+        let current = observed_input_hash(&path, masks[1]);
+        let active = stage_shared_input(
+            repo.path(),
+            &conn,
+            &path,
+            &[current.clone(), current.clone()],
+        )?;
+        activate_staging_batch(repo.path(), &conn, active, &snapshot, false, None)?;
+        let staged = stage_shared_input(repo.path(), &conn, &path, &[stale, current])?;
+        let error = activate_staging_batch(repo.path(), &conn, staged, &snapshot, false, None)
+            .expect_err("different masks do not excuse an observed content change");
+        assert!(
+            error.to_string().contains("input changed since loading"),
+            "{error}"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT id FROM checker_enrichment_batches WHERE active=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            active
+        );
+        let state: (i64, i64, i64) = conn.query_row(
+            "SELECT active,
+                    (SELECT count(*) FROM checker_project_runs
+                     WHERE batch_id=?1 AND status='completed'),
+                    (SELECT count(*) FROM checker_project_inputs WHERE batch_id=?1)
+             FROM checker_enrichment_batches WHERE id=?1",
+            [staged],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(state, (0, 2, 2), "failure must retain completed staging");
+    }
+    Ok(())
+}
+
 #[test]
 fn receiver_value_flow_suppresses_canonical_checker_fact_during_projection() -> Result<()> {
     let repo = tempfile::tempdir()?;
