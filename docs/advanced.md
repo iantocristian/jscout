@@ -1176,6 +1176,8 @@ multiplies (`jobs = 2`, `checkers_per_project = 4` permits up to eight query che
 Neither setting is a process-wide thread or memory cap.
 Restart watch after changing either setting; changes alone do not invalidate
 reusable checker results. The default of one for both retains serial project and query execution.
+See the [ai-pipe and Next.js measurements](performance-project-parallelism.md)
+for observed speed, CPU and memory trade-offs.
 
 Enrichment JSON labels its memory counters `peak_project_rss_bytes` and
 `peak_project_heap_bytes` (formerly `peak_rss_bytes` and `peak_heap_bytes`).
