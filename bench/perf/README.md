@@ -6,8 +6,9 @@ does not measure retrieval quality or remote model latency. The older
 remains a separate workload.
 
 For full index plus the **embedded TSR** checker, see the
-[native PGO/profiling recipe](../../docs/performance-pgo.md) and
-[profiling findings and build comparison](../../docs/performance-pgo-results.md).
+[native PGO/profiling recipe](../../docs/performance-pgo.md),
+[profiling findings and build comparison](../../docs/performance-pgo-results.md),
+and [invocation-local discovery reuse](../../docs/performance-discovery-reuse.md).
 The enrichment arm below remains a TypeScript-sidecar workload.
 
 ## Prerequisites

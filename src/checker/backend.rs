@@ -83,6 +83,13 @@ impl Checker {
         }
     }
 
+    pub(super) fn take_project_plan(&mut self) -> Option<super::embedded::ProjectPlan> {
+        match self {
+            Self::TypeScript(_) => None,
+            Self::Tsr(checker) => checker.take_project_plan(),
+        }
+    }
+
     pub fn resolve_members(
         &mut self,
         project_id: String,

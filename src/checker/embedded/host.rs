@@ -57,7 +57,7 @@ fn input_path(path: &[u8]) -> Result<Vec<u8>, Error> {
         .map_err(|_| Error::Unsupported("non-UTF-8 input path"))
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Observation {
     read: Option<Result<Option<FileContent>, Error>>,
     stat: Option<Result<Option<FileInfo>, Error>>,
@@ -174,6 +174,37 @@ impl InputFs {
             Arc::new(tsr_bundled::BundledFs::new(tsr_vfs::os::shared_fs())),
             request,
         )
+    }
+
+    /// Reuse the answers behind a parsed configuration, not its live host or
+    /// request. New observations must bypass discovery's shared metadata cache.
+    pub fn fork(&self, request: &Arc<Request>) -> Result<Self, CheckerError> {
+        request.check()?;
+        let observations = self
+            .observations
+            .lock()
+            .map_err(|_| error("checker_failure", "input lock poisoned"))?
+            .clone();
+        for (path, observation) in &observations {
+            request.check()?;
+            if tsr_bundled::is_bundled(path) {
+                continue;
+            }
+            let path = std::str::from_utf8(path)
+                .map_err(|_| error("unsupported_path", "compiler input is not UTF-8"))?;
+            let expected = observation.signature();
+            if fresh_signature(Path::new(path), &expected).as_deref() != Some(expected.as_str()) {
+                return Err(error(
+                    "checker_input_changed",
+                    format!("configuration input changed since project discovery: {path}"),
+                ));
+            }
+        }
+        request.check()?;
+        Ok(Self {
+            observations: Mutex::new(observations),
+            ..Self::os(request.clone())
+        })
     }
 
     pub fn set_request(&self, request: Arc<Request>) {
@@ -312,4 +343,103 @@ pub fn inputs_fingerprint(inputs: &[CheckerInputFile]) -> String {
         part(&mut hasher, input.source_hash.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, time::Duration};
+
+    fn request() -> Arc<Request> {
+        Request::new(Duration::from_secs(30), false).unwrap()
+    }
+
+    #[test]
+    fn fork_isolates_observations_and_request_lifetimes() {
+        let repo = tempfile::tempdir().unwrap();
+        let config = path_text(&repo.path().join("tsconfig.json")).unwrap();
+        let extra = path_text(&repo.path().join("extra.ts")).unwrap();
+        fs::write(&config, "{}").unwrap();
+        fs::write(&extra, "export {};").unwrap();
+        let original = InputFs::os(request());
+        original.read_file(config.as_bytes()).unwrap();
+        original.set_request(Request::new(Duration::ZERO, false).unwrap());
+
+        let first = original.fork(&request()).unwrap();
+        let second = original.fork(&request()).unwrap();
+        assert_eq!(
+            inputs_fingerprint(&first.inputs().unwrap()),
+            inputs_fingerprint(&original.inputs().unwrap())
+        );
+        assert!(original.read_file(config.as_bytes()).is_err());
+        assert!(first.read_file(config.as_bytes()).unwrap().is_some());
+        first.read_file(extra.as_bytes()).unwrap();
+        assert_eq!(first.inputs().unwrap().len(), 2);
+        assert_eq!(second.inputs().unwrap().len(), 1);
+        assert_eq!(original.inputs().unwrap().len(), 1);
+        first.set_request(Request::new(Duration::ZERO, false).unwrap());
+        assert!(first.read_file(config.as_bytes()).is_err());
+        assert!(second.read_file(config.as_bytes()).unwrap().is_some());
+    }
+
+    #[test]
+    fn fork_rejects_changed_configuration_directory_and_missing_inputs() {
+        for changed in ["configuration", "directory", "missing"] {
+            let repo = tempfile::tempdir().unwrap();
+            let config = repo.path().join("tsconfig.json");
+            let directory = repo.path().join("src");
+            let missing = repo.path().join("missing.ts");
+            fs::write(&config, "{}").unwrap();
+            fs::create_dir(&directory).unwrap();
+            let original = InputFs::os(request());
+            original
+                .read_file(path_text(&config).unwrap().as_bytes())
+                .unwrap();
+            original
+                .entries(path_text(&directory).unwrap().as_bytes())
+                .unwrap();
+            original
+                .stat(path_text(&missing).unwrap().as_bytes())
+                .unwrap();
+            match changed {
+                "configuration" => fs::write(config, r#"{"compilerOptions":{"strict":true}}"#),
+                "directory" => fs::write(directory.join("new.ts"), "export {};"),
+                "missing" => fs::write(missing, "export {};"),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            assert!(
+                matches!(original.fork(&request()),
+                    Err(CheckerError::Remote { code, .. }) if code == "checker_input_changed"),
+                "{changed} must invalidate the captured configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_does_not_inherit_unobserved_cached_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        let late = path_text(&repo.path().join("late.ts")).unwrap();
+        let cached = Arc::new(tsr_vfs::cached::CachedFs::new(Arc::new(
+            tsr_bundled::BundledFs::new(tsr_vfs::os::shared_fs()),
+        )));
+        assert!(cached.stat(late.as_bytes()).unwrap().is_none());
+        let original = InputFs::new(cached.clone(), request());
+        let fork = original.fork(&request()).unwrap();
+        fs::write(&late, "export {};").unwrap();
+        assert!(cached.stat(late.as_bytes()).unwrap().is_none());
+        assert!(fork.stat(late.as_bytes()).unwrap().is_some());
+        assert!(fork.read_file(late.as_bytes()).unwrap().is_some());
+        assert!(original.inputs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fork_honors_its_own_deadline_even_without_captured_inputs() {
+        let original = InputFs::os(request());
+        let expired = Request::new(Duration::ZERO, false).unwrap();
+        assert!(matches!(
+            original.fork(&expired),
+            Err(CheckerError::Timeout(_))
+        ));
+    }
 }
