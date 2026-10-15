@@ -4,6 +4,16 @@ version = "0.5.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+# Matched baseline/instrumented/PGO builds; normal release packaging is unchanged.
+# Keep unwinding: the embedded TSR adapter contains compiler panics per file.
+[profile.release-perf]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+debug = 1
+split-debuginfo = "packed"
+panic = "unwind"
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.22.1"

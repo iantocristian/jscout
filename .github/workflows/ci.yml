@@ -62,7 +62,7 @@ jobs:
         with:
           node-version: 22.19.0
       - name: Run performance harness tests
-        run: node --test bench/perf/perf.test.mjs
+        run: node --test bench/perf/*.test.mjs scripts/build-pgo.test.mjs
       - name: Check user documentation links and JSON examples
         run: node --test scripts/docs.test.mjs
 
