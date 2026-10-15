@@ -105,6 +105,7 @@ Column three is the legacy `JSCOUT_*` name; an em dash means the key has no envi
 | `sidecars.node` | `JSCOUT_NODE` | `"node"` |
 | `sidecars.gateway` | `JSCOUT_PI_AI_GATEWAY`, then `JSCOUT_BUNDLED_GATEWAY` as *builtin* | none |
 | `checker.jobs` | `1` | Limit of 1–16 concurrent checker projects for `enrich` and `watch --enrich`. `--checker-jobs N` overrides it. More workers use more memory; restart watch after changes. |
+| `checker.checkers_per_project` | — | `1`; maximum 1–16 query checkers per active embedded TSR project, overridden by `--checkers-per-project N` and capped by selected files in the first preparation batch. One file stays serial; an effective pool above one enables loader workers bounded by `max(4, available CPUs)`. Ignored by the TypeScript sidecar; restart watch after changes. |
 | `experimental.tsr` | — | `false`; selects the embedded checker, CLI overrides it |
 | `sidecars.checker` | `JSCOUT_CHECKER_SIDECAR`, then `JSCOUT_BUNDLED_CHECKER` as *builtin* | none |
 | `mcp.profile` | — | `"core"` (`core\|full`; `baseline` aliases core, `structural` aliases full) |

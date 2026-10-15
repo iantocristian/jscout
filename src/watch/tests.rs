@@ -2184,6 +2184,7 @@ fn startup_log_records_runtime_identities_and_effective_watch_flags() {
         "product=true",
         "enrich=true",
         "docs_freshness=false",
+        "checkers_per_project=1",
     ] {
         assert!(line.contains(expected), "missing {expected:?} from {line}");
     }
@@ -2237,6 +2238,16 @@ fn effective_watch_policy_identity_tracks_cli_resolved_overrides() {
         sidecar_changed,
         effective_watch_policy_fingerprint(&options)
     );
+    options.checker_backend = crate::checker::Backend::Tsr {
+        diagnostics: false,
+        checkers: 1,
+    };
+    let serial = effective_watch_policy_fingerprint(&options);
+    options.checker_backend = crate::checker::Backend::Tsr {
+        diagnostics: false,
+        checkers: 4,
+    };
+    assert_ne!(serial, effective_watch_policy_fingerprint(&options));
 }
 
 #[test]

@@ -46,6 +46,7 @@ pub struct EffectiveConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckerSettings {
     pub jobs: usize,
+    pub checkers_per_project: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -55,6 +55,40 @@ fn progress_interval_cli_is_a_nonnegative_global_override() {
 }
 
 #[test]
+fn checkers_per_project_cli_is_a_bounded_global_override() {
+    let default = Cli::try_parse_from(["jscout", "enrich", "."]).unwrap();
+    assert_eq!(default.checkers_per_project, None);
+    for args in [
+        vec!["jscout", "--checkers-per-project", "4", "enrich", "."],
+        vec![
+            "jscout",
+            "watch",
+            ".",
+            "--enrich",
+            "--checkers-per-project",
+            "4",
+        ],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.checkers_per_project, Some(4));
+        assert_eq!(cli.checker_jobs, None);
+        assert_eq!(cli.experimental_tsr, None);
+    }
+    for value in ["0", "17", "-1", "1.5", "invalid"] {
+        assert!(
+            Cli::try_parse_from(["jscout", "enrich", ".", "--checkers-per-project", value])
+                .is_err()
+        );
+    }
+    assert_eq!(
+        Cli::try_parse_from(["jscout", "enrich", ".", "--checkers-per-project", "16"])
+            .unwrap()
+            .checkers_per_project,
+        Some(16),
+    );
+}
+
+#[test]
 fn experimental_tsr_cli_preserves_absence_and_explicit_overrides() {
     for (args, expected) in [
         (vec!["jscout", "enrich", "."], None),

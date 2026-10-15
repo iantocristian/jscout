@@ -101,6 +101,9 @@ fn run(cli: Cli) -> Result<()> {
                 {
                     checker::Backend::Tsr {
                         diagnostics: cli.tsr_diagnostics,
+                        checkers: cli
+                            .checkers_per_project
+                            .unwrap_or(runtime.effective.checker.checkers_per_project),
                     }
                 } else {
                     checker::Backend::TypeScript

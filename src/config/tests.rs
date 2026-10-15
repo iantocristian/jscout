@@ -17,6 +17,12 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     assert!(!config.config_loaded);
     assert!(!config.effective.experimental.tsr);
     assert_eq!(config.sources["experimental.tsr"], ValueSource::Builtin);
+    assert_eq!(config.effective.checker.jobs, 1);
+    assert_eq!(config.effective.checker.checkers_per_project, 1);
+    assert_eq!(
+        config.sources["checker.checkers_per_project"],
+        ValueSource::Builtin
+    );
     assert_eq!(
         config.effective.database.path,
         root.path().canonicalize()?.join(".jscout.db")
@@ -45,6 +51,47 @@ fn absent_file_preserves_current_search_and_database_defaults() -> anyhow::Resul
     assert_eq!(config.sources["search.rerank"], ValueSource::Builtin);
     assert_eq!(config.sources["docs.include"], ValueSource::Builtin);
     assert_eq!(config.sources["docs.enabled"], ValueSource::Builtin);
+    Ok(())
+}
+
+#[test]
+fn checkers_per_project_is_reported_and_bounded() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    write_config(
+        root.path(),
+        "version=1\n[checker]\ncheckers_per_project=4\n",
+    )?;
+    let config = RuntimeConfig::load(Some(root.path()), None)?;
+    assert_eq!(config.effective.checker.jobs, 1);
+    assert_eq!(config.effective.checker.checkers_per_project, 4);
+    assert_eq!(
+        config.sources["checker.checkers_per_project"],
+        ValueSource::Config
+    );
+    assert!(
+        config
+            .show_text()
+            .contains("checker.checkers_per_project = 4 [config]")
+    );
+    let json: serde_json::Value = serde_json::from_str(&config.show_json()?)?;
+    assert_eq!(json["effective"]["checker"]["checkers_per_project"], 4);
+    assert_eq!(json["sources"]["checker.checkers_per_project"], "config");
+    for value in ["0", "17", "64"] {
+        write_config(
+            root.path(),
+            &format!("version=1\n[checker]\ncheckers_per_project={value}\n"),
+        )?;
+        let error = RuntimeConfig::load(Some(root.path()), None).unwrap_err();
+        assert!(format!("{error:#}").contains("invalid checker.checkers_per_project"));
+        assert!(format!("{error:#}").contains("between 1 and 16"));
+    }
+    for value in ["-1", "1.5", "\"4\""] {
+        write_config(
+            root.path(),
+            &format!("version=1\n[checker]\ncheckers_per_project={value}\n"),
+        )?;
+        assert!(RuntimeConfig::load(Some(root.path()), None).is_err());
+    }
     Ok(())
 }
 

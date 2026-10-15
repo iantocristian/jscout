@@ -29,6 +29,9 @@ pub(super) struct Cli {
     /// Maximum checker projects running concurrently, 1–16 (overrides checker.jobs)
     #[arg(long, global = true, value_parser = parse_checker_jobs)]
     pub(super) checker_jobs: Option<usize>,
+    /// Embedded TSR query checkers per active project, 1–16 (overrides `checker.checkers_per_project`)
+    #[arg(long, global = true, value_parser = parse_checkers_per_project)]
+    pub(super) checkers_per_project: Option<usize>,
     #[command(subcommand)]
     pub(super) command: Command,
 }
@@ -37,6 +40,12 @@ fn parse_checker_jobs(value: &str) -> Result<usize, String> {
     let jobs = value.parse::<usize>().map_err(|error| error.to_string())?;
     crate::checker::validate_jobs(jobs).map_err(|error| error.to_string())?;
     Ok(jobs)
+}
+
+fn parse_checkers_per_project(value: &str) -> Result<usize, String> {
+    let checkers = value.parse::<usize>().map_err(|error| error.to_string())?;
+    crate::checker::validate_checkers_per_project(checkers).map_err(|error| error.to_string())?;
+    Ok(checkers)
 }
 
 // Keep the largest argument builder in a separate frame: nesting the complete

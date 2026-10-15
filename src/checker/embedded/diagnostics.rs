@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use crate::checker::process::CheckerError;
 use crate::checker::protocol::MemberQuery;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Context {
     project: Option<String>,
     query: Option<(String, i64, i64)>,
@@ -32,6 +32,24 @@ pub(super) struct Diagnostics(Option<Mutex<Context>>);
 impl Diagnostics {
     pub fn new(enabled: bool) -> Self {
         Self(enabled.then(|| Mutex::new(Context::default())))
+    }
+
+    /// Parallel queries share a deadline, never their current error location.
+    pub fn fork(&self) -> Self {
+        Self(
+            self.0.as_ref().map(|context| {
+                Mutex::new(context.lock().expect("checker diagnostic context").clone())
+            }),
+        )
+    }
+
+    /// After joining workers, report a fatal error using the failing worker's
+    /// location. The request boundary remains the sole error annotator.
+    pub fn adopt(&self, other: &Self) {
+        if let (Some(target), Some(source)) = (&self.0, &other.0) {
+            let context = source.lock().expect("checker diagnostic context").clone();
+            *target.lock().expect("checker diagnostic context") = context;
+        }
     }
 
     fn update(&self, change: impl FnOnce(&mut Context)) {

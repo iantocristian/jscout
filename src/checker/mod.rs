@@ -12,11 +12,20 @@ pub(crate) use enrich::{active_batch_inputs_fresh, target_fingerprint};
 
 /// Bound independently allocated compiler sessions; each can use substantial memory.
 pub(crate) const MAX_JOBS: usize = 16;
+pub(crate) const MAX_CHECKERS_PER_PROJECT: usize = 16;
 
 pub(crate) fn validate_jobs(jobs: usize) -> anyhow::Result<()> {
     anyhow::ensure!(
         (1..=MAX_JOBS).contains(&jobs),
         "checker jobs must be between 1 and {MAX_JOBS}"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_checkers_per_project(checkers: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=MAX_CHECKERS_PER_PROJECT).contains(&checkers),
+        "checkers per project must be between 1 and {MAX_CHECKERS_PER_PROJECT}"
     );
     Ok(())
 }
@@ -131,8 +140,12 @@ pub fn launch(
     node: &str,
     backend: Backend,
 ) -> Result<Checker> {
-    if let Backend::Tsr { diagnostics } = backend {
-        return Ok(Checker::embedded(root, diagnostics)?);
+    if let Backend::Tsr {
+        diagnostics,
+        checkers,
+    } = backend
+    {
+        return Ok(Checker::embedded(root, diagnostics, checkers)?);
     }
     let node = crate::llm::config::resolve_node_setting(node, "the TypeScript checker sidecar")?;
     crate::llm::config::verify_node_version(&node)?;
@@ -150,11 +163,16 @@ pub fn doctor(
     timeout: std::time::Duration,
     backend: Backend,
 ) -> Result<()> {
-    if let Backend::Tsr { diagnostics } = backend {
+    if let Backend::Tsr {
+        diagnostics,
+        checkers,
+    } = backend
+    {
         process::begin_interrupt_scope()?;
-        let mut checker = Checker::embedded(root, diagnostics)?;
+        let mut checker = Checker::embedded(root, diagnostics, checkers)?;
         checker.register_interrupts()?;
         println!("checker: tsr-embedded (experimental, in process)");
+        println!("query checkers per project: {checkers}");
         println!("deadlines: cooperative; a running compiler query cannot be forcibly stopped");
         return print_capabilities(checker.capabilities(timeout)?);
     }
@@ -240,6 +258,22 @@ mod policy_tests {
                 .all(|byte| { byte.is_ascii_digit() || matches!(byte, b'a'..=b'f') })
         );
         assert_eq!(fingerprint, super::watch_policy_fingerprint(&options()));
+    }
+
+    #[test]
+    fn watch_policy_identity_does_not_depend_on_concurrency() {
+        let mut options = options();
+        options.backend = super::Backend::Tsr {
+            diagnostics: false,
+            checkers: 1,
+        };
+        let baseline = super::watch_policy_fingerprint(&options);
+        options.jobs = 4;
+        options.backend = super::Backend::Tsr {
+            diagnostics: true,
+            checkers: 16,
+        };
+        assert_eq!(baseline, super::watch_policy_fingerprint(&options));
     }
 
     #[test]
